@@ -211,6 +211,7 @@ async def play_next(guild_id):
 
     song = queue.pop(0)
     current_song[guild_id] = song
+    song_start_time[guild_id] = {"filepath": song["filepath"], "start": time.time()}
     logger.info(f"Playing: {song['title']}")
 
     def after_play(error):
@@ -324,15 +325,16 @@ async def restart_song(guild_id):
         song_start_time.pop(guild_id, None)
         return
     
-    # Calculate position from elapsed time
-    position = int(time.time() - start_time - 0.5) if start_time else 0  # subtract ~0.5s for sound duration
+    # Calculate position from when song started playing, minus sound effect duration
+    position = int(time.time() - start_time - 0.5) if start_time else 0
     
-    logger.info(f"Restarting song after sound effect: {song['title']} from {position}s (elapsed: {int(time.time() - start_time)}s)")
+    logger.info(f"Restarting song after sound effect: {song['title']} from {position}s")
     
     def after_restart(error):
         if error:
             logger.error(f"Restart error: {error}")
         is_playing_sound[guild_id] = False
+        song_start_time.pop(guild_id, None)
     
     try:
         ffmpeg_options = "-vn" + (f" -ss {position}" if position > 0 else "")
@@ -519,7 +521,7 @@ async def na_command(interaction: discord.Interaction):
     def after_sound(error):
         if error:
             logger.error(f"Sound effect error: {error}")
-        # Don't reset is_playing_sound here, let restart_song do it
+        asyncio.run_coroutine_threadsafe(restart_song(guild_id), bot.loop)
     
     try:
         vc.play(discord.FFmpegPCMAudio(mp3_file), after=after_sound)
