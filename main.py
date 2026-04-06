@@ -337,7 +337,7 @@ async def restart_song(guild_id):
         song_start_time.pop(guild_id, None)
     
     try:
-        ffmpeg_options = "-vn" + (f" -ss {position}" if position > 0 else "")
+        ffmpeg_options = "-vn"
         vc.play(
             discord.FFmpegPCMAudio(
                 filepath,
