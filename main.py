@@ -304,7 +304,7 @@ async def on_message(message):
     
     await bot.process_commands(message)
 
-async def restart_song(guild_id, filepath):
+async def restart_song(guild_id):
     await asyncio.sleep(0.3)
     vc = voice_clients_map.get(guild_id)
     if not vc or not vc.is_connected():
@@ -324,10 +324,7 @@ async def restart_song(guild_id, filepath):
         song_position.pop(guild_id, None)
         return
     
-    # Calculate position from elapsed time
-    stored = song_start_time.pop(guild_id, {"filepath": None, "start": 0})
-    filepath = stored.get("filepath") or filepath
-    start_time = stored.get("start", 0)
+    # Calculate position from elapsed time (subtract sound effect duration ~0.5s)
     position = int(time.time() - start_time) if start_time else 0
     
     logger.info(f"Restarting song after sound effect: {song['title']} from {position}s")
@@ -522,7 +519,7 @@ async def na_command(interaction: discord.Interaction):
     def after_sound(error):
         if error:
             logger.error(f"Sound effect error: {error}")
-        asyncio.run_coroutine_threadsafe(restart_song(guild_id, song_filepath), bot.loop)
+        # Don't reset is_playing_sound here, let restart_song do it
     
     try:
         vc.play(discord.FFmpegPCMAudio(mp3_file), after=after_sound)
