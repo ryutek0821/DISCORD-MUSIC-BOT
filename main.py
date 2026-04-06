@@ -12,10 +12,10 @@ from discord.ext import commands
 
 load_dotenv()
 
-TOKEN = os.getenv(DISCORD_TOKEN)
-COOKIE_FILE = os.getenv(COOKIE_FILE)
-NICO_EMAIL = os.getenv(NICO_EMAIL)
-NICO_PASSWORD = os.getenv(NICO_PASSWORD)
+TOKEN = os.getenv("DISCORD_TOKEN")
+COOKIE_FILE = os.getenv("COOKIE_FILE")
+NICO_EMAIL = os.getenv("NICO_EMAIL")
+NICO_PASSWORD = os.getenv("NICO_PASSWORD")
 
 logging.basicConfig(
     level=logging.INFO,
