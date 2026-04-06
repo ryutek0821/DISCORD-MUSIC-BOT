@@ -308,40 +308,32 @@ async def on_message(message):
 async def restart_song(guild_id):
     await asyncio.sleep(0.3)
     vc = voice_clients_map.get(guild_id)
-    if not vc or not vc.is_connected():
-        is_playing_sound[guild_id] = False
-        song_start_time.pop(guild_id, None)
-        return
     
-    if not filepath or not os.path.exists(filepath):
-        logger.warning(f"Song file not found for restart: {filepath}")
-        is_playing_sound[guild_id] = False
-        song_start_time.pop(guild_id, None)
-        return
-    
+    # Get song data
     song = current_song.get(guild_id)
     if not song:
+        logger.warning("No current song found")
         is_playing_sound[guild_id] = False
-        song_start_time.pop(guild_id, None)
         return
     
-    # Calculate position from when song started playing, minus sound effect duration
-    position = int(time.time() - start_time - 0.5) if start_time else 0
+    filepath = song.get("filepath")
+    if not filepath or not os.path.exists(filepath):
+        logger.warning(f"Song file not found: {filepath}")
+        is_playing_sound[guild_id] = False
+        return
     
-    logger.info(f"Restarting song after sound effect: {song['title']} from {position}s")
+    logger.info(f"Restarting song from beginning: {song['title']}")
     
     def after_restart(error):
         if error:
             logger.error(f"Restart error: {error}")
         is_playing_sound[guild_id] = False
-        song_start_time.pop(guild_id, None)
     
     try:
-        ffmpeg_options = "-vn"
         vc.play(
             discord.FFmpegPCMAudio(
                 filepath,
-                options=ffmpeg_options,
+                options="-vn",
             ),
             after=after_restart,
         )
