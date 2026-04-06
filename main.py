@@ -416,7 +416,7 @@ async def play(interaction: discord.Interaction, query: str):
 async def skip(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if not vc or not vc.is_playing():
-        await interaction.response.send_message("再生していません。")
+        await interaction.response.send_message("再生していません。", ephemeral=True)
         return
     vc.stop()
     await interaction.response.send_message("スキップしました！")
@@ -450,7 +450,7 @@ async def pause(interaction: discord.Interaction):
         vc.pause()
         await interaction.response.send_message("一時停止しました。")
     else:
-        await interaction.response.send_message("再生していません。")
+        await interaction.response.send_message("再生していません。", ephemeral=True)
 
 @bot.tree.command(name="resume", description="Resume the paused song")
 async def resume(interaction: discord.Interaction):
@@ -483,16 +483,16 @@ async def na_command(interaction: discord.Interaction):
     
     vc = voice_clients_map.get(guild_id)
     if not vc or not vc.is_connected():
-        await interaction.response.send_message("VCに接続していません。")
+        await interaction.response.send_message("VCに接続していません。", ephemeral=True)
         return
     
     if not vc.is_playing():
-        await interaction.response.send_message("再生していません。")
+        await interaction.response.send_message("再生していません。", ephemeral=True)
         return
     
     mp3_file = os.path.join(SOUNDS_DIR, "na-.mp3")
     if not os.path.exists(mp3_file):
-        await interaction.response.send_message("効果音ファイルが見つかりません。")
+        await interaction.response.send_message("効果音ファイルが見つかりません。", ephemeral=True)
         return
     
     if is_playing_sound.get(guild_id):
@@ -522,7 +522,7 @@ async def na_command(interaction: discord.Interaction):
         logger.error(f"Failed to play sound: {e}")
         is_playing_sound[guild_id] = False
         vc.resume()
-        await interaction.response.send_message("効果音の再生に失敗しました。")
+        await interaction.response.send_message("効果音の再生に失敗しました。", ephemeral=True)
 
 @bot.tree.command(name="refresh", description="Refresh niconico cookies")
 async def refresh(interaction: discord.Interaction):
