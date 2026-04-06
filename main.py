@@ -496,7 +496,7 @@ async def na_command(interaction: discord.Interaction):
         return
     
     if is_playing_sound.get(guild_id):
-        await interaction.response.send_message("再生待ちです。")
+        await interaction.response.send_message("同一楽曲再生中に1度しか流せません")
         return
     
     logger.info("Playing sound effect via /na-")
@@ -517,7 +517,7 @@ async def na_command(interaction: discord.Interaction):
     
     try:
         vc.play(discord.FFmpegPCMAudio(mp3_file), after=after_sound)
-        await interaction.response.send_message("ンアッー!")
+        await interaction.response.send_message("ンアッー!", ephemeral=True)
     except Exception as e:
         logger.error(f"Failed to play sound: {e}")
         is_playing_sound[guild_id] = False
