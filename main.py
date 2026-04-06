@@ -324,8 +324,10 @@ async def restart_song(guild_id, filepath):
         song_position.pop(guild_id, None)
         return
     
-    # Get stored position
-    position = song_position.pop(guild_id, 0)
+    # Get stored position and filepath
+    stored = song_position.pop(guild_id, {"position": 0, "filepath": None})
+    position = stored.get("position", 0)
+    filepath = stored.get("filepath") or filepath
     
     logger.info(f"Restarting song after sound effect: {song['title']} from {position}s")
     
@@ -508,15 +510,16 @@ async def na_command(interaction: discord.Interaction):
     logger.info("Playing sound effect via /na-")
     is_playing_sound[guild_id] = True
     
-    # Store current song info for replay
+    # Get position BEFORE pausing
+    position = 0
+    if hasattr(vc.source, 'progress') and vc.source.progress is not None:
+        position = int(vc.source.progress)
+    
     song = current_song.get(guild_id)
     song_filepath = song["filepath"] if song else None
     
-    # Get current playback position (approximately)
-    position = 0
-    if vc.source and hasattr(vc.source, 'progress'):
-        position = int(vc.source.progress)
-    song_position[guild_id] = position
+    # Store position and filepath
+    song_position[guild_id] = {"position": position, "filepath": song_filepath}
     
     vc.pause()
     
