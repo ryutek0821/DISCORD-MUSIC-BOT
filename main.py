@@ -12,10 +12,10 @@ from discord.ext import commands
 
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-COOKIE_FILE = os.getenv("COOKIE_FILE")
-NICO_EMAIL = os.getenv("NICO_EMAIL")
-NICO_PASSWORD = os.getenv("NICO_PASSWORD")
+TOKEN = os.getenv(DISCORD_TOKEN)
+COOKIE_FILE = os.getenv(COOKIE_FILE)
+NICO_EMAIL = os.getenv(NICO_EMAIL)
+NICO_PASSWORD = os.getenv(NICO_PASSWORD)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,6 +32,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 song_queues = {}
 voice_clients_map = {}
+current_song = {}
 idle_tasks = {}
 last_cookie_refresh = 0
 COOKIE_TTL = 3600
@@ -168,6 +169,7 @@ def download_audio_file(url):
             "title": info.get("title", "Unknown"),
             "duration": info.get("duration", 0),
             "thumbnail": info.get("thumbnail", ""),
+            "url": url,
         }
 
 def cancel_idle_task(guild_id):
@@ -195,6 +197,7 @@ async def play_next(guild_id):
         return
 
     if len(queue) == 0:
+        current_song.pop(guild_id, None)
         logger.info(f"Queue empty, scheduling disconnect in {IDLE_TIMEOUT}s")
         cancel_idle_task(guild_id)
         idle_tasks[guild_id] = asyncio.create_task(schedule_disconnect(guild_id))
@@ -203,6 +206,7 @@ async def play_next(guild_id):
     cancel_idle_task(guild_id)
 
     song = queue.pop(0)
+    current_song[guild_id] = song
     logger.info(f"Playing: {song['title']}")
 
     def after_play(error):
@@ -303,9 +307,11 @@ async def play(interaction: discord.Interaction, query: str):
             embed.set_thumbnail(url=song["thumbnail"])
         await interaction.followup.send(embed=embed)
     else:
+        current_song[interaction.guild.id] = song
+        duration_str = f"{song['duration'] // 60}:{song['duration'] % 60:02d}"
         embed = discord.Embed(
             title="再生中",
-            description=f"**{song['title']}**",
+            description=f"**[{song['title']}]({song['url']})**\n再生時間: {duration_str}",
             color=0x00ff00,
         )
         if song["thumbnail"]:
@@ -341,6 +347,7 @@ async def stop(interaction: discord.Interaction):
         await vc.disconnect()
     song_queues.pop(interaction.guild.id, None)
     voice_clients_map.pop(interaction.guild.id, None)
+    current_song.pop(interaction.guild.id, None)
     await interaction.response.send_message("停止してキューをクリアしました。")
 
 @bot.tree.command(name="pause", description="Pause the current song")
@@ -360,6 +367,22 @@ async def resume(interaction: discord.Interaction):
         await interaction.response.send_message("再開しました。")
     else:
         await interaction.response.send_message("一時停止していません。")
+
+@bot.tree.command(name="nowplaying", description="Show current playing song")
+async def nowplaying(interaction: discord.Interaction):
+    song = current_song.get(interaction.guild.id)
+    if not song:
+        await interaction.response.send_message("再生中の曲はありません。")
+        return
+    duration_str = f"{song['duration'] // 60}:{song['duration'] % 60:02d}"
+    embed = discord.Embed(
+        title="再生中",
+        description=f"**[{song['title']}]({song['url']})**\n再生時間: {duration_str}",
+        color=0x00ff00,
+    )
+    if song["thumbnail"]:
+        embed.set_thumbnail(url=song["thumbnail"])
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="refresh", description="Refresh niconico cookies")
 async def refresh(interaction: discord.Interaction):
