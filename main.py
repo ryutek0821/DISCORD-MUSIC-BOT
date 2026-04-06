@@ -309,19 +309,19 @@ async def restart_song(guild_id):
     vc = voice_clients_map.get(guild_id)
     if not vc or not vc.is_connected():
         is_playing_sound[guild_id] = False
-        song_position.pop(guild_id, None)
+        song_start_time.pop(guild_id, None)
         return
     
     if not filepath or not os.path.exists(filepath):
         logger.warning(f"Song file not found for restart: {filepath}")
         is_playing_sound[guild_id] = False
-        song_position.pop(guild_id, None)
+        song_start_time.pop(guild_id, None)
         return
     
     song = current_song.get(guild_id)
     if not song:
         is_playing_sound[guild_id] = False
-        song_position.pop(guild_id, None)
+        song_start_time.pop(guild_id, None)
         return
     
     # Calculate position from elapsed time (subtract sound effect duration ~0.5s)
