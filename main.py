@@ -446,6 +446,50 @@ async def nowplaying(interaction: discord.Interaction):
         embed.set_thumbnail(url=song["thumbnail"])
     await interaction.response.send_message(embed=embed)
 
+@bot.tree.command(name="na-", description="ンアッー!(≧д≦)")
+async def na_command(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    
+    vc = voice_clients_map.get(guild_id)
+    if not vc or not vc.is_connected():
+        await interaction.response.send_message("VCに接続していません。")
+        return
+    
+    if not vc.is_playing():
+        await interaction.response.send_message("再生していません。")
+        return
+    
+    mp3_file = os.path.join(SOUNDS_DIR, "na-.mp3")
+    if not os.path.exists(mp3_file):
+        await interaction.response.send_message("効果音ファイルが見つかりません。")
+        return
+    
+    if is_playing_sound.get(guild_id):
+        await interaction.response.send_message("再生待ちです。")
+        return
+    
+    logger.info("Playing sound effect via /na-")
+    is_playing_sound[guild_id] = True
+    
+    was_playing = vc.is_playing()
+    if was_playing:
+        vc.pause()
+    
+    def after_sound(error):
+        if error:
+            logger.error(f"Sound effect error: {error}")
+        asyncio.run_coroutine_threadsafe(resume_after_sound(guild_id), bot.loop)
+    
+    try:
+        vc.play(discord.FFmpegPCMAudio(mp3_file), after=after_sound)
+        await interaction.response.send_message("ンアッー!")
+    except Exception as e:
+        logger.error(f"Failed to play sound: {e}")
+        is_playing_sound[guild_id] = False
+        if was_playing:
+            vc.resume()
+        await interaction.response.send_message("効果音の再生に失敗しました。")
+
 @bot.tree.command(name="refresh", description="Refresh niconico cookies")
 async def refresh(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
