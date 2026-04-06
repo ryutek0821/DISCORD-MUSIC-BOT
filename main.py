@@ -324,10 +324,10 @@ async def restart_song(guild_id):
         song_start_time.pop(guild_id, None)
         return
     
-    # Calculate position from elapsed time (subtract sound effect duration ~0.5s)
-    position = int(time.time() - start_time) if start_time else 0
+    # Calculate position from elapsed time
+    position = int(time.time() - start_time - 0.5) if start_time else 0  # subtract ~0.5s for sound duration
     
-    logger.info(f"Restarting song after sound effect: {song['title']} from {position}s")
+    logger.info(f"Restarting song after sound effect: {song['title']} from {position}s (elapsed: {int(time.time() - start_time)}s)")
     
     def after_restart(error):
         if error:
