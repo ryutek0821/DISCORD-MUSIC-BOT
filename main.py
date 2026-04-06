@@ -40,7 +40,7 @@ last_cookie_refresh = 0
 COOKIE_TTL = 3600
 cookie_refresh_lock = asyncio.Lock()
 is_playing_sound = {}
-song_position = {}
+song_start_time = {}
 
 IDLE_TIMEOUT = 180
 
@@ -324,10 +324,11 @@ async def restart_song(guild_id, filepath):
         song_position.pop(guild_id, None)
         return
     
-    # Get stored position and filepath
-    stored = song_position.pop(guild_id, {"position": 0, "filepath": None})
-    position = stored.get("position", 0)
+    # Calculate position from elapsed time
+    stored = song_start_time.pop(guild_id, {"filepath": None, "start": 0})
     filepath = stored.get("filepath") or filepath
+    start_time = stored.get("start", 0)
+    position = int(time.time() - start_time) if start_time else 0
     
     logger.info(f"Restarting song after sound effect: {song['title']} from {position}s")
     
@@ -510,16 +511,11 @@ async def na_command(interaction: discord.Interaction):
     logger.info("Playing sound effect via /na-")
     is_playing_sound[guild_id] = True
     
-    # Get position BEFORE pausing
-    position = 0
-    if hasattr(vc.source, 'progress') and vc.source.progress is not None:
-        position = int(vc.source.progress)
-    
     song = current_song.get(guild_id)
     song_filepath = song["filepath"] if song else None
     
-    # Store position and filepath
-    song_position[guild_id] = {"position": position, "filepath": song_filepath}
+    # Store start time for position calculation
+    song_start_time[guild_id] = {"filepath": song_filepath, "start": time.time()}
     
     vc.pause()
     
