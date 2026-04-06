@@ -303,12 +303,41 @@ async def on_message(message):
     
     await bot.process_commands(message)
 
-async def resume_after_sound(guild_id):
-    await asyncio.sleep(0.5)
+async def restart_song(guild_id, filepath):
+    await asyncio.sleep(0.3)
     vc = voice_clients_map.get(guild_id)
-    if vc and vc.is_connected():
-        vc.resume()
-    is_playing_sound[guild_id] = False
+    if not vc or not vc.is_connected():
+        is_playing_sound[guild_id] = False
+        return
+    
+    if not filepath or not os.path.exists(filepath):
+        logger.warning(f"Song file not found for restart: {filepath}")
+        is_playing_sound[guild_id] = False
+        return
+    
+    song = current_song.get(guild_id)
+    if not song:
+        is_playing_sound[guild_id] = False
+        return
+    
+    logger.info(f"Restarting song after sound effect: {song['title']}")
+    
+    def after_restart(error):
+        if error:
+            logger.error(f"Restart error: {error}")
+        is_playing_sound[guild_id] = False
+    
+    try:
+        vc.play(
+            discord.FFmpegPCMAudio(
+                filepath,
+                options="-vn",
+            ),
+            after=after_restart,
+        )
+    except Exception as e:
+        logger.error(f"Failed to restart song: {e}")
+        is_playing_sound[guild_id] = False
 
 async def background_cookie_refresh():
     await asyncio.sleep(2)
@@ -471,14 +500,16 @@ async def na_command(interaction: discord.Interaction):
     logger.info("Playing sound effect via /na-")
     is_playing_sound[guild_id] = True
     
-    was_playing = vc.is_playing()
-    if was_playing:
-        vc.pause()
+    # Store current song info for replay
+    song = current_song.get(guild_id)
+    song_filepath = song["filepath"] if song else None
+    
+    vc.pause()
     
     def after_sound(error):
         if error:
             logger.error(f"Sound effect error: {error}")
-        asyncio.run_coroutine_threadsafe(resume_after_sound(guild_id), bot.loop)
+        asyncio.run_coroutine_threadsafe(restart_song(guild_id, song_filepath), bot.loop)
     
     try:
         vc.play(discord.FFmpegPCMAudio(mp3_file), after=after_sound)
@@ -486,8 +517,7 @@ async def na_command(interaction: discord.Interaction):
     except Exception as e:
         logger.error(f"Failed to play sound: {e}")
         is_playing_sound[guild_id] = False
-        if was_playing:
-            vc.resume()
+        vc.resume()
         await interaction.response.send_message("効果音の再生に失敗しました。")
 
 @bot.tree.command(name="refresh", description="Refresh niconico cookies")
