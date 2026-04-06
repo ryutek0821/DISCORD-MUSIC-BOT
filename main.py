@@ -40,6 +40,7 @@ last_cookie_refresh = 0
 COOKIE_TTL = 3600
 cookie_refresh_lock = asyncio.Lock()
 is_playing_sound = {}
+song_position = {}
 
 IDLE_TIMEOUT = 180
 
@@ -308,19 +309,25 @@ async def restart_song(guild_id, filepath):
     vc = voice_clients_map.get(guild_id)
     if not vc or not vc.is_connected():
         is_playing_sound[guild_id] = False
+        song_position.pop(guild_id, None)
         return
     
     if not filepath or not os.path.exists(filepath):
         logger.warning(f"Song file not found for restart: {filepath}")
         is_playing_sound[guild_id] = False
+        song_position.pop(guild_id, None)
         return
     
     song = current_song.get(guild_id)
     if not song:
         is_playing_sound[guild_id] = False
+        song_position.pop(guild_id, None)
         return
     
-    logger.info(f"Restarting song after sound effect: {song['title']}")
+    # Get stored position
+    position = song_position.pop(guild_id, 0)
+    
+    logger.info(f"Restarting song after sound effect: {song['title']} from {position}s")
     
     def after_restart(error):
         if error:
@@ -328,10 +335,11 @@ async def restart_song(guild_id, filepath):
         is_playing_sound[guild_id] = False
     
     try:
+        ffmpeg_options = "-vn" + (f" -ss {position}" if position > 0 else "")
         vc.play(
             discord.FFmpegPCMAudio(
                 filepath,
-                options="-vn",
+                options=ffmpeg_options,
             ),
             after=after_restart,
         )
@@ -503,6 +511,12 @@ async def na_command(interaction: discord.Interaction):
     # Store current song info for replay
     song = current_song.get(guild_id)
     song_filepath = song["filepath"] if song else None
+    
+    # Get current playback position (approximately)
+    position = 0
+    if vc.source and hasattr(vc.source, 'progress'):
+        position = int(vc.source.progress)
+    song_position[guild_id] = position
     
     vc.pause()
     
