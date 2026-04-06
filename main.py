@@ -273,7 +273,7 @@ async def on_message(message):
             await bot.process_commands(message)
             return
         
-        mp3_file = os.path.join(SOUNDS_DIR, "effect.mp3")
+        mp3_file = os.path.join(SOUNDS_DIR, "na-.mp3")
         if not os.path.exists(mp3_file):
             logger.warning(f"Sound file not found: {mp3_file}")
             await bot.process_commands(message)
