@@ -17,6 +17,8 @@ COOKIE_FILE = os.getenv("COOKIE_FILE")
 NICO_EMAIL = os.getenv("NICO_EMAIL")
 NICO_PASSWORD = os.getenv("NICO_PASSWORD")
 
+SOUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -37,6 +39,7 @@ idle_tasks = {}
 last_cookie_refresh = 0
 COOKIE_TTL = 3600
 cookie_refresh_lock = asyncio.Lock()
+is_playing_sound = {}
 
 IDLE_TIMEOUT = 180
 
@@ -247,6 +250,65 @@ async def on_ready():
     except Exception as e:
         logger.error(f"Sync error: {e}")
     bot.loop.create_task(background_cookie_refresh())
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+    
+    guild_id = message.guild.id
+    content = message.content
+    
+    if content in ["んあー", "んあーと"]:
+        if is_playing_sound.get(guild_id):
+            return
+        
+        vc = voice_clients_map.get(guild_id)
+        if not vc or not vc.is_connected():
+            await bot.process_commands(message)
+            return
+        
+        if not vc.is_playing():
+            await bot.process_commands(message)
+            return
+        
+        mp3_file = os.path.join(SOUNDS_DIR, "effect.mp3")
+        if not os.path.exists(mp3_file):
+            logger.warning(f"Sound file not found: {mp3_file}")
+            await bot.process_commands(message)
+            return
+        
+        logger.info(f"Playing sound effect for trigger: {content}")
+        is_playing_sound[guild_id] = True
+        
+        was_playing = vc.is_playing()
+        if was_playing:
+            vc.pause()
+        
+        def after_sound(error):
+            if error:
+                logger.error(f"Sound effect error: {error}")
+            asyncio.run_coroutine_threadsafe(
+                resume_after_sound(guild_id), bot.loop
+            )
+        
+        try:
+            vc.play(discord.FFmpegPCMAudio(mp3_file), after=after_sound)
+        except Exception as e:
+            logger.error(f"Failed to play sound: {e}")
+            is_playing_sound[guild_id] = False
+            if was_playing:
+                vc.resume()
+    
+    await bot.process_commands(message)
+
+async def resume_after_sound(guild_id):
+    await asyncio.sleep(0.5)
+    vc = voice_clients_map.get(guild_id)
+    if vc and vc.is_connected():
+        vc.resume()
+    is_playing_sound[guild_id] = False
 
 async def background_cookie_refresh():
     await asyncio.sleep(2)
