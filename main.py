@@ -162,8 +162,11 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
     if "nicovideo.jp" in url:
         refresh_nico_cookies_sync()
 
+    # Niconico-specific format selection for original quality
+    # Prefer opus > aac > m4a > mp3 for best audio quality
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=opus]/bestaudio[ext=m4a]/bestaudio[ext=aac]/bestaudio/best",
+        "format_sort": ["abr", "asr"],  # Sort by audio bitrate and sample rate
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -179,25 +182,46 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
             if isinstance(info, dict) and "entries" in info and info["entries"]:
                 info = info["entries"][0]
             
-            # Get the best audio URL
+            # Get the best audio URL with quality priority
             formats = info.get("formats", [])
             audio_url = None
+            selected_format = None
             
-            # Try to find best audio-only format
-            for f in formats:
-                if f.get("acodec") != "none" and f.get("vcodec") == "none":
-                    audio_url = f.get("url")
+            # Priority: opus > aac > m4a > other audio-only
+            for codec in ["opus", "aac", "m4a"]:
+                for f in formats:
+                    if f.get("acodec") != "none" and f.get("vcodec") == "none":
+                        if codec in (f.get("acodec", "") or f.get("ext", "")):
+                            audio_url = f.get("url")
+                            selected_format = f
+                            break
+                if audio_url:
                     break
             
-            # Fallback to first format with URL
+            # Fallback to best audio-only format
+            if not audio_url:
+                for f in formats:
+                    if f.get("acodec") != "none" and f.get("vcodec") == "none":
+                        audio_url = f.get("url")
+                        selected_format = f
+                        break
+            
+            # Last resort: any format with URL
             if not audio_url:
                 for f in formats:
                     if f.get("url"):
                         audio_url = f.get("url")
+                        selected_format = f
                         break
             
             if not audio_url:
                 raise ValueError("No audio URL found in extracted info")
+            
+            # Log selected format for debugging
+            if selected_format:
+                logger.info(f"Selected audio format: {selected_format.get('acodec', 'unknown')} "
+                          f"({selected_format.get('abr', 'unknown')}kbps, "
+                          f"{selected_format.get('asr', 'unknown')}Hz)")
             
             return {
                 "url": url,
@@ -262,6 +286,7 @@ async def play_next(guild_id: int) -> None:
         source = discord.FFmpegOpusAudio(
             audio_url,
             before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
         )
         vc.play(source, after=after_play)
     except Exception as e:
@@ -330,7 +355,11 @@ async def on_message(message):
                 is_playing_sound[guild_id] = False
         
         try:
-            source = await discord.FFmpegOpusAudio.from_probe(mp3_file)
+            source = discord.FFmpegOpusAudio(
+                mp3_file,
+                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
+            )
             vc.play(source, after=after_sound)
         except Exception as e:
             logger.error(f"Failed to play sound: {e}")
@@ -380,6 +409,7 @@ async def restart_song(guild_id: int) -> None:
         source = discord.FFmpegOpusAudio(
             audio_url,
             before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
         )
         vc.play(source, after=after_restart)
     except Exception as e:
@@ -560,7 +590,11 @@ async def na_command(interaction: discord.Interaction):
             is_playing_sound[guild_id] = False
     
     try:
-        source = await discord.FFmpegOpusAudio.from_probe(mp3_file)
+        source = discord.FFmpegOpusAudio(
+            mp3_file,
+            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
+        )
         vc.play(source, after=after_sound)
         await interaction.response.send_message("ンアッー!", ephemeral=True)
     except Exception as e:
