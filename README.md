@@ -71,4 +71,4 @@ sudo systemctl start niconico-bot
 This project uses automated GitOps workflow:
 - PR to master → Auto merge
 - Merge to master → Version tag
-- Daily 18:00 JST → Deploy to Raspberry Pi
+- Daily 18:00 JST → Deploy to Raspberry Pi via Tailscale
