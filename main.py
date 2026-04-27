@@ -157,9 +157,8 @@ def refresh_nico_cookies_sync(force: bool = False) -> bool:
         logger.error(f"Selenium fallback failed: {e}")
         return False
 
-def download_audio_file(url: str) -> Dict[str, Any]:
-    tmpdir = tempfile.mkdtemp(prefix="niconico_bot_")
-
+def extract_audio_url(url: str) -> Dict[str, Any]:
+    """Extract audio stream URL without downloading."""
     if "nicovideo.jp" in url:
         refresh_nico_cookies_sync()
 
@@ -169,7 +168,6 @@ def download_audio_file(url: str) -> Dict[str, Any]:
         "no_warnings": True,
         "noplaylist": True,
         "socket_timeout": 10,
-        "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
     }
 
     if COOKIE_FILE and os.path.exists(COOKIE_FILE):
@@ -177,25 +175,39 @@ def download_audio_file(url: str) -> Dict[str, Any]:
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(url, download=False)
             if isinstance(info, dict) and "entries" in info and info["entries"]:
                 info = info["entries"][0]
-            filepath = ydl.prepare_filename(info)
+            
+            # Get the best audio URL
+            formats = info.get("formats", [])
+            audio_url = None
+            
+            # Try to find best audio-only format
+            for f in formats:
+                if f.get("acodec") != "none" and f.get("vcodec") == "none":
+                    audio_url = f.get("url")
+                    break
+            
+            # Fallback to first format with URL
+            if not audio_url:
+                for f in formats:
+                    if f.get("url"):
+                        audio_url = f.get("url")
+                        break
+            
+            if not audio_url:
+                raise ValueError("No audio URL found in extracted info")
+            
             return {
-                "filepath": filepath,
+                "url": url,
+                "audio_url": audio_url,
                 "title": info.get("title", "Unknown"),
                 "duration": info.get("duration", 0),
                 "thumbnail": info.get("thumbnail", ""),
-                "url": url,
-                "tmpdir": tmpdir,
             }
     except Exception as e:
-        logger.error(f"Failed to download audio: {e}")
-        # Cleanup temp dir on failure
-        try:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
-            pass
+        logger.error(f"Failed to extract audio URL: {e}")
         raise
 
 def cancel_idle_task(guild_id: int) -> None:
@@ -238,42 +250,22 @@ async def play_next(guild_id: int) -> None:
     def after_play(error):
         if error:
             logger.error(f"Play error: {error}")
-        fp = song.get("filepath")
-        # Cleanup downloaded file
-        if fp and os.path.exists(fp):
-            try:
-                os.remove(fp)
-            except OSError as e:
-                logger.debug(f"Failed to remove file after playback: {e}")
-        # Cleanup temporary directory created for this download
-        tmpdir = song.get("tmpdir")
-        if tmpdir and os.path.isdir(tmpdir):
-            try:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-            except Exception as e:
-                logger.debug(f"Failed to cleanup temp dir {tmpdir}: {e}")
         asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop)
 
     try:
-        source = await discord.FFmpegOpusAudio.from_probe(
-            song["filepath"],
+        audio_url = song.get("audio_url")
+        if not audio_url:
+            logger.error("No audio URL available for streaming")
+            await play_next(guild_id)
+            return
+        
+        source = discord.FFmpegOpusAudio(
+            audio_url,
             before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
         )
         vc.play(source, after=after_play)
     except Exception as e:
         logger.error(f"Play failed: {e}")
-        fp = song.get("filepath")
-        tmpdir = song.get("tmpdir")
-        if fp and os.path.exists(fp):
-            try:
-                os.remove(fp)
-            except OSError as e:
-                logger.debug(f"Failed to remove file after failed playback: {e}")
-        if tmpdir and os.path.isdir(tmpdir):
-            try:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-            except Exception as e:
-                logger.debug(f"Failed to cleanup temp dir after error: {e}")
         await play_next(guild_id)
 
 @bot.event
@@ -366,9 +358,9 @@ async def restart_song(guild_id: int) -> None:
         is_playing_sound[guild_id] = False
         return
     
-    filepath = song.get("filepath")
-    if not filepath or not os.path.exists(filepath):
-        logger.warning(f"Song file not found: {filepath}")
+    audio_url = song.get("audio_url")
+    if not audio_url:
+        logger.warning(f"No audio URL available for guild {guild_id}")
         is_playing_sound[guild_id] = False
         return
     
@@ -385,7 +377,10 @@ async def restart_song(guild_id: int) -> None:
         is_playing_sound[guild_id] = False
     
     try:
-        source = await discord.FFmpegOpusAudio.from_probe(filepath)
+        source = discord.FFmpegOpusAudio(
+            audio_url,
+            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        )
         vc.play(source, after=after_restart)
     except Exception as e:
         logger.error(f"Failed to restart song: {e}")
@@ -411,8 +406,8 @@ async def play(interaction: discord.Interaction, query: str):
     loop = asyncio.get_event_loop()
     try:
         song = await asyncio.wait_for(
-            loop.run_in_executor(None, download_audio_file, query),
-            timeout=180
+            loop.run_in_executor(None, extract_audio_url, query),
+            timeout=60
         )
     except asyncio.TimeoutError:
         await interaction.followup.send("曲の取得がタイムアウトしました。")
@@ -551,9 +546,6 @@ async def na_command(interaction: discord.Interaction):
     
     logger.info("Playing sound effect via /na-")
     is_playing_sound[guild_id] = True
-    
-    song = current_song.get(guild_id)
-    song_filepath = song["filepath"] if song else None
     
     if vc and vc.is_connected():
         vc.pause()
