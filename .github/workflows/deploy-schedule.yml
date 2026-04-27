@@ -4,6 +4,12 @@ on:
   schedule:
     # JST 18:00 = UTC 9:00
     - cron: '0 9 * * *'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Deployment reason'
+        required: false
+        default: 'Manual deployment'
 
 jobs:
   check-deploy:
