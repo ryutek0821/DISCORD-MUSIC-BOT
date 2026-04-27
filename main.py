@@ -259,6 +259,10 @@ async def on_message(message):
         await bot.process_commands(message)
         return
     
+    if not message.guild:
+        await bot.process_commands(message)
+        return
+    
     guild_id = message.guild.id
     content = message.content
     
@@ -292,7 +296,7 @@ async def on_message(message):
             if error:
                 logger.error(f"Sound effect error: {error}")
             asyncio.run_coroutine_threadsafe(
-                resume_after_sound(guild_id), bot.loop
+                resume_sound(guild_id), bot.loop
             )
         
         try:
@@ -304,6 +308,13 @@ async def on_message(message):
                 vc.resume()
     
     await bot.process_commands(message)
+
+async def resume_sound(guild_id):
+    vc = voice_clients_map.get(guild_id)
+    if vc and vc.is_connected():
+        is_playing_sound[guild_id] = False
+        vc.resume()
+        logger.info(f"Resumed playback after sound effect in guild {guild_id}")
 
 async def restart_song(guild_id):
     await asyncio.sleep(0.3)
@@ -319,6 +330,11 @@ async def restart_song(guild_id):
     filepath = song.get("filepath")
     if not filepath or not os.path.exists(filepath):
         logger.warning(f"Song file not found: {filepath}")
+        is_playing_sound[guild_id] = False
+        return
+    
+    if not vc or not vc.is_connected():
+        logger.warning(f"VC not available for guild {guild_id}")
         is_playing_sound[guild_id] = False
         return
     
