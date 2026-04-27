@@ -283,10 +283,10 @@ async def play_next(guild_id: int) -> None:
             await play_next(guild_id)
             return
         
-        source = discord.FFmpegOpusAudio(
+        source = discord.FFmpegPCMAudio(
             audio_url,
             before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
+            options="-vn -ar 48000 -ac 2",
         )
         vc.play(source, after=after_play)
     except Exception as e:
@@ -355,10 +355,10 @@ async def on_message(message):
                 is_playing_sound[guild_id] = False
         
         try:
-            source = discord.FFmpegOpusAudio(
+            source = discord.FFmpegPCMAudio(
                 mp3_file,
                 before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-                options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
+                options="-vn",
             )
             vc.play(source, after=after_sound)
         except Exception as e:
@@ -406,10 +406,10 @@ async def restart_song(guild_id: int) -> None:
         is_playing_sound[guild_id] = False
     
     try:
-        source = discord.FFmpegOpusAudio(
+        source = discord.FFmpegPCMAudio(
             audio_url,
             before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
+            options="-vn -ar 48000 -ac 2",
         )
         vc.play(source, after=after_restart)
     except Exception as e:
@@ -590,10 +590,10 @@ async def na_command(interaction: discord.Interaction):
             is_playing_sound[guild_id] = False
     
     try:
-        source = discord.FFmpegOpusAudio(
+        source = discord.FFmpegPCMAudio(
             mp3_file,
             before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
+            options="-vn",
         )
         vc.play(source, after=after_sound)
         await interaction.response.send_message("ンアッー!", ephemeral=True)
