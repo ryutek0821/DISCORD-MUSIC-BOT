@@ -1,6 +1,8 @@
 import os
+import shutil
 import asyncio
 import logging
+from typing import Optional, Dict, List, Any
 import yt_dlp
 import tempfile
 import time
@@ -16,8 +18,13 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 COOKIE_FILE = os.getenv("COOKIE_FILE")
 NICO_EMAIL = os.getenv("NICO_EMAIL")
 NICO_PASSWORD = os.getenv("NICO_PASSWORD")
+CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 
 SOUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
+
+# Ensure the sounds directory exists
+if not os.path.isdir(SOUNDS_DIR):
+    os.makedirs(SOUNDS_DIR, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,19 +44,19 @@ voice_clients_map = {}
 current_song = {}
 idle_tasks = {}
 last_cookie_refresh = 0
-COOKIE_TTL = 3600
+COOKIE_TTL = int(os.getenv("COOKIE_TTL", "3600"))
 cookie_refresh_lock = asyncio.Lock()
 is_playing_sound = {}
-song_start_time = {}
 
-IDLE_TIMEOUT = 180
+# Idle disconnect timeout (seconds) configurable via env
+IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
 
-def get_queue(guild_id):
+def get_queue(guild_id: int) -> List[Dict[str, Any]]:
     if guild_id not in song_queues:
         song_queues[guild_id] = []
     return song_queues[guild_id]
 
-def login_via_api():
+def login_via_api() -> requests.cookies.RequestsCookieJar:
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
@@ -62,7 +69,7 @@ def login_via_api():
     logger.info(f"API login status: {resp.status_code}")
     return session.cookies
 
-def save_session_cookies(cookies):
+def save_session_cookies(cookies: requests.cookies.RequestsCookieJar) -> None:
     with open(COOKIE_FILE, "w") as f:
         f.write("# Netscape HTTP Cookie File\n")
         for cookie in cookies:
@@ -73,9 +80,14 @@ def save_session_cookies(cookies):
             secure = "TRUE" if cookie.secure else "FALSE"
             expiry = str(int(cookie.expires)) if cookie.expires else "0"
             f.write(f"{domain}\tTRUE\t{path}\t{secure}\t{expiry}\t{cookie.name}\t{cookie.value}\n")
+    # Restrict permission on the cookie file
+    try:
+        os.chmod(COOKIE_FILE, 0o600)
+    except Exception as e:
+        logger.warning(f"Failed to set restrictive permissions on cookie file: {e}")
     logger.info(f"Saved {len(cookies)} session cookies")
 
-def refresh_nico_cookies_sync(force=False):
+def refresh_nico_cookies_sync(force: bool = False) -> bool:
     global last_cookie_refresh
     now = time.time()
     if not force and (now - last_cookie_refresh) < COOKIE_TTL:
@@ -109,7 +121,7 @@ def refresh_nico_cookies_sync(force=False):
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1920,1080")
 
-        service = Service("/usr/bin/chromedriver")
+        service = Service(CHROMEDRIVER_PATH)
         driver = webdriver.Chrome(service=service, options=options)
 
         try:
@@ -145,7 +157,7 @@ def refresh_nico_cookies_sync(force=False):
         logger.error(f"Selenium fallback failed: {e}")
         return False
 
-def download_audio_file(url):
+def download_audio_file(url: str) -> Dict[str, Any]:
     tmpdir = tempfile.mkdtemp(prefix="niconico_bot_")
 
     if "nicovideo.jp" in url:
@@ -163,25 +175,35 @@ def download_audio_file(url):
     if COOKIE_FILE and os.path.exists(COOKIE_FILE):
         ydl_opts["cookiefile"] = COOKIE_FILE
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if "entries" in info and info["entries"]:
-            info = info["entries"][0]
-        filepath = ydl.prepare_filename(info)
-        return {
-            "filepath": filepath,
-            "title": info.get("title", "Unknown"),
-            "duration": info.get("duration", 0),
-            "thumbnail": info.get("thumbnail", ""),
-            "url": url,
-        }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if isinstance(info, dict) and "entries" in info and info["entries"]:
+                info = info["entries"][0]
+            filepath = ydl.prepare_filename(info)
+            return {
+                "filepath": filepath,
+                "title": info.get("title", "Unknown"),
+                "duration": info.get("duration", 0),
+                "thumbnail": info.get("thumbnail", ""),
+                "url": url,
+                "tmpdir": tmpdir,
+            }
+    except Exception as e:
+        logger.error(f"Failed to download audio: {e}")
+        # Cleanup temp dir on failure
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+        raise
 
-def cancel_idle_task(guild_id):
+def cancel_idle_task(guild_id: int) -> None:
     if guild_id in idle_tasks:
         idle_tasks[guild_id].cancel()
         del idle_tasks[guild_id]
 
-async def schedule_disconnect(guild_id):
+async def schedule_disconnect(guild_id: int) -> None:
     try:
         await asyncio.sleep(IDLE_TIMEOUT)
         vc = voice_clients_map.get(guild_id)
@@ -193,7 +215,7 @@ async def schedule_disconnect(guild_id):
     except asyncio.CancelledError:
         pass
 
-async def play_next(guild_id):
+async def play_next(guild_id: int) -> None:
     queue = get_queue(guild_id)
     vc = voice_clients_map.get(guild_id)
 
@@ -211,36 +233,47 @@ async def play_next(guild_id):
 
     song = queue.pop(0)
     current_song[guild_id] = song
-    song_start_time[guild_id] = {"filepath": song["filepath"], "start": time.time()}
     logger.info(f"Playing: {song['title']}")
 
     def after_play(error):
         if error:
             logger.error(f"Play error: {error}")
         fp = song.get("filepath")
+        # Cleanup downloaded file
         if fp and os.path.exists(fp):
             try:
                 os.remove(fp)
-            except:
-                pass
+            except OSError as e:
+                logger.debug(f"Failed to remove file after playback: {e}")
+        # Cleanup temporary directory created for this download
+        tmpdir = song.get("tmpdir")
+        if tmpdir and os.path.isdir(tmpdir):
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception as e:
+                logger.debug(f"Failed to cleanup temp dir {tmpdir}: {e}")
         asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop)
 
     try:
-        vc.play(
-            discord.FFmpegPCMAudio(
-                song["filepath"],
-                options="-vn",
-            ),
-            after=after_play,
+        source = await discord.FFmpegOpusAudio.from_probe(
+            song["filepath"],
+            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
         )
+        vc.play(source, after=after_play)
     except Exception as e:
         logger.error(f"Play failed: {e}")
         fp = song.get("filepath")
+        tmpdir = song.get("tmpdir")
         if fp and os.path.exists(fp):
             try:
                 os.remove(fp)
-            except:
-                pass
+            except OSError as e:
+                logger.debug(f"Failed to remove file after failed playback: {e}")
+        if tmpdir and os.path.isdir(tmpdir):
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception as e:
+                logger.debug(f"Failed to cleanup temp dir after error: {e}")
         await play_next(guild_id)
 
 @bot.event
@@ -290,33 +323,39 @@ async def on_message(message):
         
         was_playing = vc.is_playing()
         if was_playing:
-            vc.pause()
+            if vc and vc.is_connected():
+                vc.pause()
         
         def after_sound(error):
             if error:
                 logger.error(f"Sound effect error: {error}")
-            asyncio.run_coroutine_threadsafe(
-                resume_sound(guild_id), bot.loop
-            )
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    resume_sound(guild_id), bot.loop
+                )
+            except Exception as e:
+                logger.error(f"Failed to schedule resume: {e}")
+                is_playing_sound[guild_id] = False
         
         try:
-            vc.play(discord.FFmpegPCMAudio(mp3_file), after=after_sound)
+            source = await discord.FFmpegOpusAudio.from_probe(mp3_file)
+            vc.play(source, after=after_sound)
         except Exception as e:
             logger.error(f"Failed to play sound: {e}")
             is_playing_sound[guild_id] = False
-            if was_playing:
+            if was_playing and vc and vc.is_connected():
                 vc.resume()
     
     await bot.process_commands(message)
 
-async def resume_sound(guild_id):
+async def resume_sound(guild_id: int) -> None:
     vc = voice_clients_map.get(guild_id)
     if vc and vc.is_connected():
         is_playing_sound[guild_id] = False
         vc.resume()
         logger.info(f"Resumed playback after sound effect in guild {guild_id}")
 
-async def restart_song(guild_id):
+async def restart_song(guild_id: int) -> None:
     await asyncio.sleep(0.3)
     vc = voice_clients_map.get(guild_id)
     
@@ -346,13 +385,8 @@ async def restart_song(guild_id):
         is_playing_sound[guild_id] = False
     
     try:
-        vc.play(
-            discord.FFmpegPCMAudio(
-                filepath,
-                options="-vn",
-            ),
-            after=after_restart,
-        )
+        source = await discord.FFmpegOpusAudio.from_probe(filepath)
+        vc.play(source, after=after_restart)
     except Exception as e:
         logger.error(f"Failed to restart song: {e}")
         is_playing_sound[guild_id] = False
@@ -521,23 +555,27 @@ async def na_command(interaction: discord.Interaction):
     song = current_song.get(guild_id)
     song_filepath = song["filepath"] if song else None
     
-    # Store start time for position calculation
-    song_start_time[guild_id] = {"filepath": song_filepath, "start": time.time()}
-    
-    vc.pause()
+    if vc and vc.is_connected():
+        vc.pause()
     
     def after_sound(error):
         if error:
             logger.error(f"Sound effect error: {error}")
-        asyncio.run_coroutine_threadsafe(restart_song(guild_id), bot.loop)
+        try:
+            asyncio.run_coroutine_threadsafe(restart_song(guild_id), bot.loop)
+        except Exception as e:
+            logger.error(f"Failed to schedule restart: {e}")
+            is_playing_sound[guild_id] = False
     
     try:
-        vc.play(discord.FFmpegPCMAudio(mp3_file), after=after_sound)
+        source = await discord.FFmpegOpusAudio.from_probe(mp3_file)
+        vc.play(source, after=after_sound)
         await interaction.response.send_message("ンアッー!", ephemeral=True)
     except Exception as e:
         logger.error(f"Failed to play sound: {e}")
         is_playing_sound[guild_id] = False
-        vc.resume()
+        if vc and vc.is_connected():
+            vc.resume()
         await interaction.response.send_message("効果音の再生に失敗しました。", ephemeral=True)
 
 @bot.tree.command(name="refresh", description="Refresh niconico cookies")
