@@ -1,0 +1,59 @@
+name: Version Tag on Merge
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  version-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump version and tag
+        id: version
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get latest tag or start at 0.0.0
+            let currentVersion = '0.0.0';
+            try {
+              const { data: tags } = await github.rest.repos.listTags({
+                owner: context.repo.owner,
+                repo: context.repo.repo
+              });
+              if (tags.length > 0) {
+                currentVersion = tags[0].name.replace(/^v/, '');
+              }
+            } catch (e) {
+              console.log('No tags found, starting at 0.0.0');
+            }
+
+            // Parse and increment patch version
+            const parts = currentVersion.split('.');
+            const patch = parseInt(parts[2] || 0) + 1;
+            const newVersion = `${parts[0] || 0}.${parts[1] || 0}.${patch}`;
+            console.log(`Bumping version: ${currentVersion} -> ${newVersion}`);
+
+            // Create tag
+            await github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: 'refs/tags/v' + newVersion,
+              sha: context.sha
+            });
+
+            // Create release
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: 'v' + newVersion,
+              name: 'Version ' + newVersion,
+              body: 'Auto-generated release for version ' + newVersion
+            });
+
+            console.log('Created tag and release: v' + newVersion);
