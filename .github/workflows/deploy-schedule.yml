@@ -37,11 +37,19 @@ jobs:
             
             return isToday ? 'deploy' : 'skip';
 
+      - name: Connect to Tailscale
+        if: steps.check.outputs.result == 'deploy'
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey "$TAILSCALE_AUTHKEY" --accept-routes --hostname github-actions-deploy
+
       - name: Deploy to Raspberry Pi
         if: steps.check.outputs.result == 'deploy'
         env:
-          SSH_HOST: ${{ secrets.SSH_HOST || '100.114.153.17' }}
-          SSH_USER: ${{ secrets.SSH_USER || 'ryu' }}
+          SSH_HOST: 100.114.153.17
+          SSH_USER: ryu
           SSH_KEY: ${{ secrets.SSH_KEY }}
         run: |
           # Install SSH key
