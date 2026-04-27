@@ -40,8 +40,8 @@ jobs:
       - name: Deploy to Raspberry Pi
         if: steps.check.outputs.result == 'deploy'
         env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST || '100.114.153.17' }}
+          SSH_USER: ${{ secrets.SSH_USER || 'ryu' }}
           SSH_KEY: ${{ secrets.SSH_KEY }}
         run: |
           # Install SSH key
@@ -54,7 +54,7 @@ jobs:
             StrictHostKeyChecking no
             UserKnownHostsFile /dev/null" >> ~/.ssh/config
           
-          # Deploy via SSH
+          # Deploy via SSH (Tailscale IP - no port forwarding needed)
           ssh "$SSH_USER@$SSH_HOST" << 'EOF'
             cd ~/niconico-discord-bot
             git fetch origin
