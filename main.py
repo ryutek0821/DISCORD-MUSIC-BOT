@@ -271,6 +271,20 @@ async def play_next(guild_id: int) -> None:
     current_song[guild_id] = song
     logger.info(f"Playing: {song['title']}")
 
+    try:
+        duration_str = f"{song['duration'] // 60}:{song['duration'] % 60:02d}"
+        embed = discord.Embed(
+            title="再生中",
+            description=f"**[{song['title']}]({song['url']})**\n再生時間: {duration_str}",
+            color=0x00ff00,
+        )
+        if song["thumbnail"]:
+            embed.set_thumbnail(url=song["thumbnail"])
+        text_channel = vc.channel.guild.text_channels[0]
+        asyncio.create_task(text_channel.send(embed=embed))
+    except Exception as e:
+        logger.warning(f"Failed to send now playing message: {e}")
+
     def after_play(error):
         if error:
             logger.error(f"Play error: {error}")
@@ -468,7 +482,7 @@ async def play(interaction: discord.Interaction, query: str):
     if vc.is_playing():
         embed = discord.Embed(
             title="キューに追加",
-            description=f"**{song['title']}** をキューに追加しました (#{len(queue)})",
+            description=f"**[{song['title']}]({song['url']})** をキューに追加しました (#{len(queue)})",
             color=0x00ff00,
         )
         if song["thumbnail"]:
