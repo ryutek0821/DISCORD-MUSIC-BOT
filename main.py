@@ -280,7 +280,10 @@ async def play_next(guild_id: int) -> None:
         )
         if song["thumbnail"]:
             embed.set_thumbnail(url=song["thumbnail"])
-        text_channel = vc.channel.guild.text_channels[0]
+        channel_id = song.get("text_channel_id")
+        text_channel = vc.channel.guild.get_channel(channel_id) if channel_id else None
+        if not text_channel:
+            text_channel = vc.channel.guild.text_channels[0]
         asyncio.create_task(text_channel.send(embed=embed))
     except Exception as e:
         logger.warning(f"Failed to send now playing message: {e}")
@@ -288,7 +291,8 @@ async def play_next(guild_id: int) -> None:
     def after_play(error):
         if error:
             logger.error(f"Play error: {error}")
-        asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop)
+        if not is_playing_sound.get(guild_id):
+            asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop)
 
     try:
         audio_url = song.get("audio_url")
@@ -351,23 +355,19 @@ async def on_message(message):
         
         logger.info(f"Playing sound effect for trigger: {content}")
         is_playing_sound[guild_id] = True
-        
-        was_playing = vc.is_playing()
-        if was_playing:
-            if vc and vc.is_connected():
-                vc.pause()
-        
+        vc.stop()  # after_play checks is_playing_sound and skips play_next
+
         def after_sound(error):
             if error:
                 logger.error(f"Sound effect error: {error}")
             try:
                 asyncio.run_coroutine_threadsafe(
-                    resume_sound(guild_id), bot.loop
+                    restart_song(guild_id), bot.loop
                 )
             except Exception as e:
-                logger.error(f"Failed to schedule resume: {e}")
+                logger.error(f"Failed to schedule restart: {e}")
                 is_playing_sound[guild_id] = False
-        
+
         try:
             source = discord.FFmpegOpusAudio(
                 mp3_file,
@@ -378,8 +378,6 @@ async def on_message(message):
         except Exception as e:
             logger.error(f"Failed to play sound: {e}")
             is_playing_sound[guild_id] = False
-            if was_playing and vc and vc.is_connected():
-                vc.resume()
     
     await bot.process_commands(message)
 
@@ -432,8 +430,13 @@ async def restart_song(guild_id: int) -> None:
 
 async def background_cookie_refresh():
     await asyncio.sleep(2)
-    async with cookie_refresh_lock:
-        await asyncio.get_event_loop().run_in_executor(None, refresh_nico_cookies_sync, True)
+    while True:
+        try:
+            async with cookie_refresh_lock:
+                await asyncio.get_event_loop().run_in_executor(None, refresh_nico_cookies_sync, True)
+        except Exception as e:
+            logger.error(f"Background cookie refresh error: {e}")
+        await asyncio.sleep(COOKIE_TTL)
 
 @bot.tree.command(name="play", description="Play a song from NicoNico or YouTube")
 @app_commands.describe(query="NicoNico URL, YouTube URL, or search keyword")
@@ -459,6 +462,8 @@ async def play(interaction: discord.Interaction, query: str):
     except Exception as e:
         await interaction.followup.send(f"曲が見つかりません: {str(e)}")
         return
+
+    song["text_channel_id"] = interaction.channel.id
 
     if not vc:
         try:
@@ -516,7 +521,7 @@ async def queue_cmd(interaction: discord.Interaction):
     if not q:
         await interaction.response.send_message("キューは空です。")
         return
-    desc = "\n".join(f"{i+1}. **{s['title']}**" for i, s in enumerate(q[:10]))
+    desc = "\n".join(f"{i+1}. **[{s['title']}]({s['url']})**" for i, s in enumerate(q[:10]))
     embed = discord.Embed(title="キュー", description=desc, color=0x00ff00)
     await interaction.response.send_message(embed=embed)
 
@@ -590,9 +595,8 @@ async def na_command(interaction: discord.Interaction):
     
     logger.info("Playing sound effect via /na-")
     is_playing_sound[guild_id] = True
-    
     if vc and vc.is_connected():
-        vc.pause()
+        vc.stop()  # after_play checks is_playing_sound and skips play_next
     
     def after_sound(error):
         if error:
