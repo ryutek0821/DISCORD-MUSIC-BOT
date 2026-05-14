@@ -28,11 +28,8 @@ NICO_PASSWORD=...
 - Optional: Selenium + Chromium for cookie fallback
 
 ## Known Bugs (DO NOT IGNORE)
-1. `resume_after_sound` (line ~295) is **undefined** - on_message sound effect breaks
-2. `is_playing_sound[guild_id]` never reset to `False` in `on_message` - sound locked after first use
-3. `message.guild` is `None` in DMs - crashes on DM messages
-4. `song_start_time` saved but never used (line 214, 509)
-5. `restart_song` doesn't check `vc` before calling `vc.play` (line 333)
+All previously listed bugs have been fixed. Current known issues:
+- None at this time.
 
 ## Critical Constraints
 - No tests, no CI, no type checking
