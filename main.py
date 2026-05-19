@@ -63,7 +63,7 @@ def create_now_playing_embed(song: Dict[str, Any]) -> discord.Embed:
     duration_str = f"{song['duration'] // 60}:{song['duration'] % 60:02d}"
     embed = discord.Embed(
         title="再生中",
-        description=f"**[{song['title']}]({song['url']})**\n再生時間: {duration_str}",
+        description=f"**[{song['title']}]({song['url']})**\n再生時間: {duration_str}\nリクエスト: {song.get('requester', '不明')}",
         color=0x00ff00,
     )
     if song.get("thumbnail"):
@@ -75,7 +75,7 @@ def create_queued_embed(song: Dict[str, Any], position: int) -> discord.Embed:
     """Create a 'added to queue' embed."""
     embed = discord.Embed(
         title="キューに追加",
-        description=f"**[{song['title']}]({song['url']})** をキューに追加しました (#{position})",
+        description=f"**[{song['title']}]({song['url']})** をキューに追加しました (#{position})\nリクエスト: {song.get('requester', '不明')}",
         color=0x00ff00,
     )
     if song.get("thumbnail"):
@@ -379,6 +379,7 @@ async def play(interaction: discord.Interaction, query: str):
         return
 
     song["text_channel_id"] = interaction.channel.id
+    song["requester"] = interaction.user.display_name
 
     if not vc:
         try:
@@ -426,7 +427,7 @@ async def queue_cmd(interaction: discord.Interaction):
     if not state.queue:
         await interaction.response.send_message("キューは空です。")
         return
-    desc = "\n".join(f"{i+1}. **[{s['title']}]({s['url']})**" for i, s in enumerate(state.queue[:10]))
+    desc = "\n".join(f"{i+1}. **[{s['title']}]({s['url']})** (by {s.get('requester', '不明')})" for i, s in enumerate(state.queue[:10]))
     embed = discord.Embed(title="キュー", description=desc, color=0x00ff00)
     await interaction.response.send_message(embed=embed)
 
