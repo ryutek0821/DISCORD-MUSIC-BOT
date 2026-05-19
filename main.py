@@ -1,5 +1,4 @@
 import os
-import shutil
 import asyncio
 import logging
 from typing import Optional, Dict, List, Any
@@ -20,12 +19,6 @@ NICO_EMAIL = os.getenv("NICO_EMAIL")
 NICO_PASSWORD = os.getenv("NICO_PASSWORD")
 CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 
-SOUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
-
-# Ensure the sounds directory exists
-if not os.path.isdir(SOUNDS_DIR):
-    os.makedirs(SOUNDS_DIR, exist_ok=True)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -39,22 +32,56 @@ intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-song_queues = {}
-voice_clients_map = {}
-current_song = {}
-idle_tasks = {}
+
+class GuildState:
+    """Manages per-guild playback state."""
+    def __init__(self):
+        self.queue: List[Dict[str, Any]] = []
+        self.voice_client: Optional[discord.VoiceClient] = None
+        self.current_song: Optional[Dict[str, Any]] = None
+        self.idle_task: Optional[asyncio.Task] = None
+
+
+guild_states: Dict[int, GuildState] = {}
+
 last_cookie_refresh = 0
 COOKIE_TTL = int(os.getenv("COOKIE_TTL", "3600"))
 cookie_refresh_lock = asyncio.Lock()
-is_playing_sound = {}
 
 # Idle disconnect timeout (seconds) configurable via env
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
 
-def get_queue(guild_id: int) -> List[Dict[str, Any]]:
-    if guild_id not in song_queues:
-        song_queues[guild_id] = []
-    return song_queues[guild_id]
+
+def get_state(guild_id: int) -> GuildState:
+    if guild_id not in guild_states:
+        guild_states[guild_id] = GuildState()
+    return guild_states[guild_id]
+
+
+def create_now_playing_embed(song: Dict[str, Any]) -> discord.Embed:
+    """Create a 'now playing' embed."""
+    duration_str = f"{song['duration'] // 60}:{song['duration'] % 60:02d}"
+    embed = discord.Embed(
+        title="再生中",
+        description=f"**[{song['title']}]({song['url']})**\n再生時間: {duration_str}",
+        color=0x00ff00,
+    )
+    if song.get("thumbnail"):
+        embed.set_thumbnail(url=song["thumbnail"])
+    return embed
+
+
+def create_queued_embed(song: Dict[str, Any], position: int) -> discord.Embed:
+    """Create a 'added to queue' embed."""
+    embed = discord.Embed(
+        title="キューに追加",
+        description=f"**[{song['title']}]({song['url']})** をキューに追加しました (#{position})",
+        color=0x00ff00,
+    )
+    if song.get("thumbnail"):
+        embed.set_thumbnail(url=song["thumbnail"])
+    return embed
+
 
 def login_via_api() -> requests.cookies.RequestsCookieJar:
     session = requests.Session()
@@ -69,6 +96,7 @@ def login_via_api() -> requests.cookies.RequestsCookieJar:
     logger.info(f"API login status: {resp.status_code}")
     return session.cookies
 
+
 def save_session_cookies(cookies: requests.cookies.RequestsCookieJar) -> None:
     with open(COOKIE_FILE, "w") as f:
         f.write("# Netscape HTTP Cookie File\n")
@@ -80,12 +108,12 @@ def save_session_cookies(cookies: requests.cookies.RequestsCookieJar) -> None:
             secure = "TRUE" if cookie.secure else "FALSE"
             expiry = str(int(cookie.expires)) if cookie.expires else "0"
             f.write(f"{domain}\tTRUE\t{path}\t{secure}\t{expiry}\t{cookie.name}\t{cookie.value}\n")
-    # Restrict permission on the cookie file
     try:
         os.chmod(COOKIE_FILE, 0o600)
     except Exception as e:
         logger.warning(f"Failed to set restrictive permissions on cookie file: {e}")
     logger.info(f"Saved {len(cookies)} session cookies")
+
 
 def refresh_nico_cookies_sync(force: bool = False) -> bool:
     global last_cookie_refresh
@@ -157,16 +185,15 @@ def refresh_nico_cookies_sync(force: bool = False) -> bool:
         logger.error(f"Selenium fallback failed: {e}")
         return False
 
+
 def extract_audio_url(url: str) -> Dict[str, Any]:
     """Extract audio stream URL without downloading."""
     if "nicovideo.jp" in url:
         refresh_nico_cookies_sync()
 
-    # Niconico-specific format selection for original quality
-    # Prefer opus > aac > m4a > mp3 for best audio quality
     ydl_opts = {
         "format": "bestaudio[ext=opus]/bestaudio[ext=m4a]/bestaudio[ext=aac]/bestaudio/best",
-        "format_sort": ["abr", "asr"],  # Sort by audio bitrate and sample rate
+        "format_sort": ["abr", "asr"],
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -181,13 +208,11 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
             info = ydl.extract_info(url, download=False)
             if isinstance(info, dict) and "entries" in info and info["entries"]:
                 info = info["entries"][0]
-            
-            # Get the best audio URL with quality priority
+
             formats = info.get("formats", [])
             audio_url = None
             selected_format = None
-            
-            # Priority: opus > aac > m4a > other audio-only
+
             for codec in ["opus", "aac", "m4a"]:
                 for f in formats:
                     if f.get("acodec") != "none" and f.get("vcodec") == "none":
@@ -197,32 +222,29 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
                             break
                 if audio_url:
                     break
-            
-            # Fallback to best audio-only format
+
             if not audio_url:
                 for f in formats:
                     if f.get("acodec") != "none" and f.get("vcodec") == "none":
                         audio_url = f.get("url")
                         selected_format = f
                         break
-            
-            # Last resort: any format with URL
+
             if not audio_url:
                 for f in formats:
                     if f.get("url"):
                         audio_url = f.get("url")
                         selected_format = f
                         break
-            
+
             if not audio_url:
                 raise ValueError("No audio URL found in extracted info")
-            
-            # Log selected format for debugging
+
             if selected_format:
                 logger.info(f"Selected audio format: {selected_format.get('acodec', 'unknown')} "
                           f"({selected_format.get('abr', 'unknown')}kbps, "
                           f"{selected_format.get('asr', 'unknown')}Hz)")
-            
+
             return {
                 "url": url,
                 "audio_url": audio_url,
@@ -234,52 +256,50 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
         logger.error(f"Failed to extract audio URL: {e}")
         raise
 
+
 def cancel_idle_task(guild_id: int) -> None:
-    if guild_id in idle_tasks:
-        idle_tasks[guild_id].cancel()
-        del idle_tasks[guild_id]
+    state = get_state(guild_id)
+    if state.idle_task:
+        state.idle_task.cancel()
+        state.idle_task = None
+
 
 async def schedule_disconnect(guild_id: int) -> None:
     try:
         await asyncio.sleep(IDLE_TIMEOUT)
-        vc = voice_clients_map.get(guild_id)
+        state = get_state(guild_id)
+        vc = state.voice_client
         if vc and vc.is_connected() and not vc.is_playing():
             logger.info(f"Idle timeout ({IDLE_TIMEOUT}s), disconnecting")
             await vc.disconnect()
-            voice_clients_map.pop(guild_id, None)
-            song_queues.pop(guild_id, None)
+            if guild_id in guild_states:
+                del guild_states[guild_id]
     except asyncio.CancelledError:
         pass
 
+
 async def play_next(guild_id: int) -> None:
-    queue = get_queue(guild_id)
-    vc = voice_clients_map.get(guild_id)
+    state = get_state(guild_id)
+    vc = state.voice_client
 
     if not vc or not vc.is_connected():
         return
 
-    if len(queue) == 0:
-        current_song.pop(guild_id, None)
+    if len(state.queue) == 0:
+        state.current_song = None
         logger.info(f"Queue empty, scheduling disconnect in {IDLE_TIMEOUT}s")
         cancel_idle_task(guild_id)
-        idle_tasks[guild_id] = asyncio.create_task(schedule_disconnect(guild_id))
+        state.idle_task = asyncio.create_task(schedule_disconnect(guild_id))
         return
 
     cancel_idle_task(guild_id)
 
-    song = queue.pop(0)
-    current_song[guild_id] = song
+    song = state.queue.pop(0)
+    state.current_song = song
     logger.info(f"Playing: {song['title']}")
 
     try:
-        duration_str = f"{song['duration'] // 60}:{song['duration'] % 60:02d}"
-        embed = discord.Embed(
-            title="再生中",
-            description=f"**[{song['title']}]({song['url']})**\n再生時間: {duration_str}",
-            color=0x00ff00,
-        )
-        if song["thumbnail"]:
-            embed.set_thumbnail(url=song["thumbnail"])
+        embed = create_now_playing_embed(song)
         channel_id = song.get("text_channel_id")
         text_channel = vc.channel.guild.get_channel(channel_id) if channel_id else None
         if not text_channel:
@@ -291,8 +311,7 @@ async def play_next(guild_id: int) -> None:
     def after_play(error):
         if error:
             logger.error(f"Play error: {error}")
-        if not is_playing_sound.get(guild_id):
-            asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop)
+        asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop)
 
     try:
         audio_url = song.get("audio_url")
@@ -300,7 +319,7 @@ async def play_next(guild_id: int) -> None:
             logger.error("No audio URL available for streaming")
             await play_next(guild_id)
             return
-        
+
         source = discord.FFmpegOpusAudio(
             audio_url,
             before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -310,6 +329,7 @@ async def play_next(guild_id: int) -> None:
     except Exception as e:
         logger.error(f"Play failed: {e}")
         await play_next(guild_id)
+
 
 @bot.event
 async def on_ready():
@@ -321,112 +341,6 @@ async def on_ready():
         logger.error(f"Sync error: {e}")
     bot.loop.create_task(background_cookie_refresh())
 
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        await bot.process_commands(message)
-        return
-    
-    if not message.guild:
-        await bot.process_commands(message)
-        return
-    
-    guild_id = message.guild.id
-    content = message.content
-    
-    if content in ["んあー", "んあーと"]:
-        if is_playing_sound.get(guild_id):
-            return
-        
-        vc = voice_clients_map.get(guild_id)
-        if not vc or not vc.is_connected():
-            await bot.process_commands(message)
-            return
-        
-        if not vc.is_playing():
-            await bot.process_commands(message)
-            return
-        
-        mp3_file = os.path.join(SOUNDS_DIR, "na-.mp3")
-        if not os.path.exists(mp3_file):
-            logger.warning(f"Sound file not found: {mp3_file}")
-            await bot.process_commands(message)
-            return
-        
-        logger.info(f"Playing sound effect for trigger: {content}")
-        is_playing_sound[guild_id] = True
-        vc.stop()  # after_play checks is_playing_sound and skips play_next
-
-        def after_sound(error):
-            if error:
-                logger.error(f"Sound effect error: {error}")
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    restart_song(guild_id), bot.loop
-                )
-            except Exception as e:
-                logger.error(f"Failed to schedule restart: {e}")
-                is_playing_sound[guild_id] = False
-
-        try:
-            source = discord.FFmpegOpusAudio(
-                mp3_file,
-                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-                options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
-            )
-            vc.play(source, after=after_sound)
-        except Exception as e:
-            logger.error(f"Failed to play sound: {e}")
-            is_playing_sound[guild_id] = False
-    
-    await bot.process_commands(message)
-
-async def resume_sound(guild_id: int) -> None:
-    vc = voice_clients_map.get(guild_id)
-    if vc and vc.is_connected():
-        is_playing_sound[guild_id] = False
-        vc.resume()
-        logger.info(f"Resumed playback after sound effect in guild {guild_id}")
-
-async def restart_song(guild_id: int) -> None:
-    await asyncio.sleep(0.3)
-    vc = voice_clients_map.get(guild_id)
-    
-    # Get song data
-    song = current_song.get(guild_id)
-    if not song:
-        logger.warning("No current song found")
-        is_playing_sound[guild_id] = False
-        return
-    
-    audio_url = song.get("audio_url")
-    if not audio_url:
-        logger.warning(f"No audio URL available for guild {guild_id}")
-        is_playing_sound[guild_id] = False
-        return
-    
-    if not vc or not vc.is_connected():
-        logger.warning(f"VC not available for guild {guild_id}")
-        is_playing_sound[guild_id] = False
-        return
-    
-    logger.info(f"Restarting song from beginning: {song['title']}")
-    
-    def after_restart(error):
-        if error:
-            logger.error(f"Restart error: {error}")
-        is_playing_sound[guild_id] = False
-    
-    try:
-        source = discord.FFmpegOpusAudio(
-            audio_url,
-            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
-        )
-        vc.play(source, after=after_restart)
-    except Exception as e:
-        logger.error(f"Failed to restart song: {e}")
-        is_playing_sound[guild_id] = False
 
 async def background_cookie_refresh():
     await asyncio.sleep(2)
@@ -437,6 +351,7 @@ async def background_cookie_refresh():
         except Exception as e:
             logger.error(f"Background cookie refresh error: {e}")
         await asyncio.sleep(COOKIE_TTL)
+
 
 @bot.tree.command(name="play", description="Play a song from NicoNico or YouTube")
 @app_commands.describe(query="NicoNico URL, YouTube URL, or search keyword")
@@ -468,7 +383,8 @@ async def play(interaction: discord.Interaction, query: str):
     if not vc:
         try:
             vc = await channel.connect(timeout=15)
-            voice_clients_map[interaction.guild.id] = vc
+            state = get_state(interaction.guild.id)
+            state.voice_client = vc
         except Exception as e:
             await interaction.followup.send(f"VC接続失敗: {str(e)}")
             return
@@ -481,30 +397,18 @@ async def play(interaction: discord.Interaction, query: str):
 
     cancel_idle_task(interaction.guild.id)
 
-    queue = get_queue(interaction.guild.id)
-    queue.append(song)
+    state = get_state(interaction.guild.id)
+    state.queue.append(song)
 
     if vc.is_playing():
-        embed = discord.Embed(
-            title="キューに追加",
-            description=f"**[{song['title']}]({song['url']})** をキューに追加しました (#{len(queue)})",
-            color=0x00ff00,
-        )
-        if song["thumbnail"]:
-            embed.set_thumbnail(url=song["thumbnail"])
+        embed = create_queued_embed(song, len(state.queue))
         await interaction.followup.send(embed=embed)
     else:
-        current_song[interaction.guild.id] = song
-        duration_str = f"{song['duration'] // 60}:{song['duration'] % 60:02d}"
-        embed = discord.Embed(
-            title="再生中",
-            description=f"**[{song['title']}]({song['url']})**\n再生時間: {duration_str}",
-            color=0x00ff00,
-        )
-        if song["thumbnail"]:
-            embed.set_thumbnail(url=song["thumbnail"])
+        state.current_song = song
+        embed = create_now_playing_embed(song)
         await interaction.followup.send(embed=embed)
         await play_next(interaction.guild.id)
+
 
 @bot.tree.command(name="skip", description="Skip the current song")
 async def skip(interaction: discord.Interaction):
@@ -515,15 +419,17 @@ async def skip(interaction: discord.Interaction):
     vc.stop()
     await interaction.response.send_message("スキップしました！")
 
+
 @bot.tree.command(name="queue", description="Show the current queue")
 async def queue_cmd(interaction: discord.Interaction):
-    q = get_queue(interaction.guild.id)
-    if not q:
+    state = get_state(interaction.guild.id)
+    if not state.queue:
         await interaction.response.send_message("キューは空です。")
         return
-    desc = "\n".join(f"{i+1}. **[{s['title']}]({s['url']})**" for i, s in enumerate(q[:10]))
+    desc = "\n".join(f"{i+1}. **[{s['title']}]({s['url']})**" for i, s in enumerate(state.queue[:10]))
     embed = discord.Embed(title="キュー", description=desc, color=0x00ff00)
     await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="stop", description="Stop playing and clear the queue")
 async def stop(interaction: discord.Interaction):
@@ -532,10 +438,10 @@ async def stop(interaction: discord.Interaction):
     if vc:
         vc.stop()
         await vc.disconnect()
-    song_queues.pop(interaction.guild.id, None)
-    voice_clients_map.pop(interaction.guild.id, None)
-    current_song.pop(interaction.guild.id, None)
+    if interaction.guild.id in guild_states:
+        del guild_states[interaction.guild.id]
     await interaction.response.send_message("停止してキューをクリアしました。")
+
 
 @bot.tree.command(name="pause", description="Pause the current song")
 async def pause(interaction: discord.Interaction):
@@ -546,6 +452,7 @@ async def pause(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("再生していません。", ephemeral=True)
 
+
 @bot.tree.command(name="resume", description="Resume the paused song")
 async def resume(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
@@ -555,72 +462,16 @@ async def resume(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("一時停止していません。")
 
+
 @bot.tree.command(name="nowplaying", description="Show current playing song")
 async def nowplaying(interaction: discord.Interaction):
-    song = current_song.get(interaction.guild.id)
-    if not song:
+    state = get_state(interaction.guild.id)
+    if not state.current_song:
         await interaction.response.send_message("再生中の曲はありません。")
         return
-    duration_str = f"{song['duration'] // 60}:{song['duration'] % 60:02d}"
-    embed = discord.Embed(
-        title="再生中",
-        description=f"**[{song['title']}]({song['url']})**\n再生時間: {duration_str}",
-        color=0x00ff00,
-    )
-    if song["thumbnail"]:
-        embed.set_thumbnail(url=song["thumbnail"])
+    embed = create_now_playing_embed(state.current_song)
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="na-", description="ンアッー!(≧д≦)")
-async def na_command(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-    
-    vc = voice_clients_map.get(guild_id)
-    if not vc or not vc.is_connected():
-        await interaction.response.send_message("VCに接続していません。", ephemeral=True)
-        return
-    
-    if not vc.is_playing():
-        await interaction.response.send_message("再生していません。", ephemeral=True)
-        return
-    
-    mp3_file = os.path.join(SOUNDS_DIR, "na-.mp3")
-    if not os.path.exists(mp3_file):
-        await interaction.response.send_message("効果音ファイルが見つかりません。", ephemeral=True)
-        return
-    
-    if is_playing_sound.get(guild_id):
-        await interaction.response.send_message("同一楽曲再生中に1度しか流せません")
-        return
-    
-    logger.info("Playing sound effect via /na-")
-    is_playing_sound[guild_id] = True
-    if vc and vc.is_connected():
-        vc.stop()  # after_play checks is_playing_sound and skips play_next
-    
-    def after_sound(error):
-        if error:
-            logger.error(f"Sound effect error: {error}")
-        try:
-            asyncio.run_coroutine_threadsafe(restart_song(guild_id), bot.loop)
-        except Exception as e:
-            logger.error(f"Failed to schedule restart: {e}")
-            is_playing_sound[guild_id] = False
-    
-    try:
-        source = discord.FFmpegOpusAudio(
-            mp3_file,
-            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
-        )
-        vc.play(source, after=after_sound)
-        await interaction.response.send_message("ンアッー!", ephemeral=True)
-    except Exception as e:
-        logger.error(f"Failed to play sound: {e}")
-        is_playing_sound[guild_id] = False
-        if vc and vc.is_connected():
-            vc.resume()
-        await interaction.response.send_message("効果音の再生に失敗しました。", ephemeral=True)
 
 @bot.tree.command(name="refresh", description="Refresh niconico cookies")
 async def refresh(interaction: discord.Interaction):
@@ -632,6 +483,7 @@ async def refresh(interaction: discord.Interaction):
         await interaction.followup.send("Cookieを更新しました！", ephemeral=True)
     else:
         await interaction.followup.send("Cookieの更新に失敗しました", ephemeral=True)
+
 
 if __name__ == "__main__":
     if not TOKEN or TOKEN == "your_discord_bot_token_here":
