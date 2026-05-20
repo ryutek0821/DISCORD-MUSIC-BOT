@@ -752,9 +752,16 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if len(human_members) == 0:
         logger.info("All users left the voice channel, disconnecting bot")
         cancel_idle_task(guild.id)
+        text_channel = None
+        if state.current_song and state.current_song.get("text_channel_id"):
+            text_channel = guild.get_channel(state.current_song["text_channel_id"])
+        if not text_channel:
+            text_channel = next((ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages), None)
         await state.voice_client.disconnect()
         if guild.id in guild_states:
             del guild_states[guild.id]
+        if text_channel:
+            await text_channel.send("誰も居なくなったので退出しました。")
 
 
 if __name__ == "__main__":
