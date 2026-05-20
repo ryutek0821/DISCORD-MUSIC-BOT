@@ -40,9 +40,28 @@ jobs:
           
           # Deploy via SSH (Tailscale IP - no port forwarding needed)
           ssh "$SSH_USER@$SSH_HOST" << 'EOF'
+            set -e
             cd ~/niconico-discord-bot
             git fetch origin
             git checkout master
             git pull origin master
+
+            # Install/upgrade dependencies (use venv if present)
+            if [ -x venv/bin/pip ]; then
+              PIP="venv/bin/pip"
+            else
+              PIP="python3 -m pip"
+            fi
+            echo "Installing dependencies with: $PIP"
+            $PIP install --upgrade -r requirements.txt
+
+            # Restart the bot so new code and dependencies take effect
+            if systemctl list-unit-files | grep -q '^niconico-bot\.service'; then
+              sudo systemctl restart niconico-bot
+              sudo systemctl --no-pager status niconico-bot | head -n 5 || true
+            else
+              echo "WARNING: niconico-bot.service not found; restart the bot manually"
+            fi
+
             echo "Deployed successfully at $(date)"
           EOF
