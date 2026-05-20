@@ -193,7 +193,7 @@ def refresh_nico_cookies_sync(force: bool = False) -> bool:
 
 
 def extract_audio_url(url: str) -> Dict[str, Any]:
-    """Extract audio stream URL without downloading."""
+    """Extract audio stream URL or download for niconico."""
     if "nicovideo.jp" in url:
         refresh_nico_cookies_sync()
 
@@ -251,19 +251,7 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
                           f"({selected_format.get('abr', 'unknown')}kbps, "
                           f"{selected_format.get('asr', 'unknown')}Hz)")
 
-            # Extract cookies for FFmpeg headers (needed for niconico)
-            cookie_header = None
-            if "nicovideo.jp" in url and COOKIE_FILE and os.path.exists(COOKIE_FILE):
-                with open(COOKIE_FILE) as f:
-                    cookies = {}
-                    for line in f:
-                        if line.startswith("#") or line.strip() == "":
-                            continue
-                        parts = line.strip().split("\t")
-                        if len(parts) >= 7:
-                            cookies[parts[5]] = parts[6]
-                    if cookies:
-                        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+            is_niconico = "nicovideo.jp" in url
 
             return {
                 "url": url,
@@ -271,7 +259,8 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
                 "title": info.get("title", "Unknown"),
                 "duration": info.get("duration", 0),
                 "thumbnail": info.get("thumbnail", ""),
-                "cookie_header": cookie_header,
+                "is_niconico": is_niconico,
+                "local_file": None,
             }
     except Exception as e:
         logger.error(f"Failed to extract audio URL: {e}")
@@ -332,30 +321,68 @@ async def play_next(guild_id: int) -> None:
     def after_play(error):
         if error:
             logger.error(f"Play error: {error}")
+        local_file = song.get("local_file")
+        if local_file and os.path.exists(local_file):
+            try:
+                os.remove(local_file)
+                logger.info(f"Cleaned up temp file: {local_file}")
+            except Exception as e:
+                logger.warning(f"Failed to remove temp file: {e}")
         if not state.is_playing_sound:
             asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop)
 
     try:
-        audio_url = song.get("audio_url")
-        if not audio_url:
-            logger.error("No audio URL available for streaming")
-            await play_next(guild_id)
-            return
+        audio_source = song.get("audio_url")
 
-        cookie_header = song.get("cookie_header")
-        ffmpeg_options = "-c:a libopus -b:a 192k -ar 48000 -ac 2"
-        if cookie_header:
-            ffmpeg_options += f' -headers "Cookie: {cookie_header}\\r\\nReferer: https://www.nicovideo.jp/\\r\\n"'
+        if song.get("is_niconico"):
+            local_file = await asyncio.get_event_loop().run_in_executor(
+                None, download_niconico_audio, song["url"]
+            )
+            if not local_file:
+                logger.error("Failed to download niconico audio")
+                await play_next(guild_id)
+                return
+            song["local_file"] = local_file
+            audio_source = local_file
 
         source = discord.FFmpegOpusAudio(
-            audio_url,
+            audio_source,
             before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            options=ffmpeg_options,
+            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
         )
         vc.play(source, after=after_play)
     except Exception as e:
         logger.error(f"Play failed: {e}")
         await play_next(guild_id)
+
+
+def download_niconico_audio(url: str) -> str:
+    """Download niconico audio to a temp file and return the path."""
+    tmpdir = tempfile.gettempdir()
+    output_template = os.path.join(tmpdir, "nico_%(id)s.%(ext)s")
+
+    ydl_opts = {
+        "format": "bestaudio[ext=opus]/bestaudio[ext=m4a]/bestaudio[ext=aac]/bestaudio/best",
+        "format_sort": ["abr", "asr"],
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "outtmpl": output_template,
+    }
+
+    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
+        ydl_opts["cookiefile"] = COOKIE_FILE
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            if os.path.exists(filename):
+                logger.info(f"Downloaded niconico audio: {filename}")
+                return filename
+    except Exception as e:
+        logger.error(f"Failed to download niconico audio: {e}")
+    return None
 
 
 @bot.event
@@ -454,12 +481,6 @@ async def restart_song(guild_id: int) -> None:
         state.is_playing_sound = False
         return
 
-    audio_url = song.get("audio_url")
-    if not audio_url:
-        logger.warning(f"No audio URL available for guild {guild_id}")
-        state.is_playing_sound = False
-        return
-
     if not vc or not vc.is_connected():
         logger.warning(f"VC not available for guild {guild_id}")
         state.is_playing_sound = False
@@ -473,15 +494,25 @@ async def restart_song(guild_id: int) -> None:
         state.is_playing_sound = False
 
     try:
-        cookie_header = song.get("cookie_header")
-        ffmpeg_options = "-c:a libopus -b:a 192k -ar 48000 -ac 2"
-        if cookie_header:
-            ffmpeg_options += f' -headers "Cookie: {cookie_header}\\r\\nReferer: https://www.nicovideo.jp/\\r\\n"'
+        audio_source = song.get("audio_url")
+
+        if song.get("is_niconico") and not song.get("local_file"):
+            local_file = await asyncio.get_event_loop().run_in_executor(
+                None, download_niconico_audio, song["url"]
+            )
+            if not local_file:
+                logger.error("Failed to download niconico audio for restart")
+                state.is_playing_sound = False
+                return
+            song["local_file"] = local_file
+            audio_source = local_file
+        elif song.get("local_file"):
+            audio_source = song["local_file"]
 
         source = discord.FFmpegOpusAudio(
-            audio_url,
+            audio_source,
             before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            options=ffmpeg_options,
+            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
         )
         vc.play(source, after=after_restart)
     except Exception as e:
