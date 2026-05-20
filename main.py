@@ -251,12 +251,27 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
                           f"({selected_format.get('abr', 'unknown')}kbps, "
                           f"{selected_format.get('asr', 'unknown')}Hz)")
 
+            # Extract cookies for FFmpeg headers (needed for niconico)
+            cookie_header = None
+            if "nicovideo.jp" in url and COOKIE_FILE and os.path.exists(COOKIE_FILE):
+                with open(COOKIE_FILE) as f:
+                    cookies = {}
+                    for line in f:
+                        if line.startswith("#") or line.strip() == "":
+                            continue
+                        parts = line.strip().split("\t")
+                        if len(parts) >= 7:
+                            cookies[parts[5]] = parts[6]
+                    if cookies:
+                        cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
             return {
                 "url": url,
                 "audio_url": audio_url,
                 "title": info.get("title", "Unknown"),
                 "duration": info.get("duration", 0),
                 "thumbnail": info.get("thumbnail", ""),
+                "cookie_header": cookie_header,
             }
     except Exception as e:
         logger.error(f"Failed to extract audio URL: {e}")
@@ -327,10 +342,15 @@ async def play_next(guild_id: int) -> None:
             await play_next(guild_id)
             return
 
+        cookie_header = song.get("cookie_header")
+        ffmpeg_options = "-c:a libopus -b:a 192k -ar 48000 -ac 2"
+        if cookie_header:
+            ffmpeg_options += f' -headers "Cookie: {cookie_header}\\r\\nReferer: https://www.nicovideo.jp/\\r\\n"'
+
         source = discord.FFmpegOpusAudio(
             audio_url,
             before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
+            options=ffmpeg_options,
         )
         vc.play(source, after=after_play)
     except Exception as e:
@@ -453,10 +473,15 @@ async def restart_song(guild_id: int) -> None:
         state.is_playing_sound = False
 
     try:
+        cookie_header = song.get("cookie_header")
+        ffmpeg_options = "-c:a libopus -b:a 192k -ar 48000 -ac 2"
+        if cookie_header:
+            ffmpeg_options += f' -headers "Cookie: {cookie_header}\\r\\nReferer: https://www.nicovideo.jp/\\r\\n"'
+
         source = discord.FFmpegOpusAudio(
             audio_url,
             before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
+            options=ffmpeg_options,
         )
         vc.play(source, after=after_restart)
     except Exception as e:
