@@ -19,6 +19,11 @@ NICO_EMAIL = os.getenv("NICO_EMAIL")
 NICO_PASSWORD = os.getenv("NICO_PASSWORD")
 CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 
+SOUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
+
+if not os.path.isdir(SOUNDS_DIR):
+    os.makedirs(SOUNDS_DIR, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -40,6 +45,7 @@ class GuildState:
         self.voice_client: Optional[discord.VoiceClient] = None
         self.current_song: Optional[Dict[str, Any]] = None
         self.idle_task: Optional[asyncio.Task] = None
+        self.is_playing_sound: bool = False
 
 
 guild_states: Dict[int, GuildState] = {}
@@ -311,7 +317,8 @@ async def play_next(guild_id: int) -> None:
     def after_play(error):
         if error:
             logger.error(f"Play error: {error}")
-        asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop)
+        if not state.is_playing_sound:
+            asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop)
 
     try:
         audio_url = song.get("audio_url")
@@ -351,6 +358,110 @@ async def background_cookie_refresh():
         except Exception as e:
             logger.error(f"Background cookie refresh error: {e}")
         await asyncio.sleep(COOKIE_TTL)
+
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+
+    if not message.guild:
+        await bot.process_commands(message)
+        return
+
+    guild_id = message.guild.id
+    content = message.content
+
+    if content in ["んあー", "んあーと"]:
+        state = get_state(guild_id)
+        if state.is_playing_sound:
+            await bot.process_commands(message)
+            return
+
+        vc = state.voice_client
+        if not vc or not vc.is_connected():
+            await bot.process_commands(message)
+            return
+
+        if not vc.is_playing():
+            await bot.process_commands(message)
+            return
+
+        mp3_file = os.path.join(SOUNDS_DIR, "na-.mp3")
+        if not os.path.exists(mp3_file):
+            logger.warning(f"Sound file not found: {mp3_file}")
+            await bot.process_commands(message)
+            return
+
+        logger.info(f"Playing sound effect for trigger: {content}")
+        state.is_playing_sound = True
+        vc.stop()
+
+        def after_sound(error):
+            if error:
+                logger.error(f"Sound effect error: {error}")
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    restart_song(guild_id), bot.loop
+                )
+            except Exception as e:
+                logger.error(f"Failed to schedule restart: {e}")
+                state.is_playing_sound = False
+
+        try:
+            source = discord.FFmpegOpusAudio(
+                mp3_file,
+                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
+            )
+            vc.play(source, after=after_sound)
+        except Exception as e:
+            logger.error(f"Failed to play sound: {e}")
+            state.is_playing_sound = False
+
+    await bot.process_commands(message)
+
+
+async def restart_song(guild_id: int) -> None:
+    await asyncio.sleep(0.3)
+    state = get_state(guild_id)
+    vc = state.voice_client
+
+    song = state.current_song
+    if not song:
+        logger.warning("No current song found")
+        state.is_playing_sound = False
+        return
+
+    audio_url = song.get("audio_url")
+    if not audio_url:
+        logger.warning(f"No audio URL available for guild {guild_id}")
+        state.is_playing_sound = False
+        return
+
+    if not vc or not vc.is_connected():
+        logger.warning(f"VC not available for guild {guild_id}")
+        state.is_playing_sound = False
+        return
+
+    logger.info(f"Restarting song from beginning: {song['title']}")
+
+    def after_restart(error):
+        if error:
+            logger.error(f"Restart error: {error}")
+        state.is_playing_sound = False
+
+    try:
+        source = discord.FFmpegOpusAudio(
+            audio_url,
+            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
+        )
+        vc.play(source, after=after_restart)
+    except Exception as e:
+        logger.error(f"Failed to restart song: {e}")
+        state.is_playing_sound = False
 
 
 @bot.tree.command(name="play", description="Play a song from NicoNico or YouTube")
@@ -472,6 +583,59 @@ async def nowplaying(interaction: discord.Interaction):
         return
     embed = create_now_playing_embed(state.current_song)
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="na-", description="ンアッー!(≧д≦)")
+async def na_command(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    state = get_state(guild_id)
+
+    vc = state.voice_client
+    if not vc or not vc.is_connected():
+        await interaction.response.send_message("VCに接続していません。", ephemeral=True)
+        return
+
+    if not vc.is_playing():
+        await interaction.response.send_message("再生していません。", ephemeral=True)
+        return
+
+    mp3_file = os.path.join(SOUNDS_DIR, "na-.mp3")
+    if not os.path.exists(mp3_file):
+        await interaction.response.send_message("効果音ファイルが見つかりません。", ephemeral=True)
+        return
+
+    if state.is_playing_sound:
+        await interaction.response.send_message("同一楽曲再生中に1度しか流せません")
+        return
+
+    logger.info("Playing sound effect via /na-")
+    state.is_playing_sound = True
+    if vc and vc.is_connected():
+        vc.stop()
+
+    def after_sound(error):
+        if error:
+            logger.error(f"Sound effect error: {error}")
+        try:
+            asyncio.run_coroutine_threadsafe(restart_song(guild_id), bot.loop)
+        except Exception as e:
+            logger.error(f"Failed to schedule restart: {e}")
+            state.is_playing_sound = False
+
+    try:
+        source = discord.FFmpegOpusAudio(
+            mp3_file,
+            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
+        )
+        vc.play(source, after=after_sound)
+        await interaction.response.send_message("ンアッー!", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Failed to play sound: {e}")
+        state.is_playing_sound = False
+        if vc and vc.is_connected():
+            vc.resume()
+        await interaction.response.send_message("効果音の再生に失敗しました。", ephemeral=True)
 
 
 @bot.tree.command(name="refresh", description="Refresh niconico cookies")
