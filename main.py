@@ -370,6 +370,8 @@ async def play_next(guild_id: int) -> None:
 
     try:
         audio_source = song.get("audio_url")
+        # -reconnect options only apply to network input; local files reject them.
+        before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 
         if song.get("is_niconico"):
             local_file = await asyncio.get_event_loop().run_in_executor(
@@ -381,10 +383,11 @@ async def play_next(guild_id: int) -> None:
                 return
             song["local_file"] = local_file
             audio_source = local_file
+            before_opts = None
 
         source = discord.FFmpegOpusAudio(
             audio_source,
-            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            before_options=before_opts,
             options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
         )
         vc.play(source, after=after_play)
@@ -486,7 +489,6 @@ async def on_message(message):
         try:
             source = discord.FFmpegOpusAudio(
                 mp3_file,
-                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
                 options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
             )
             vc.play(source, after=after_sound)
@@ -522,6 +524,7 @@ async def restart_song(guild_id: int) -> None:
 
     try:
         audio_source = song.get("audio_url")
+        before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 
         if song.get("is_niconico") and not song.get("local_file"):
             local_file = await asyncio.get_event_loop().run_in_executor(
@@ -533,12 +536,14 @@ async def restart_song(guild_id: int) -> None:
                 return
             song["local_file"] = local_file
             audio_source = local_file
+            before_opts = None
         elif song.get("local_file"):
             audio_source = song["local_file"]
+            before_opts = None
 
         source = discord.FFmpegOpusAudio(
             audio_source,
-            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            before_options=before_opts,
             options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
         )
         vc.play(source, after=after_restart)
@@ -708,7 +713,6 @@ async def na_command(interaction: discord.Interaction):
     try:
         source = discord.FFmpegOpusAudio(
             mp3_file,
-            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
             options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
         )
         vc.play(source, after=after_sound)
