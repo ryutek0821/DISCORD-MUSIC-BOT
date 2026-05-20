@@ -89,16 +89,23 @@ def create_queued_embed(song: Dict[str, Any], position: int) -> discord.Embed:
     return embed
 
 
+NICO_LOGIN_BASE = "https://account.nicovideo.jp"
+
+
 def login_via_api() -> requests.cookies.RequestsCookieJar:
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
     })
-    session.get("https://account.nicovideo.jp/login")
-    resp = session.post("https://account.nicovideo.jp/api/v1/login", data={
-        "mail_tel": NICO_EMAIL,
-        "password": NICO_PASSWORD,
-    }, allow_redirects=True)
+    # niconico deprecated /api/v1/login; the current login flow posts to
+    # /login/redirector and sets the `user_session` cookie on success.
+    session.get(f"{NICO_LOGIN_BASE}/login")
+    resp = session.post(
+        f"{NICO_LOGIN_BASE}/login/redirector",
+        data={"mail_tel": NICO_EMAIL, "password": NICO_PASSWORD},
+        headers={"Referer": f"{NICO_LOGIN_BASE}/login"},
+        allow_redirects=True,
+    )
     logger.info(f"API login status: {resp.status_code}")
     return session.cookies
 
@@ -132,10 +139,11 @@ def refresh_nico_cookies_sync(force: bool = False) -> bool:
     logger.info("Refreshing niconico cookies via API...")
     try:
         cookies = login_via_api()
-        if len(cookies) >= 2:
+        if any(c.name == "user_session" for c in cookies):
             save_session_cookies(cookies)
             last_cookie_refresh = time.time()
             return True
+        logger.warning("API login did not return a user_session cookie")
     except Exception as e:
         logger.error(f"API login failed: {e}")
 
@@ -192,22 +200,51 @@ def refresh_nico_cookies_sync(force: bool = False) -> bool:
         return False
 
 
-def extract_audio_url(url: str) -> Dict[str, Any]:
-    """Extract audio stream URL or download for niconico."""
-    if "nicovideo.jp" in url:
-        refresh_nico_cookies_sync()
+def ensure_cookie_file() -> None:
+    """Create an empty Netscape cookie file so yt-dlp can load and persist it."""
+    if COOKIE_FILE and not os.path.exists(COOKIE_FILE):
+        try:
+            with open(COOKIE_FILE, "w") as f:
+                f.write("# Netscape HTTP Cookie File\n")
+            os.chmod(COOKIE_FILE, 0o600)
+        except Exception as e:
+            logger.warning(f"Failed to create cookie file: {e}")
 
-    ydl_opts = {
+
+def build_ydl_opts(url: str, **overrides: Any) -> Dict[str, Any]:
+    """Build yt-dlp options, enabling niconico login + cookie persistence."""
+    ydl_opts: Dict[str, Any] = {
         "format": "bestaudio[ext=opus]/bestaudio[ext=m4a]/bestaudio[ext=aac]/bestaudio/best",
         "format_sort": ["abr", "asr"],
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 10,
     }
+    ydl_opts.update(overrides)
 
-    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
-        ydl_opts["cookiefile"] = COOKIE_FILE
+    is_niconico = "nicovideo.jp" in url
+
+    if COOKIE_FILE:
+        ensure_cookie_file()
+        if os.path.exists(COOKIE_FILE):
+            ydl_opts["cookiefile"] = COOKIE_FILE
+
+    # Let yt-dlp perform the login itself using the current niconico flow.
+    # It reuses the cached user_session cookie when present and saves fresh
+    # cookies back to COOKIE_FILE on close.
+    if is_niconico and NICO_EMAIL and NICO_PASSWORD:
+        ydl_opts["username"] = NICO_EMAIL
+        ydl_opts["password"] = NICO_PASSWORD
+
+    return ydl_opts
+
+
+def extract_audio_url(url: str) -> Dict[str, Any]:
+    """Extract audio stream URL or download for niconico."""
+    if "nicovideo.jp" in url:
+        refresh_nico_cookies_sync()
+
+    ydl_opts = build_ydl_opts(url, socket_timeout=10)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -361,17 +398,7 @@ def download_niconico_audio(url: str) -> str:
     tmpdir = tempfile.gettempdir()
     output_template = os.path.join(tmpdir, "nico_%(id)s.%(ext)s")
 
-    ydl_opts = {
-        "format": "bestaudio[ext=opus]/bestaudio[ext=m4a]/bestaudio[ext=aac]/bestaudio/best",
-        "format_sort": ["abr", "asr"],
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "outtmpl": output_template,
-    }
-
-    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
-        ydl_opts["cookiefile"] = COOKIE_FILE
+    ydl_opts = build_ydl_opts(url, outtmpl=output_template)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
