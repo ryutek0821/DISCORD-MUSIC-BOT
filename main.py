@@ -737,6 +737,26 @@ async def refresh(interaction: discord.Interaction):
         await interaction.followup.send("Cookieの更新に失敗しました", ephemeral=True)
 
 
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.bot:
+        return
+
+    guild = member.guild
+    state = guild_states.get(guild.id)
+    if not state or not state.voice_client or not state.voice_client.is_connected():
+        return
+
+    bot_channel = state.voice_client.channel
+    human_members = [m for m in bot_channel.members if not m.bot]
+    if len(human_members) == 0:
+        logger.info("All users left the voice channel, disconnecting bot")
+        cancel_idle_task(guild.id)
+        await state.voice_client.disconnect()
+        if guild.id in guild_states:
+            del guild_states[guild.id]
+
+
 if __name__ == "__main__":
     if not TOKEN or TOKEN == "your_discord_bot_token_here":
         print("Error: Please set DISCORD_TOKEN in .env file")
