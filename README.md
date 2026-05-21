@@ -1,26 +1,42 @@
 # INMERMUSIC_BOT
 
-Discordでニコニコ動画を再生できるMusic Bot
+Discordでニコニコ動画・YouTubeを再生できるMusic Bot
 
 ## 機能
 
 - ニコニコ動画・YouTubeの再生
-- `/play` - 曲再生（URLまたは検索キーワード）
-- `/skip` - スキップ
-- `/queue` - キュー表示
-- `/stop` - 停止
-- `/pause` / `/resume` - 一時停止/再開
-- `/nowplaying` - 再生中の曲表示
-- `/na-` - 効果音再生（ンアッー!）
-- `/refresh` - ニコニコCookie更新
+- キュー管理（追加・スキップ・表示・クリア）
+- 再生中の曲情報をEmbedで表示（タイトル・URL・再生時間・リクエスト者・サムネイル）
+- 効果音再生（`/na-` またはメッセージトリガー `んあー` / `んあーと`）
+- ニコニコCookieの自動更新・手動更新
+- アイドル時に自動VC切断
+
+## スラッシュコマンド
+
+| コマンド | 説明 |
+|----------|------|
+| `/play <URL/キーワード>` | 曲を再生（ニコニコ動画URL、YouTubeURL、または検索キーワード） |
+| `/skip` | 現在の曲をスキップ |
+| `/queue` | キューを表示（最大10件） |
+| `/stop` | 再生を停止してキューをクリア、VCから切断 |
+| `/pause` | 現在の曲を一時停止 |
+| `/resume` | 一時停止した曲を再開 |
+| `/nowplaying` | 再生中の曲情報を表示 |
+| `/na-` | 効果音を再生（同一楽曲中に1回のみ） |
+| `/refresh` | ニコニコのCookieを手動で更新 |
+
+## メッセージトリガー
+
+VC接続中に以下のメッセージを送信すると効果音が再生されます：
+- `んあー`
+- `んあーと`
 
 ## 必要環境
 
-- Raspberry Pi 4 (aarch64)
+- Raspberry Pi 4 (aarch64) または Linux/macOS
 - Python 3.11+
-- discord.py
-- yt-dlp
-- Selenium + Chromium
+- FFmpeg
+- Chromium（Seleniumフォールバック用）
 
 ## セットアップ
 
@@ -34,16 +50,19 @@ pip install -r requirements.txt
 
 # 環境変数設定
 cp .env.example .env
-# .envファイルを編集してトークンを設定
+# .envファイルを編集して各値を設定
 ```
 
 ## .env設定
 
 ```
 DISCORD_TOKEN=あなたのDiscordBotトークン
-COOKIE_FILE=cookies.txtへのパス
+COOKIE_FILE=cookies.txt
 NICO_EMAIL=ニコニコメールアドレス
 NICO_PASSWORD=ニコニコパスワード
+CHROMEDRIVER_PATH=/usr/bin/chromedriver  # オプション
+COOKIE_TTL=3600                           # オプション、Cookie有効期限（秒）
+IDLE_TIMEOUT=180                          # オプション、アイドル切断時間（秒）
 ```
 
 ## 起動
@@ -52,7 +71,7 @@ NICO_PASSWORD=ニコニコパスワード
 python main.py
 ```
 
-またはsystemdサービスとして起動:
+### systemdサービスとして起動
 
 ```bash
 sudo cp niconico-bot.service /etc/systemd/system/
@@ -62,13 +81,20 @@ sudo systemctl start niconico-bot
 
 ## 効果音
 
-`sounds/na-.mp3` に効果音ファイルを配置
+`sounds/na-.mp3` に効果音ファイルを配置してください。
 
----
+## アーキテクチャ
+
+- `main.py` - シングルファイル構成
+- `GuildState` クラスでサーバーごとの状態を管理（キュー、VC、現在の曲、アイドルタスク）
+- ニコニコ動画の音yt-dlpでローカルにダウンロードしてから再生（403エラー回避）
+- YouTubeはストリーム再生
+- 再生終了後に一時ファイルを自動削除
+- CookieはAPIログインで取得、失敗時にSeleniumフォールバック
 
 ## GitOps
 
-This project uses automated GitOps workflow:
+このプロジェクトは自動化されたGitOpsワークフローを使用しています：
 - PR to master → Auto merge
 - Merge to master → Version tag
-- Daily 18:00 JST → Deploy to Raspberry Pi via Tailscale# Deploy test Mon Apr 27 21:04:22 JST 2026
+- Daily 18:00 JST → Deploy to Raspberry Pi via Tailscale
