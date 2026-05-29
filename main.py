@@ -606,6 +606,17 @@ async def restart_song(guild_id: int) -> None:
         if error:
             logger.error(f"Restart error: {error}")
         state.is_playing_sound = False
+        local_file = song.get("local_file")
+        if local_file and os.path.exists(local_file):
+            try:
+                os.remove(local_file)
+                song["local_file"] = None
+                logger.info(f"Cleaned up temp file: {local_file}")
+            except Exception as e:
+                logger.warning(f"Failed to remove temp file: {e}")
+        # The restarted song finished — advance the queue like a normal track end.
+        # Previously the queue stalled here (next song never played after a sound effect).
+        asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), bot.loop)
 
     try:
         audio_source = song.get("audio_url")
