@@ -42,21 +42,25 @@ jobs:
             const newVersion = `${parts[0] || 0}.${parts[1] || 0}.${patch}`;
             console.log(`Bumping version: ${currentVersion} -> ${newVersion}`);
 
-            // Create tag
-            await github.rest.git.createRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: 'refs/tags/v' + newVersion,
-              sha: context.sha
-            });
+            try {
+              // Create tag
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: 'refs/tags/v' + newVersion,
+                sha: context.sha
+              });
 
-            // Create release
-            await github.rest.repos.createRelease({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              tag_name: 'v' + newVersion,
-              name: 'Version ' + newVersion,
-              body: 'Auto-generated release for version ' + newVersion
-            });
+              // Create release
+              await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: 'v' + newVersion,
+                name: 'Version ' + newVersion,
+                body: 'Auto-generated release for version ' + newVersion
+              });
 
-            console.log('Created tag and release: v' + newVersion);
+              console.log('Created tag and release: v' + newVersion);
+            } catch (e) {
+              console.log('Tag/release creation skipped (may already exist): ' + e.message);
+            }

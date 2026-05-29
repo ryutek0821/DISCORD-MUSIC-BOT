@@ -40,9 +40,14 @@ jobs:
           
           # Deploy via SSH (Tailscale IP - no port forwarding needed)
           ssh "$SSH_USER@$SSH_HOST" << 'EOF'
+            set -e
             cd ~/niconico-discord-bot
             git fetch origin
             git checkout master
-            git pull origin master
-            echo "Deployed successfully at $(date)"
+            git pull --ff-only origin master
+            ./venv/bin/pip install -q -r requirements.txt
+            sudo systemctl restart niconico-bot
+            sleep 5
+            systemctl is-active niconico-bot
+            echo "Deployed and restarted at $(date)"
           EOF
