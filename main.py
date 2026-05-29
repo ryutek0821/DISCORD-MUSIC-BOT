@@ -1,5 +1,6 @@
 import os
 import asyncio
+import random
 import logging
 from typing import Optional, Dict, List, Any
 import yt_dlp
@@ -46,6 +47,8 @@ class GuildState:
         self.current_song: Optional[Dict[str, Any]] = None
         self.idle_task: Optional[asyncio.Task] = None
         self.is_playing_sound: bool = False
+        self.loop_mode: str = "off"  # "off" | "song" | "queue"
+        self.skip_flag: bool = False
 
 
 guild_states: Dict[int, GuildState] = {}
@@ -219,6 +222,8 @@ def build_ydl_opts(url: str, **overrides: Any) -> Dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        # Treat bare keywords as a YouTube search instead of an invalid URL.
+        "default_search": "ytsearch",
     }
     ydl_opts.update(overrides)
 
@@ -325,7 +330,85 @@ async def schedule_disconnect(guild_id: int) -> None:
         pass
 
 
-async def play_next(guild_id: int) -> None:
+class MusicControls(discord.ui.View):
+    """Interactive control buttons attached to the now-playing embed."""
+
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.secondary)
+    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if vc and vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message("⏸️ 一時停止しました。", ephemeral=True)
+        elif vc and vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message("▶️ 再開しました。", ephemeral=True)
+        else:
+            await interaction.response.send_message("再生していません。", ephemeral=True)
+
+    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            state = get_state(interaction.guild.id)
+            state.skip_flag = True
+            vc.stop()
+            await interaction.response.send_message("⏭️ スキップしました。", ephemeral=True)
+        else:
+            await interaction.response.send_message("再生していません。", ephemeral=True)
+
+    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger)
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cancel_idle_task(interaction.guild.id)
+        vc = interaction.guild.voice_client
+        if vc:
+            vc.stop()
+            await vc.disconnect()
+        if interaction.guild.id in guild_states:
+            del guild_states[interaction.guild.id]
+        await interaction.response.send_message("⏹️ 停止しました。", ephemeral=True)
+
+    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary)
+    async def loop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_state(interaction.guild.id)
+        order = {"off": "song", "song": "queue", "queue": "off"}
+        state.loop_mode = order.get(state.loop_mode, "off")
+        labels = {"off": "オフ", "song": "1曲リピート", "queue": "キュー全体リピート"}
+        await interaction.response.send_message(
+            f"🔁 リピート: **{labels[state.loop_mode]}**", ephemeral=True
+        )
+
+    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary)
+    async def shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_state(interaction.guild.id)
+        if len(state.queue) < 2:
+            await interaction.response.send_message("シャッフルする曲が足りません。", ephemeral=True)
+            return
+        random.shuffle(state.queue)
+        await interaction.response.send_message(
+            f"🔀 キュー（{len(state.queue)}曲）をシャッフルしました。", ephemeral=True
+        )
+
+
+async def advance_queue(guild_id: int, finished_song: Dict[str, Any]) -> None:
+    """Decide what to enqueue next based on loop/skip state, then play."""
+    state = get_state(guild_id)
+    if state.skip_flag:
+        # Manual skip overrides loop: drop the finished song and move on.
+        state.skip_flag = False
+    elif state.loop_mode == "song":
+        finished_song["local_file"] = None  # temp file already cleaned up
+        state.queue.insert(0, finished_song)
+    elif state.loop_mode == "queue":
+        finished_song["local_file"] = None
+        state.queue.append(finished_song)
+    await play_next(guild_id)
+
+
+async def play_next(guild_id: int, announce: bool = True) -> None:
     state = get_state(guild_id)
     vc = state.voice_client
 
@@ -345,15 +428,16 @@ async def play_next(guild_id: int) -> None:
     state.current_song = song
     logger.info(f"Playing: {song['title']}")
 
-    try:
-        embed = create_now_playing_embed(song)
-        channel_id = song.get("text_channel_id")
-        text_channel = vc.channel.guild.get_channel(channel_id) if channel_id else None
-        if not text_channel:
-            text_channel = vc.channel.guild.text_channels[0]
-        asyncio.create_task(text_channel.send(embed=embed))
-    except Exception as e:
-        logger.warning(f"Failed to send now playing message: {e}")
+    if announce:
+        try:
+            embed = create_now_playing_embed(song)
+            channel_id = song.get("text_channel_id")
+            text_channel = vc.channel.guild.get_channel(channel_id) if channel_id else None
+            if not text_channel:
+                text_channel = vc.channel.guild.text_channels[0]
+            asyncio.create_task(text_channel.send(embed=embed, view=MusicControls(guild_id)))
+        except Exception as e:
+            logger.warning(f"Failed to send now playing message: {e}")
 
     def after_play(error):
         if error:
@@ -362,11 +446,12 @@ async def play_next(guild_id: int) -> None:
         if local_file and os.path.exists(local_file):
             try:
                 os.remove(local_file)
+                song["local_file"] = None
                 logger.info(f"Cleaned up temp file: {local_file}")
             except Exception as e:
                 logger.warning(f"Failed to remove temp file: {e}")
         if not state.is_playing_sound:
-            asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop)
+            asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), bot.loop)
 
     try:
         audio_source = song.get("audio_url")
@@ -606,16 +691,19 @@ async def play(interaction: discord.Interaction, query: str):
     else:
         state.current_song = song
         embed = create_now_playing_embed(song)
-        await interaction.followup.send(embed=embed)
-        await play_next(interaction.guild.id)
+        await interaction.followup.send(embed=embed, view=MusicControls(interaction.guild.id))
+        # /play already announced this song, so don't re-announce in play_next.
+        await play_next(interaction.guild.id, announce=False)
 
 
 @bot.tree.command(name="skip", description="Skip the current song")
 async def skip(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
-    if not vc or not vc.is_playing():
+    if not vc or not (vc.is_playing() or vc.is_paused()):
         await interaction.response.send_message("再生していません。", ephemeral=True)
         return
+    state = get_state(interaction.guild.id)
+    state.skip_flag = True
     vc.stop()
     await interaction.response.send_message("スキップしました！")
 
@@ -629,6 +717,110 @@ async def queue_cmd(interaction: discord.Interaction):
     desc = "\n".join(f"{i+1}. **[{s['title']}]({s['url']})** (by {s.get('requester', '不明')})" for i, s in enumerate(state.queue[:10]))
     embed = discord.Embed(title="キュー", description=desc, color=0x00ff00)
     await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="loop", description="Set repeat mode (off / song / queue)")
+@app_commands.describe(mode="リピートモード")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="オフ", value="off"),
+    app_commands.Choice(name="1曲リピート", value="song"),
+    app_commands.Choice(name="キュー全体リピート", value="queue"),
+])
+async def loop_cmd(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+    state = get_state(interaction.guild.id)
+    state.loop_mode = mode.value
+    labels = {"off": "オフ", "song": "1曲リピート", "queue": "キュー全体リピート"}
+    await interaction.response.send_message(f"🔁 リピート: **{labels[state.loop_mode]}**")
+
+
+@bot.tree.command(name="shuffle", description="Shuffle the queue")
+async def shuffle_cmd(interaction: discord.Interaction):
+    state = get_state(interaction.guild.id)
+    if len(state.queue) < 2:
+        await interaction.response.send_message("シャッフルする曲が足りません。", ephemeral=True)
+        return
+    random.shuffle(state.queue)
+    await interaction.response.send_message(f"🔀 キュー（{len(state.queue)}曲）をシャッフルしました。")
+
+
+@bot.tree.command(name="remove", description="Remove a song from the queue by position")
+@app_commands.describe(position="削除するキューの番号（1から）")
+async def remove_cmd(interaction: discord.Interaction, position: int):
+    state = get_state(interaction.guild.id)
+    if not state.queue:
+        await interaction.response.send_message("キューは空です。", ephemeral=True)
+        return
+    if position < 1 or position > len(state.queue):
+        await interaction.response.send_message(
+            f"1〜{len(state.queue)} の範囲で指定してください。", ephemeral=True
+        )
+        return
+    removed = state.queue.pop(position - 1)
+    await interaction.response.send_message(f"🗑️ 削除しました: **{removed['title']}**")
+
+
+@bot.tree.command(name="clear", description="Clear the queue without disconnecting")
+async def clear_cmd(interaction: discord.Interaction):
+    state = get_state(interaction.guild.id)
+    count = len(state.queue)
+    state.queue.clear()
+    await interaction.response.send_message(
+        f"🧹 キューをクリアしました（{count}曲）。再生中の曲は継続します。"
+    )
+
+
+@bot.tree.command(name="join", description="Join your voice channel")
+async def join_cmd(interaction: discord.Interaction):
+    if not interaction.user.voice:
+        await interaction.response.send_message("先にVCに参加してください。", ephemeral=True)
+        return
+    channel = interaction.user.voice.channel
+    vc = interaction.guild.voice_client
+    state = get_state(interaction.guild.id)
+    try:
+        if vc:
+            await vc.move_to(channel)
+        else:
+            vc = await channel.connect(timeout=15)
+            state.voice_client = vc
+    except Exception as e:
+        await interaction.response.send_message(f"VC接続失敗: {str(e)}", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🔊 接続しました: **{channel.name}**")
+
+
+@bot.tree.command(name="leave", description="Disconnect from the voice channel")
+async def leave_cmd(interaction: discord.Interaction):
+    cancel_idle_task(interaction.guild.id)
+    vc = interaction.guild.voice_client
+    if not vc:
+        await interaction.response.send_message("VCに接続していません。", ephemeral=True)
+        return
+    vc.stop()
+    await vc.disconnect()
+    if interaction.guild.id in guild_states:
+        del guild_states[interaction.guild.id]
+    await interaction.response.send_message("👋 退出しました。")
+
+
+@bot.tree.command(name="help", description="Show available commands")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(title="INMERMUSIC BOT コマンド一覧", color=0x00ff00)
+    embed.add_field(name="/play <URL/キーワード>", value="ニコニコ/YouTube/検索キーワードで再生", inline=False)
+    embed.add_field(name="/skip", value="現在の曲をスキップ", inline=True)
+    embed.add_field(name="/pause・/resume", value="一時停止・再開", inline=True)
+    embed.add_field(name="/stop", value="停止してキュー削除・退出", inline=True)
+    embed.add_field(name="/queue", value="キューを表示", inline=True)
+    embed.add_field(name="/nowplaying", value="再生中の曲を表示", inline=True)
+    embed.add_field(name="/loop <mode>", value="リピート (off/song/queue)", inline=True)
+    embed.add_field(name="/shuffle", value="キューをシャッフル", inline=True)
+    embed.add_field(name="/remove <番号>", value="キューから曲を削除", inline=True)
+    embed.add_field(name="/clear", value="キューをクリア（再生は継続）", inline=True)
+    embed.add_field(name="/join・/leave", value="VCに参加・退出", inline=True)
+    embed.add_field(name="/na-", value="効果音（同一曲中1回）", inline=True)
+    embed.add_field(name="/refresh", value="ニコニコCookie更新", inline=True)
+    embed.add_field(name="メッセージトリガー", value="`んあー` / `んあーと` で効果音", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="stop", description="Stop playing and clear the queue")
@@ -670,7 +862,7 @@ async def nowplaying(interaction: discord.Interaction):
         await interaction.response.send_message("再生中の曲はありません。")
         return
     embed = create_now_playing_embed(state.current_song)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, view=MusicControls(interaction.guild.id))
 
 
 @bot.tree.command(name="na-", description="ンアッー!(≧д≦)")
