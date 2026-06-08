@@ -49,6 +49,10 @@ class GuildState:
         self.is_playing_sound: bool = False
         self.loop_mode: str = "off"  # "off" | "song" | "queue"
         self.skip_flag: bool = False
+        self.speed: float = 1.0          # playback tempo (0.5–2.0), pitch preserved
+        self.pitch: int = 0              # pitch shift in semitones (-12–+12)
+        self.seek_position: float = 0.0  # start offset (s) of the current FFmpeg source
+        self.loops_at_swap: int = 0      # player.loops captured when seek_position was set
 
 
 guild_states: Dict[int, GuildState] = {}
@@ -59,6 +63,10 @@ cookie_refresh_lock = asyncio.Lock()
 
 # Idle disconnect timeout (seconds) configurable via env
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
+
+# Playback speed / pitch limits shared by the effect buttons and slash commands.
+SPEED_MIN, SPEED_MAX, SPEED_STEP = 0.5, 2.0, 0.25
+PITCH_MIN, PITCH_MAX = -12, 12
 
 
 def get_state(guild_id: int) -> GuildState:
@@ -330,6 +338,92 @@ async def schedule_disconnect(guild_id: int) -> None:
         pass
 
 
+def _atempo_chain(factor: float) -> List[str]:
+    """Split a tempo factor into atempo filters within FFmpeg's 0.5–2.0 range."""
+    parts: List[str] = []
+    while factor > 2.0:
+        parts.append("atempo=2.0")
+        factor /= 2.0
+    while factor < 0.5:
+        parts.append("atempo=0.5")
+        factor /= 0.5
+    parts.append(f"atempo={factor:.6f}")
+    return parts
+
+
+def build_audio_filter(speed: float, pitch: int) -> Optional[str]:
+    """Build an FFmpeg -af value for the given tempo and pitch (semitones).
+
+    Pitch uses the asetrate trick so it runs on the stock FFmpeg shipped with
+    Raspberry Pi OS (no librubberband needed).
+    """
+    if abs(speed - 1.0) < 1e-6 and pitch == 0:
+        return None
+    filters: List[str] = []
+    ratio = 2 ** (pitch / 12.0)
+    if pitch != 0:
+        # asetrate shifts pitch *and* speed by `ratio`; resample back to 48k.
+        filters.append(f"asetrate={int(round(48000 * ratio))}")
+        filters.append("aresample=48000")
+    # Undo the asetrate speed change, then apply the requested speed.
+    filters.extend(_atempo_chain(speed / ratio))
+    return ",".join(filters)
+
+
+def make_audio_source(song: Dict[str, Any], state: GuildState, seek: float = 0.0) -> discord.FFmpegOpusAudio:
+    """Build an Opus source honoring the guild's speed/pitch and an optional seek."""
+    audio_source = song.get("local_file") or song.get("audio_url")
+    is_local = bool(song.get("local_file"))
+
+    before_parts: List[str] = []
+    if not is_local:
+        # -reconnect options only apply to network input; local files reject them.
+        before_parts.append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
+    if seek > 0:
+        before_parts.append(f"-ss {seek:.3f}")
+    before_options = " ".join(before_parts) if before_parts else None
+
+    options = "-c:a libopus -b:a 192k -ar 48000 -ac 2"
+    af = build_audio_filter(state.speed, state.pitch)
+    if af:
+        options += f' -af "{af}"'
+
+    return discord.FFmpegOpusAudio(audio_source, before_options=before_options, options=options)
+
+
+def current_elapsed(vc: discord.VoiceClient, state: GuildState) -> float:
+    """Best-effort playback position (s) within the current song, seek-aware."""
+    player = getattr(vc, "_player", None)
+    loops = getattr(player, "loops", 0) if player else 0
+    return max(0.0, state.seek_position + (loops - state.loops_at_swap) * 0.02)
+
+
+def reapply_audio_settings(vc: discord.VoiceClient, state: GuildState) -> None:
+    """Hot-swap the FFmpeg source so speed/pitch apply from the current position.
+
+    Swapping vc.source (instead of vc.play) avoids firing the `after` callback,
+    so the queue does not advance. The old source must be cleaned up manually.
+    """
+    song = state.current_song
+    if not song or not vc or not vc.is_connected():
+        return
+    was_paused = vc.is_paused()
+    elapsed = current_elapsed(vc, state)
+    new_source = make_audio_source(song, state, seek=elapsed)
+    old_source = vc.source
+    vc.source = new_source  # _set_source resumes unconditionally; re-pause below
+    if was_paused:
+        vc.pause()
+    if old_source:
+        try:
+            old_source.cleanup()
+        except Exception as e:
+            logger.warning(f"Failed to cleanup old audio source: {e}")
+    player = getattr(vc, "_player", None)
+    state.seek_position = elapsed
+    state.loops_at_swap = getattr(player, "loops", 0) if player else 0
+
+
 class MusicControls(discord.ui.View):
     """Interactive control buttons attached to the now-playing embed."""
 
@@ -391,6 +485,54 @@ class MusicControls(discord.ui.View):
         await interaction.response.send_message(
             f"🔀 キュー（{len(state.queue)}曲）をシャッフルしました。", ephemeral=True
         )
+
+    async def _apply_speed_pitch(self, interaction: discord.Interaction, *,
+                                 speed: Optional[float] = None,
+                                 pitch: Optional[int] = None):
+        state = get_state(interaction.guild.id)
+        vc = interaction.guild.voice_client
+        if not vc or not (vc.is_playing() or vc.is_paused()):
+            await interaction.response.send_message("再生していません。", ephemeral=True)
+            return
+        if state.is_playing_sound:
+            await interaction.response.send_message("効果音の再生中は変更できません。", ephemeral=True)
+            return
+        if speed is not None:
+            state.speed = speed
+        if pitch is not None:
+            state.pitch = pitch
+        reapply_audio_settings(vc, state)
+        await interaction.response.send_message(
+            f"🎚️ 速度 **{state.speed:.2f}x** / ピッチ **{state.pitch:+d}半音**", ephemeral=True
+        )
+
+    @discord.ui.button(emoji="🐢", label="遅く", style=discord.ButtonStyle.secondary, row=1)
+    async def slow_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_state(interaction.guild.id)
+        await self._apply_speed_pitch(
+            interaction, speed=round(max(SPEED_MIN, state.speed - SPEED_STEP), 2)
+        )
+
+    @discord.ui.button(emoji="🐇", label="速く", style=discord.ButtonStyle.secondary, row=1)
+    async def speed_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_state(interaction.guild.id)
+        await self._apply_speed_pitch(
+            interaction, speed=round(min(SPEED_MAX, state.speed + SPEED_STEP), 2)
+        )
+
+    @discord.ui.button(emoji="🔽", label="ピッチ-", style=discord.ButtonStyle.secondary, row=1)
+    async def pitch_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_state(interaction.guild.id)
+        await self._apply_speed_pitch(interaction, pitch=max(PITCH_MIN, state.pitch - 1))
+
+    @discord.ui.button(emoji="🔼", label="ピッチ+", style=discord.ButtonStyle.secondary, row=1)
+    async def pitch_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = get_state(interaction.guild.id)
+        await self._apply_speed_pitch(interaction, pitch=min(PITCH_MAX, state.pitch + 1))
+
+    @discord.ui.button(emoji="🎚️", label="リセット", style=discord.ButtonStyle.primary, row=1)
+    async def reset_effects(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply_speed_pitch(interaction, speed=1.0, pitch=0)
 
 
 async def advance_queue(guild_id: int, finished_song: Dict[str, Any]) -> None:
@@ -454,11 +596,7 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
             asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), bot.loop)
 
     try:
-        audio_source = song.get("audio_url")
-        # -reconnect options only apply to network input; local files reject them.
-        before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-
-        if song.get("is_niconico"):
+        if song.get("is_niconico") and not song.get("local_file"):
             local_file = await asyncio.get_event_loop().run_in_executor(
                 None, download_niconico_audio, song["url"]
             )
@@ -467,14 +605,11 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                 await play_next(guild_id)
                 return
             song["local_file"] = local_file
-            audio_source = local_file
-            before_opts = None
 
-        source = discord.FFmpegOpusAudio(
-            audio_source,
-            before_options=before_opts,
-            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
-        )
+        # A fresh FFmpeg process starts at loops=0; reset the seek bookkeeping.
+        state.seek_position = 0.0
+        state.loops_at_swap = 0
+        source = make_audio_source(song, state, seek=0.0)
         vc.play(source, after=after_play)
     except Exception as e:
         logger.error(f"Play failed: {e}")
@@ -619,9 +754,6 @@ async def restart_song(guild_id: int) -> None:
         asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), bot.loop)
 
     try:
-        audio_source = song.get("audio_url")
-        before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-
         if song.get("is_niconico") and not song.get("local_file"):
             local_file = await asyncio.get_event_loop().run_in_executor(
                 None, download_niconico_audio, song["url"]
@@ -631,17 +763,11 @@ async def restart_song(guild_id: int) -> None:
                 state.is_playing_sound = False
                 return
             song["local_file"] = local_file
-            audio_source = local_file
-            before_opts = None
-        elif song.get("local_file"):
-            audio_source = song["local_file"]
-            before_opts = None
 
-        source = discord.FFmpegOpusAudio(
-            audio_source,
-            before_options=before_opts,
-            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
-        )
+        # Restart from the top, keeping the active speed/pitch settings.
+        state.seek_position = 0.0
+        state.loops_at_swap = 0
+        source = make_audio_source(song, state, seek=0.0)
         vc.play(source, after=after_restart)
     except Exception as e:
         logger.error(f"Failed to restart song: {e}")
@@ -754,6 +880,28 @@ async def shuffle_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(f"🔀 キュー（{len(state.queue)}曲）をシャッフルしました。")
 
 
+@bot.tree.command(name="speed", description="Set playback speed (0.5-2.0x, pitch preserved)")
+@app_commands.describe(rate="再生速度 (0.5〜2.0)")
+async def speed_cmd(interaction: discord.Interaction, rate: app_commands.Range[float, 0.5, 2.0]):
+    state = get_state(interaction.guild.id)
+    vc = interaction.guild.voice_client
+    state.speed = round(rate, 2)
+    if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
+        reapply_audio_settings(vc, state)
+    await interaction.response.send_message(f"🎚️ 速度を **{state.speed:.2f}x** にしました。")
+
+
+@bot.tree.command(name="pitch", description="Set pitch shift in semitones (-12 to +12)")
+@app_commands.describe(semitones="ピッチ (-12〜+12半音)")
+async def pitch_cmd(interaction: discord.Interaction, semitones: app_commands.Range[int, -12, 12]):
+    state = get_state(interaction.guild.id)
+    vc = interaction.guild.voice_client
+    state.pitch = semitones
+    if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
+        reapply_audio_settings(vc, state)
+    await interaction.response.send_message(f"🎚️ ピッチを **{state.pitch:+d}半音** にしました。")
+
+
 @bot.tree.command(name="remove", description="Remove a song from the queue by position")
 @app_commands.describe(position="削除するキューの番号（1から）")
 async def remove_cmd(interaction: discord.Interaction, position: int):
@@ -825,11 +973,14 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(name="/nowplaying", value="再生中の曲を表示", inline=True)
     embed.add_field(name="/loop <mode>", value="リピート (off/song/queue)", inline=True)
     embed.add_field(name="/shuffle", value="キューをシャッフル", inline=True)
+    embed.add_field(name="/speed <0.5-2.0>", value="再生速度（ピッチ維持）", inline=True)
+    embed.add_field(name="/pitch <-12〜12>", value="ピッチ（半音単位）", inline=True)
     embed.add_field(name="/remove <番号>", value="キューから曲を削除", inline=True)
     embed.add_field(name="/clear", value="キューをクリア（再生は継続）", inline=True)
     embed.add_field(name="/join・/leave", value="VCに参加・退出", inline=True)
     embed.add_field(name="/na-", value="効果音（同一曲中1回）", inline=True)
     embed.add_field(name="/refresh", value="ニコニコCookie更新", inline=True)
+    embed.add_field(name="再生中ボタン", value="🐢🐇 速度 / 🔽🔼 ピッチ / 🎚️ リセット", inline=False)
     embed.add_field(name="メッセージトリガー", value="`んあー` / `んあーと` で効果音", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
