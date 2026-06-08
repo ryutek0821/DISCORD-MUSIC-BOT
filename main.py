@@ -503,7 +503,8 @@ class MusicControls(discord.ui.View):
             state.pitch = pitch
         reapply_audio_settings(vc, state)
         await interaction.response.send_message(
-            f"🎚️ 速度 **{state.speed:.2f}x** / ピッチ **{state.pitch:+d}半音**", ephemeral=True
+            f"🎚️ {interaction.user.display_name} が 速度 **{state.speed:.2f}x** / "
+            f"ピッチ **{state.pitch:+d}半音** に変更"
         )
 
     @discord.ui.button(emoji="🐢", label="遅く", style=discord.ButtonStyle.secondary, row=1)
