@@ -51,8 +51,12 @@ class GuildState:
         self.skip_flag: bool = False
         self.speed: float = 1.0          # playback tempo (0.5–2.0), pitch preserved
         self.pitch: int = 0              # pitch shift in semitones (-12–+12)
+        self.volume: int = 100           # playback volume in percent (0–200)
+        self.effect: str = "off"         # active effect preset (see EFFECT_FILTERS)
         self.seek_position: float = 0.0  # start offset (s) of the current FFmpeg source
         self.loops_at_swap: int = 0      # player.loops captured when seek_position was set
+        self.np_message: Optional[discord.Message] = None  # live now-playing message
+        self.np_updater: Optional[asyncio.Task] = None      # progress-bar refresh loop
 
 
 guild_states: Dict[int, GuildState] = {}
@@ -64,9 +68,42 @@ cookie_refresh_lock = asyncio.Lock()
 # Idle disconnect timeout (seconds) configurable via env
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
 
-# Playback speed / pitch limits shared by the effect buttons and slash commands.
+# How often (seconds) to edit the now-playing embed so the progress bar advances.
+NP_UPDATE_INTERVAL = 10
+
+# Playback speed / pitch / volume limits shared by buttons and slash commands.
 SPEED_MIN, SPEED_MAX, SPEED_STEP = 0.5, 2.0, 0.25
 PITCH_MIN, PITCH_MAX = -12, 12
+VOLUME_MIN, VOLUME_MAX, VOLUME_STEP = 0, 200, 20
+
+# Extra FFmpeg filters layered on top of speed/pitch for each effect preset.
+EFFECT_FILTERS: Dict[str, List[str]] = {
+    "off": [],
+    "nightcore": [],                       # tempo/pitch only (set via preset)
+    "vaporwave": [],                       # tempo/pitch only (set via preset)
+    "bassboost": ["bass=g=12"],
+    "8d": ["apulsator=hz=0.09"],
+    "lofi": ["lowpass=f=3200", "highpass=f=200"],
+}
+
+# Presets bundle a tempo/pitch pair with an effect filter set.
+EFFECT_PRESETS: Dict[str, Dict[str, Any]] = {
+    "off":       {"speed": 1.0,  "pitch": 0,  "effect": "off"},
+    "nightcore": {"speed": 1.25, "pitch": 3,  "effect": "nightcore"},
+    "vaporwave": {"speed": 0.85, "pitch": -3, "effect": "vaporwave"},
+    "bassboost": {"speed": 1.0,  "pitch": 0,  "effect": "bassboost"},
+    "8d":        {"speed": 1.0,  "pitch": 0,  "effect": "8d"},
+    "lofi":      {"speed": 0.9,  "pitch": 0,  "effect": "lofi"},
+}
+
+EFFECT_LABELS: Dict[str, str] = {
+    "off": "オフ",
+    "nightcore": "ナイトコア",
+    "vaporwave": "ベイパーウェイブ",
+    "bassboost": "低音ブースト",
+    "8d": "8Dオーディオ",
+    "lofi": "Lo-Fi",
+}
 
 
 def get_state(guild_id: int) -> GuildState:
@@ -75,14 +112,74 @@ def get_state(guild_id: int) -> GuildState:
     return guild_states[guild_id]
 
 
-def create_now_playing_embed(song: Dict[str, Any]) -> discord.Embed:
-    """Create a 'now playing' embed."""
-    duration_str = f"{song['duration'] // 60}:{song['duration'] % 60:02d}"
+def fmt_duration(seconds: float) -> str:
+    """Format seconds as m:ss (or h:mm:ss past an hour)."""
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def parse_time(value: str) -> Optional[float]:
+    """Parse '90', '1:30' or '1:02:03' into seconds. Returns None if invalid."""
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        if ":" in value:
+            parts = [float(p) for p in value.split(":")]
+            if len(parts) == 2:
+                return parts[0] * 60 + parts[1]
+            if len(parts) == 3:
+                return parts[0] * 3600 + parts[1] * 60 + parts[2]
+            return None
+        return float(value)
+    except ValueError:
+        return None
+
+
+def make_progress_bar(elapsed: float, duration: float, length: int = 18) -> str:
+    """Render `0:12` ▬▬🔘▬▬ `4:56`. Empty string when duration is unknown."""
+    if not duration or duration <= 0:
+        return ""
+    ratio = max(0.0, min(1.0, elapsed / duration))
+    pos = min(length - 1, int(ratio * length))
+    bar = "".join("🔘" if i == pos else "▬" for i in range(length))
+    return f"`{fmt_duration(elapsed)}` {bar} `{fmt_duration(duration)}`"
+
+
+def effect_status_line(state: GuildState) -> str:
+    """Summarize active speed/pitch/volume/effect; '' when everything default."""
+    parts: List[str] = []
+    if abs(state.speed - 1.0) > 1e-6:
+        parts.append(f"速度 {state.speed:.2f}x")
+    if state.pitch != 0:
+        parts.append(f"ピッチ {state.pitch:+d}")
+    if state.volume != 100:
+        parts.append(f"音量 {state.volume}%")
+    if state.effect != "off":
+        parts.append(f"効果 {EFFECT_LABELS.get(state.effect, state.effect)}")
+    return " ・ ".join(parts)
+
+
+def create_now_playing_embed(song: Dict[str, Any], *, elapsed: Optional[float] = None,
+                             state: Optional[GuildState] = None) -> discord.Embed:
+    """Create a 'now playing' embed, optionally with a progress bar and effects."""
     embed = discord.Embed(
         title="再生中",
-        description=f"**[{song['title']}]({song['url']})**\n再生時間: {duration_str}\nリクエスト: {song.get('requester', '不明')}",
+        description=f"**[{song['title']}]({song['url']})**\nリクエスト: {song.get('requester', '不明')}",
         color=0x00ff00,
     )
+    duration = song.get("duration") or 0
+    bar = make_progress_bar(elapsed, duration) if elapsed is not None else ""
+    if bar:
+        embed.add_field(name="再生位置", value=bar, inline=False)
+    else:
+        embed.add_field(name="再生時間", value=fmt_duration(duration), inline=False)
+    if state is not None:
+        status = effect_status_line(state)
+        if status:
+            embed.add_field(name="エフェクト", value=status, inline=False)
     if song.get("thumbnail"):
         embed.set_thumbnail(url=song["thumbnail"])
     return embed
@@ -351,14 +448,13 @@ def _atempo_chain(factor: float) -> List[str]:
     return parts
 
 
-def build_audio_filter(speed: float, pitch: int) -> Optional[str]:
-    """Build an FFmpeg -af value for the given tempo and pitch (semitones).
+def build_audio_filter(speed: float, pitch: int, volume: int = 100,
+                       effect: str = "off") -> Optional[str]:
+    """Build an FFmpeg -af value for tempo, pitch (semitones), volume and effect.
 
     Pitch uses the asetrate trick so it runs on the stock FFmpeg shipped with
-    Raspberry Pi OS (no librubberband needed).
+    Raspberry Pi OS (no librubberband needed). Returns None when nothing applies.
     """
-    if abs(speed - 1.0) < 1e-6 and pitch == 0:
-        return None
     filters: List[str] = []
     ratio = 2 ** (pitch / 12.0)
     if pitch != 0:
@@ -366,8 +462,13 @@ def build_audio_filter(speed: float, pitch: int) -> Optional[str]:
         filters.append(f"asetrate={int(round(48000 * ratio))}")
         filters.append("aresample=48000")
     # Undo the asetrate speed change, then apply the requested speed.
-    filters.extend(_atempo_chain(speed / ratio))
-    return ",".join(filters)
+    tempo = speed / ratio
+    if abs(tempo - 1.0) > 1e-6:
+        filters.extend(_atempo_chain(tempo))
+    filters.extend(EFFECT_FILTERS.get(effect, []))
+    if volume != 100:
+        filters.append(f"volume={volume / 100:.3f}")
+    return ",".join(filters) if filters else None
 
 
 def make_audio_source(song: Dict[str, Any], state: GuildState, seek: float = 0.0) -> discord.FFmpegOpusAudio:
@@ -384,7 +485,7 @@ def make_audio_source(song: Dict[str, Any], state: GuildState, seek: float = 0.0
     before_options = " ".join(before_parts) if before_parts else None
 
     options = "-c:a libopus -b:a 192k -ar 48000 -ac 2"
-    af = build_audio_filter(state.speed, state.pitch)
+    af = build_audio_filter(state.speed, state.pitch, state.volume, state.effect)
     if af:
         options += f' -af "{af}"'
 
@@ -398,18 +499,18 @@ def current_elapsed(vc: discord.VoiceClient, state: GuildState) -> float:
     return max(0.0, state.seek_position + (loops - state.loops_at_swap) * 0.02)
 
 
-def reapply_audio_settings(vc: discord.VoiceClient, state: GuildState) -> None:
-    """Hot-swap the FFmpeg source so speed/pitch apply from the current position.
+def swap_source_at(vc: discord.VoiceClient, state: GuildState, seek: float) -> None:
+    """Hot-swap the FFmpeg source to restart the current song at `seek` seconds.
 
     Swapping vc.source (instead of vc.play) avoids firing the `after` callback,
     so the queue does not advance. The old source must be cleaned up manually.
+    Used both to reapply speed/pitch/volume in place and to seek.
     """
     song = state.current_song
     if not song or not vc or not vc.is_connected():
         return
     was_paused = vc.is_paused()
-    elapsed = current_elapsed(vc, state)
-    new_source = make_audio_source(song, state, seek=elapsed)
+    new_source = make_audio_source(song, state, seek=seek)
     old_source = vc.source
     vc.source = new_source  # _set_source resumes unconditionally; re-pause below
     if was_paused:
@@ -420,8 +521,13 @@ def reapply_audio_settings(vc: discord.VoiceClient, state: GuildState) -> None:
         except Exception as e:
             logger.warning(f"Failed to cleanup old audio source: {e}")
     player = getattr(vc, "_player", None)
-    state.seek_position = elapsed
+    state.seek_position = seek
     state.loops_at_swap = getattr(player, "loops", 0) if player else 0
+
+
+def reapply_audio_settings(vc: discord.VoiceClient, state: GuildState) -> None:
+    """Re-render the current song in place from the current playback position."""
+    swap_source_at(vc, state, current_elapsed(vc, state))
 
 
 class MusicControls(discord.ui.View):
@@ -488,7 +594,8 @@ class MusicControls(discord.ui.View):
 
     async def _apply_speed_pitch(self, interaction: discord.Interaction, *,
                                  speed: Optional[float] = None,
-                                 pitch: Optional[int] = None):
+                                 pitch: Optional[int] = None,
+                                 effect: Optional[str] = None):
         state = get_state(interaction.guild.id)
         vc = interaction.guild.voice_client
         if not vc or not (vc.is_playing() or vc.is_paused()):
@@ -501,6 +608,8 @@ class MusicControls(discord.ui.View):
             state.speed = speed
         if pitch is not None:
             state.pitch = pitch
+        if effect is not None:
+            state.effect = effect
         reapply_audio_settings(vc, state)
         await interaction.response.send_message(
             f"🎚️ {interaction.user.display_name} が 速度 **{state.speed:.2f}x** / "
@@ -533,7 +642,7 @@ class MusicControls(discord.ui.View):
 
     @discord.ui.button(emoji="🎚️", label="リセット", style=discord.ButtonStyle.primary, row=1)
     async def reset_effects(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._apply_speed_pitch(interaction, speed=1.0, pitch=0)
+        await self._apply_speed_pitch(interaction, speed=1.0, pitch=0, effect="off")
 
 
 async def advance_queue(guild_id: int, finished_song: Dict[str, Any]) -> None:
@@ -560,6 +669,8 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
 
     if len(state.queue) == 0:
         state.current_song = None
+        cancel_np_updater(state)
+        state.np_message = None
         logger.info(f"Queue empty, scheduling disconnect in {IDLE_TIMEOUT}s")
         cancel_idle_task(guild_id)
         state.idle_task = asyncio.create_task(schedule_disconnect(guild_id))
@@ -573,12 +684,13 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
 
     if announce:
         try:
-            embed = create_now_playing_embed(song)
+            embed = create_now_playing_embed(song, elapsed=0.0, state=state)
             channel_id = song.get("text_channel_id")
             text_channel = vc.channel.guild.get_channel(channel_id) if channel_id else None
             if not text_channel:
                 text_channel = vc.channel.guild.text_channels[0]
-            asyncio.create_task(text_channel.send(embed=embed, view=MusicControls(guild_id)))
+            state.np_message = await text_channel.send(embed=embed, view=MusicControls(guild_id))
+            start_np_updater(guild_id)
         except Exception as e:
             logger.warning(f"Failed to send now playing message: {e}")
 
@@ -828,8 +940,11 @@ async def play(interaction: discord.Interaction, query: str):
         await interaction.followup.send(embed=embed)
     else:
         state.current_song = song
-        embed = create_now_playing_embed(song)
-        await interaction.followup.send(embed=embed, view=MusicControls(interaction.guild.id))
+        embed = create_now_playing_embed(song, elapsed=0.0, state=state)
+        state.np_message = await interaction.followup.send(
+            embed=embed, view=MusicControls(interaction.guild.id)
+        )
+        start_np_updater(interaction.guild.id)
         # /play already announced this song, so don't re-announce in play_next.
         await play_next(interaction.guild.id, announce=False)
 
@@ -889,6 +1004,7 @@ async def speed_cmd(interaction: discord.Interaction, rate: app_commands.Range[f
     state.speed = round(rate, 2)
     if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
         reapply_audio_settings(vc, state)
+        await refresh_now_playing(interaction.guild.id)
     await interaction.response.send_message(f"🎚️ 速度を **{state.speed:.2f}x** にしました。")
 
 
@@ -900,7 +1016,70 @@ async def pitch_cmd(interaction: discord.Interaction, semitones: app_commands.Ra
     state.pitch = semitones
     if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
         reapply_audio_settings(vc, state)
+        await refresh_now_playing(interaction.guild.id)
     await interaction.response.send_message(f"🎚️ ピッチを **{state.pitch:+d}半音** にしました。")
+
+
+@bot.tree.command(name="seek", description="Jump to a position in the current song")
+@app_commands.describe(position="再生位置（秒 または mm:ss、例: 90 / 1:30）")
+async def seek_cmd(interaction: discord.Interaction, position: str):
+    state = get_state(interaction.guild.id)
+    vc = interaction.guild.voice_client
+    if not vc or not (vc.is_playing() or vc.is_paused()):
+        await interaction.response.send_message("再生していません。", ephemeral=True)
+        return
+    if state.is_playing_sound:
+        await interaction.response.send_message("効果音の再生中は変更できません。", ephemeral=True)
+        return
+    secs = parse_time(position)
+    if secs is None or secs < 0:
+        await interaction.response.send_message(
+            "時間の形式が不正です（例: `90` または `1:30`）。", ephemeral=True
+        )
+        return
+    duration = (state.current_song or {}).get("duration") or 0
+    if duration and secs >= duration:
+        await interaction.response.send_message(
+            f"曲の長さ（{fmt_duration(duration)}）以内で指定してください。", ephemeral=True
+        )
+        return
+    swap_source_at(vc, state, secs)
+    await interaction.response.send_message(f"⏩ **{fmt_duration(secs)}** へシークしました。")
+
+
+@bot.tree.command(name="volume", description="Set playback volume (0-200%)")
+@app_commands.describe(level="音量 (0〜200)")
+async def volume_cmd(interaction: discord.Interaction, level: app_commands.Range[int, 0, 200]):
+    state = get_state(interaction.guild.id)
+    vc = interaction.guild.voice_client
+    state.volume = level
+    if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
+        reapply_audio_settings(vc, state)
+        await refresh_now_playing(interaction.guild.id)
+    await interaction.response.send_message(f"🔊 音量を **{level}%** にしました。")
+
+
+@bot.tree.command(name="preset", description="Apply an audio effect preset")
+@app_commands.describe(name="エフェクトプリセット")
+@app_commands.choices(name=[
+    app_commands.Choice(name="オフ（通常）", value="off"),
+    app_commands.Choice(name="ナイトコア", value="nightcore"),
+    app_commands.Choice(name="ベイパーウェイブ", value="vaporwave"),
+    app_commands.Choice(name="低音ブースト", value="bassboost"),
+    app_commands.Choice(name="8Dオーディオ", value="8d"),
+    app_commands.Choice(name="Lo-Fi", value="lofi"),
+])
+async def preset_cmd(interaction: discord.Interaction, name: app_commands.Choice[str]):
+    state = get_state(interaction.guild.id)
+    vc = interaction.guild.voice_client
+    preset = EFFECT_PRESETS[name.value]
+    state.speed = preset["speed"]
+    state.pitch = preset["pitch"]
+    state.effect = preset["effect"]
+    if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
+        reapply_audio_settings(vc, state)
+        await refresh_now_playing(interaction.guild.id)
+    await interaction.response.send_message(f"🎛️ プリセット **{name.name}** を適用しました。")
 
 
 @bot.tree.command(name="remove", description="Remove a song from the queue by position")
@@ -976,6 +1155,9 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(name="/shuffle", value="キューをシャッフル", inline=True)
     embed.add_field(name="/speed <0.5-2.0>", value="再生速度（ピッチ維持）", inline=True)
     embed.add_field(name="/pitch <-12〜12>", value="ピッチ（半音単位）", inline=True)
+    embed.add_field(name="/volume <0-200>", value="音量調整（%）", inline=True)
+    embed.add_field(name="/seek <時間>", value="再生位置へジャンプ (例 1:30)", inline=True)
+    embed.add_field(name="/preset <名前>", value="エフェクト（ナイトコア等）", inline=True)
     embed.add_field(name="/remove <番号>", value="キューから曲を削除", inline=True)
     embed.add_field(name="/clear", value="キューをクリア（再生は継続）", inline=True)
     embed.add_field(name="/join・/leave", value="VCに参加・退出", inline=True)
@@ -1024,7 +1206,9 @@ async def nowplaying(interaction: discord.Interaction):
     if not state.current_song:
         await interaction.response.send_message("再生中の曲はありません。")
         return
-    embed = create_now_playing_embed(state.current_song)
+    vc = interaction.guild.voice_client
+    elapsed = current_elapsed(vc, state) if vc and (vc.is_playing() or vc.is_paused()) else None
+    embed = create_now_playing_embed(state.current_song, elapsed=elapsed, state=state)
     await interaction.response.send_message(embed=embed, view=MusicControls(interaction.guild.id))
 
 
