@@ -15,6 +15,9 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Connect to Tailscale
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
@@ -22,29 +25,37 @@ jobs:
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale up --authkey "$TAILSCALE_AUTHKEY" --accept-routes --hostname github-actions-deploy --ephemeral
 
-      - name: Deploy to Raspberry Pi
+      - name: Deploy to RYU-SERVER
         env:
-          SSH_HOST: 100.114.153.17
+          SSH_HOST: 100.87.72.38
           SSH_USER: ryu
           SSH_KEY: ${{ secrets.SSH_KEY }}
         run: |
-          # Install SSH key
+          # Install SSH key (runner -> RYU-SERVER)
           mkdir -p ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          
+
           # Disable host key checking
-          echo "Host *
-            StrictHostKeyChecking no
-            UserKnownHostsFile /dev/null" >> ~/.ssh/config
-          
-          # Deploy via SSH (Tailscale IP - no port forwarding needed)
+          printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n' >> ~/.ssh/config
+
+          # Sync the checked-out repo to the server. The server does not need
+          # GitHub access; files are pushed directly over SSH (Tailscale IP).
+          # Server-specific runtime files are preserved via --exclude.
+          rsync -az --delete \
+            --exclude='.git' \
+            --exclude='venv' \
+            --exclude='.env' \
+            --exclude='cookies.txt' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='*.log' \
+            ./ "$SSH_USER@$SSH_HOST:~/niconico-discord-bot/"
+
+          # Install deps and restart the service on the server.
           ssh "$SSH_USER@$SSH_HOST" << 'EOF'
             set -e
             cd ~/niconico-discord-bot
-            git fetch origin
-            git checkout master
-            git pull --ff-only origin master
             ./venv/bin/pip install -q -r requirements.txt
             sudo systemctl restart niconico-bot
             sleep 5
