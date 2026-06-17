@@ -19,6 +19,11 @@ COOKIE_FILE = os.getenv("COOKIE_FILE")
 NICO_EMAIL = os.getenv("NICO_EMAIL")
 NICO_PASSWORD = os.getenv("NICO_PASSWORD")
 CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+# Route YouTube traffic through a residential-IP proxy (e.g. a Tailscale RPi)
+# so YouTube's datacenter-IP bot detection doesn't block extraction. The
+# googlevideo media URLs are IP-locked to the extractor, so downloads must use
+# the same proxy; that's why YouTube is fetched to a local file like niconico.
+YT_PROXY = os.getenv("YT_PROXY")
 
 SOUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
 
@@ -346,6 +351,11 @@ def build_ydl_opts(url: str, **overrides: Any) -> Dict[str, Any]:
         ydl_opts["username"] = NICO_EMAIL
         ydl_opts["password"] = NICO_PASSWORD
 
+    # Send YouTube (and other non-niconico) requests through the residential
+    # proxy to dodge bot detection / 429 on the VPS datacenter IP.
+    if not is_niconico and YT_PROXY and "proxy" not in ydl_opts:
+        ydl_opts["proxy"] = YT_PROXY
+
     return ydl_opts
 
 
@@ -399,14 +409,25 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
                           f"{selected_format.get('asr', 'unknown')}Hz)")
 
             is_niconico = "nicovideo.jp" in url
+            # A bare keyword resolves to a YouTube video via default_search, so
+            # detect YouTube from the resolved info rather than the input string.
+            extractor = (info.get("extractor_key") or info.get("extractor") or "")
+            webpage_url = info.get("webpage_url") or url
+            is_youtube = "youtube" in extractor.lower() or "youtube.com" in webpage_url
 
+            # YouTube media URLs are IP-locked to the proxy used for extraction,
+            # so they can't be streamed directly from the VPS. Fetch them to a
+            # local file (through the proxy) at play time, like niconico.
             return {
-                "url": url,
+                # Use the concrete video URL so the lazy download re-extracts the
+                # exact video (and routes through the proxy via build_ydl_opts).
+                "url": webpage_url if is_youtube else url,
                 "audio_url": audio_url,
                 "title": info.get("title", "Unknown"),
                 "duration": info.get("duration", 0),
                 "thumbnail": info.get("thumbnail", ""),
                 "is_niconico": is_niconico,
+                "needs_local": is_niconico or is_youtube,
                 "local_file": None,
             }
     except Exception as e:
@@ -709,12 +730,12 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
             asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), bot.loop)
 
     try:
-        if song.get("is_niconico") and not song.get("local_file"):
+        if song.get("needs_local") and not song.get("local_file"):
             local_file = await asyncio.get_event_loop().run_in_executor(
-                None, download_niconico_audio, song["url"]
+                None, download_audio, song["url"]
             )
             if not local_file:
-                logger.error("Failed to download niconico audio")
+                logger.error("Failed to download audio")
                 await play_next(guild_id)
                 return
             song["local_file"] = local_file
@@ -729,10 +750,15 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
         await play_next(guild_id)
 
 
-def download_niconico_audio(url: str) -> str:
-    """Download niconico audio to a temp file and return the path."""
+def download_audio(url: str) -> str:
+    """Download audio to a temp file and return the path.
+
+    Used for niconico and YouTube; for YouTube the request is routed through
+    the residential proxy (via build_ydl_opts) so the IP-locked media URL is
+    fetched from the same IP that extracted it.
+    """
     tmpdir = tempfile.gettempdir()
-    output_template = os.path.join(tmpdir, "nico_%(id)s.%(ext)s")
+    output_template = os.path.join(tmpdir, "dl_%(id)s.%(ext)s")
 
     ydl_opts = build_ydl_opts(url, outtmpl=output_template)
 
@@ -741,10 +767,10 @@ def download_niconico_audio(url: str) -> str:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
             if os.path.exists(filename):
-                logger.info(f"Downloaded niconico audio: {filename}")
+                logger.info(f"Downloaded audio: {filename}")
                 return filename
     except Exception as e:
-        logger.error(f"Failed to download niconico audio: {e}")
+        logger.error(f"Failed to download audio: {e}")
     return None
 
 
@@ -867,12 +893,12 @@ async def restart_song(guild_id: int) -> None:
         asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), bot.loop)
 
     try:
-        if song.get("is_niconico") and not song.get("local_file"):
+        if song.get("needs_local") and not song.get("local_file"):
             local_file = await asyncio.get_event_loop().run_in_executor(
-                None, download_niconico_audio, song["url"]
+                None, download_audio, song["url"]
             )
             if not local_file:
-                logger.error("Failed to download niconico audio for restart")
+                logger.error("Failed to download audio for restart")
                 state.is_playing_sound = False
                 return
             song["local_file"] = local_file
