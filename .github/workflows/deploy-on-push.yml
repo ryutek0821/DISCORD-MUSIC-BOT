@@ -25,9 +25,9 @@ jobs:
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale up --authkey "$TAILSCALE_AUTHKEY" --accept-routes --hostname github-actions-deploy --ephemeral
 
-      - name: Deploy to RYU-SERVER
+      - name: Deploy to RYU-RASPBERRYPI
         env:
-          SSH_HOST: 100.87.72.38
+          SSH_HOST: 100.114.153.17
           SSH_USER: ryu
           SSH_KEY: ${{ secrets.SSH_KEY }}
         run: |
