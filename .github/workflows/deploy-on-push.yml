@@ -23,7 +23,7 @@ jobs:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey "$TAILSCALE_AUTHKEY" --accept-routes --hostname github-actions-deploy --ephemeral
+          sudo tailscale up --authkey "$TAILSCALE_AUTHKEY" --accept-routes --hostname github-actions-deploy
 
       - name: Deploy to RYU-RASPBERRYPI
         env:
