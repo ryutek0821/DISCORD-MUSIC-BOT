@@ -60,6 +60,8 @@ class GuildState:
         self.effect: str = "off"         # active effect preset (see EFFECT_FILTERS)
         self.seek_position: float = 0.0  # start offset (s) of the current FFmpeg source
         self.loops_at_swap: int = 0      # player.loops captured when seek_position was set
+        self.speed_at_swap: float = 1.0  # tempo active for the current source segment
+        self.resume_position: float = 0.0  # song position to resume at after a sound effect
         self.np_message: Optional[discord.Message] = None  # live now-playing message
         self.np_updater: Optional[asyncio.Task] = None      # progress-bar refresh loop
 
@@ -77,7 +79,7 @@ IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
 NP_UPDATE_INTERVAL = 10
 
 # Playback speed / pitch / volume limits shared by buttons and slash commands.
-SPEED_MIN, SPEED_MAX, SPEED_STEP = 0.5, 2.0, 0.25
+SPEED_MIN, SPEED_MAX, SPEED_STEP = 0.5, 2.0, 0.1
 PITCH_MIN, PITCH_MAX = -12, 12
 VOLUME_MIN, VOLUME_MAX, VOLUME_STEP = 0, 200, 20
 
@@ -89,6 +91,11 @@ EFFECT_FILTERS: Dict[str, List[str]] = {
     "bassboost": ["bass=g=12"],
     "8d": ["apulsator=hz=0.09"],
     "lofi": ["lowpass=f=3200", "highpass=f=200"],
+    "echo": ["aecho=0.8:0.9:1000:0.3"],
+    "reverb": ["aecho=0.8:0.88:60:0.4"],
+    "tremolo": ["tremolo=f=6:d=0.7"],
+    "karaoke": ["pan=stereo|c0=c0-c1|c1=c1-c0"],   # remove center-panned vocals
+    "trebleboost": ["treble=g=10"],
 }
 
 # Presets bundle a tempo/pitch pair with an effect filter set.
@@ -99,6 +106,11 @@ EFFECT_PRESETS: Dict[str, Dict[str, Any]] = {
     "bassboost": {"speed": 1.0,  "pitch": 0,  "effect": "bassboost"},
     "8d":        {"speed": 1.0,  "pitch": 0,  "effect": "8d"},
     "lofi":      {"speed": 0.9,  "pitch": 0,  "effect": "lofi"},
+    "echo":      {"speed": 1.0,  "pitch": 0,  "effect": "echo"},
+    "reverb":    {"speed": 1.0,  "pitch": 0,  "effect": "reverb"},
+    "tremolo":   {"speed": 1.0,  "pitch": 0,  "effect": "tremolo"},
+    "karaoke":   {"speed": 1.0,  "pitch": 0,  "effect": "karaoke"},
+    "trebleboost": {"speed": 1.0, "pitch": 0, "effect": "trebleboost"},
 }
 
 EFFECT_LABELS: Dict[str, str] = {
@@ -108,6 +120,11 @@ EFFECT_LABELS: Dict[str, str] = {
     "bassboost": "低音ブースト",
     "8d": "8Dオーディオ",
     "lofi": "Lo-Fi",
+    "echo": "エコー",
+    "reverb": "リバーブ",
+    "tremolo": "トレモロ",
+    "karaoke": "ボーカルカット",
+    "trebleboost": "高音ブースト",
 }
 
 
@@ -517,7 +534,63 @@ def current_elapsed(vc: discord.VoiceClient, state: GuildState) -> float:
     """Best-effort playback position (s) within the current song, seek-aware."""
     player = getattr(vc, "_player", None)
     loops = getattr(player, "loops", 0) if player else 0
-    return max(0.0, state.seek_position + (loops - state.loops_at_swap) * 0.02)
+    # Each 20ms output frame covers 0.02 * speed seconds of song content (atempo
+    # time-stretches), so scale elapsed frames by the segment's playback speed.
+    frames = (loops - state.loops_at_swap) * 0.02 * state.speed_at_swap
+    return max(0.0, state.seek_position + frames)
+
+
+def cancel_np_updater(state: GuildState) -> None:
+    """Stop the running now-playing progress-bar refresh loop, if any."""
+    if state.np_updater is not None:
+        state.np_updater.cancel()
+        state.np_updater = None
+
+
+def start_np_updater(guild_id: int, interval: float = NP_UPDATE_INTERVAL) -> None:
+    """Periodically refresh the now-playing message's progress bar."""
+    state = get_state(guild_id)
+    cancel_np_updater(state)
+
+    async def _updater():
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                vc = state.voice_client
+                song = state.current_song
+                msg = state.np_message
+                if not vc or not vc.is_connected() or not song or not msg:
+                    break
+                if not (vc.is_playing() or vc.is_paused()):
+                    break
+                elapsed = current_elapsed(vc, state)
+                try:
+                    embed = create_now_playing_embed(song, elapsed=elapsed, state=state)
+                    await msg.edit(embed=embed)
+                except Exception as e:
+                    logger.warning(f"Failed to update now playing message: {e}")
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    state.np_updater = asyncio.create_task(_updater())
+
+
+async def refresh_now_playing(guild_id: int) -> None:
+    """Re-render the live now-playing embed to reflect new playback settings."""
+    state = get_state(guild_id)
+    vc = state.voice_client
+    msg = state.np_message
+    song = state.current_song
+    if not vc or not msg or not song:
+        return
+    playing = vc.is_playing() or vc.is_paused()
+    elapsed = current_elapsed(vc, state) if playing else None
+    try:
+        embed = create_now_playing_embed(song, elapsed=elapsed, state=state)
+        await msg.edit(embed=embed)
+    except Exception as e:
+        logger.warning(f"Failed to refresh now playing message: {e}")
 
 
 def swap_source_at(vc: discord.VoiceClient, state: GuildState, seek: float) -> None:
@@ -544,6 +617,7 @@ def swap_source_at(vc: discord.VoiceClient, state: GuildState, seek: float) -> N
     player = getattr(vc, "_player", None)
     state.seek_position = seek
     state.loops_at_swap = getattr(player, "loops", 0) if player else 0
+    state.speed_at_swap = state.speed
 
 
 def reapply_audio_settings(vc: discord.VoiceClient, state: GuildState) -> None:
@@ -554,11 +628,13 @@ def reapply_audio_settings(vc: discord.VoiceClient, state: GuildState) -> None:
 class MusicControls(discord.ui.View):
     """Interactive control buttons attached to the now-playing embed."""
 
-    def __init__(self, guild_id: int):
+    def __init__(self):
+        # Persistent view (timeout=None), registered once via bot.add_view in
+        # on_ready so the buttons keep working after a restart. Handlers resolve
+        # the guild from the interaction, so no per-guild state is stored here.
         super().__init__(timeout=None)
-        self.guild_id = guild_id
 
-    @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.secondary, custom_id="music:pause_resume")
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = interaction.guild.voice_client
         if vc and vc.is_playing():
@@ -570,7 +646,7 @@ class MusicControls(discord.ui.View):
         else:
             await interaction.response.send_message("再生していません。", ephemeral=True)
 
-    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="music:skip")
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
@@ -581,18 +657,21 @@ class MusicControls(discord.ui.View):
         else:
             await interaction.response.send_message("再生していません。", ephemeral=True)
 
-    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger)
+    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, custom_id="music:stop")
     async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         cancel_idle_task(interaction.guild.id)
         vc = interaction.guild.voice_client
         if vc:
             vc.stop()
             await vc.disconnect()
+        state = guild_states.get(interaction.guild.id)
+        if state:
+            cancel_np_updater(state)
         if interaction.guild.id in guild_states:
             del guild_states[interaction.guild.id]
         await interaction.response.send_message("⏹️ 停止しました。", ephemeral=True)
 
-    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="music:loop")
     async def loop(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_state(interaction.guild.id)
         order = {"off": "song", "song": "queue", "queue": "off"}
@@ -602,7 +681,7 @@ class MusicControls(discord.ui.View):
             f"🔁 リピート: **{labels[state.loop_mode]}**", ephemeral=True
         )
 
-    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, custom_id="music:shuffle")
     async def shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_state(interaction.guild.id)
         if len(state.queue) < 2:
@@ -632,36 +711,38 @@ class MusicControls(discord.ui.View):
         if effect is not None:
             state.effect = effect
         reapply_audio_settings(vc, state)
+        await refresh_now_playing(interaction.guild.id)
         await interaction.response.send_message(
-            f"🎚️ {interaction.user.display_name} が 速度 **{state.speed:.2f}x** / "
-            f"ピッチ **{state.pitch:+d}半音** に変更"
+            f"🎚️ 速度 **{state.speed:.2f}x** / "
+            f"ピッチ **{state.pitch:+d}半音** に変更",
+            ephemeral=True,
         )
 
-    @discord.ui.button(emoji="🐢", label="遅く", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🐢", label="遅く", style=discord.ButtonStyle.secondary, row=1, custom_id="music:slow_down")
     async def slow_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_state(interaction.guild.id)
         await self._apply_speed_pitch(
             interaction, speed=round(max(SPEED_MIN, state.speed - SPEED_STEP), 2)
         )
 
-    @discord.ui.button(emoji="🐇", label="速く", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🐇", label="速く", style=discord.ButtonStyle.secondary, row=1, custom_id="music:speed_up")
     async def speed_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_state(interaction.guild.id)
         await self._apply_speed_pitch(
             interaction, speed=round(min(SPEED_MAX, state.speed + SPEED_STEP), 2)
         )
 
-    @discord.ui.button(emoji="🔽", label="ピッチ-", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🔽", label="ピッチ-", style=discord.ButtonStyle.secondary, row=1, custom_id="music:pitch_down")
     async def pitch_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_state(interaction.guild.id)
         await self._apply_speed_pitch(interaction, pitch=max(PITCH_MIN, state.pitch - 1))
 
-    @discord.ui.button(emoji="🔼", label="ピッチ+", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(emoji="🔼", label="ピッチ+", style=discord.ButtonStyle.secondary, row=1, custom_id="music:pitch_up")
     async def pitch_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = get_state(interaction.guild.id)
         await self._apply_speed_pitch(interaction, pitch=min(PITCH_MAX, state.pitch + 1))
 
-    @discord.ui.button(emoji="🎚️", label="リセット", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(emoji="🎚️", label="リセット", style=discord.ButtonStyle.primary, row=1, custom_id="music:reset")
     async def reset_effects(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._apply_speed_pitch(interaction, speed=1.0, pitch=0, effect="off")
 
@@ -707,11 +788,18 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
         try:
             embed = create_now_playing_embed(song, elapsed=0.0, state=state)
             channel_id = song.get("text_channel_id")
-            text_channel = vc.channel.guild.get_channel(channel_id) if channel_id else None
+            guild = vc.channel.guild
+            text_channel = guild.get_channel(channel_id) if channel_id else None
             if not text_channel:
-                text_channel = vc.channel.guild.text_channels[0]
-            state.np_message = await text_channel.send(embed=embed, view=MusicControls(guild_id))
-            start_np_updater(guild_id)
+                # Fall back to the first channel the bot may actually post in.
+                text_channel = next(
+                    (ch for ch in guild.text_channels
+                     if ch.permissions_for(guild.me).send_messages),
+                    None,
+                )
+            if text_channel:
+                state.np_message = await text_channel.send(embed=embed, view=MusicControls())
+                start_np_updater(guild_id)
         except Exception as e:
             logger.warning(f"Failed to send now playing message: {e}")
 
@@ -731,7 +819,7 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
 
     try:
         if song.get("needs_local") and not song.get("local_file"):
-            local_file = await asyncio.get_event_loop().run_in_executor(
+            local_file = await asyncio.get_running_loop().run_in_executor(
                 None, download_audio, song["url"]
             )
             if not local_file:
@@ -743,6 +831,7 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
         # A fresh FFmpeg process starts at loops=0; reset the seek bookkeeping.
         state.seek_position = 0.0
         state.loops_at_swap = 0
+        state.speed_at_swap = state.speed
         source = make_audio_source(song, state, seek=0.0)
         vc.play(source, after=after_play)
     except Exception as e:
@@ -782,7 +871,13 @@ async def on_ready():
         logger.info(f"Synced {len(synced)} commands")
     except Exception as e:
         logger.error(f"Sync error: {e}")
-    bot.loop.create_task(background_cookie_refresh())
+    # on_ready can fire again on gateway reconnects; run startup work only once.
+    if not getattr(bot, "_startup_done", False):
+        bot._startup_done = True
+        # Register the persistent control view so now-playing buttons keep
+        # working after a restart, and start the single cookie-refresh loop.
+        bot.add_view(MusicControls())
+        bot.loop.create_task(background_cookie_refresh())
 
 
 async def background_cookie_refresh():
@@ -790,7 +885,7 @@ async def background_cookie_refresh():
     while True:
         try:
             async with cookie_refresh_lock:
-                await asyncio.get_event_loop().run_in_executor(None, refresh_nico_cookies_sync, True)
+                await asyncio.get_running_loop().run_in_executor(None, refresh_nico_cookies_sync, True)
         except Exception as e:
             logger.error(f"Background cookie refresh error: {e}")
         await asyncio.sleep(COOKIE_TTL)
@@ -831,6 +926,7 @@ async def on_message(message):
             return
 
         logger.info(f"Playing sound effect for trigger: {content}")
+        state.resume_position = current_elapsed(vc, state)  # resume here after the effect
         state.is_playing_sound = True
         vc.stop()
 
@@ -874,9 +970,8 @@ async def restart_song(guild_id: int) -> None:
         state.is_playing_sound = False
         return
 
-    logger.info(f"Restarting song from beginning: {song['title']}")
-
-    def after_restart(error):
+    def finish(error=None):
+        # Shared teardown for both the skip path and the normal end-of-song path.
         if error:
             logger.error(f"Restart error: {error}")
         state.is_playing_sound = False
@@ -888,13 +983,21 @@ async def restart_song(guild_id: int) -> None:
                 logger.info(f"Cleaned up temp file: {local_file}")
             except Exception as e:
                 logger.warning(f"Failed to remove temp file: {e}")
-        # The restarted song finished — advance the queue like a normal track end.
-        # Previously the queue stalled here (next song never played after a sound effect).
+        # The song is done (finished or skipped) — advance the queue.
         asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), bot.loop)
+
+    # A skip requested during the sound effect should move on, not replay the song.
+    if state.skip_flag:
+        logger.info("Skip requested during sound effect; advancing instead of restarting")
+        finish()
+        return
+
+    seek = max(0.0, state.resume_position)
+    logger.info(f"Resuming song at {fmt_duration(seek)}: {song['title']}")
 
     try:
         if song.get("needs_local") and not song.get("local_file"):
-            local_file = await asyncio.get_event_loop().run_in_executor(
+            local_file = await asyncio.get_running_loop().run_in_executor(
                 None, download_audio, song["url"]
             )
             if not local_file:
@@ -903,11 +1006,12 @@ async def restart_song(guild_id: int) -> None:
                 return
             song["local_file"] = local_file
 
-        # Restart from the top, keeping the active speed/pitch settings.
-        state.seek_position = 0.0
+        # Resume from where the sound effect interrupted, keeping speed/pitch.
+        state.seek_position = seek
         state.loops_at_swap = 0
-        source = make_audio_source(song, state, seek=0.0)
-        vc.play(source, after=after_restart)
+        state.speed_at_swap = state.speed
+        source = make_audio_source(song, state, seek=seek)
+        vc.play(source, after=finish)
     except Exception as e:
         logger.error(f"Failed to restart song: {e}")
         state.is_playing_sound = False
@@ -925,7 +1029,7 @@ async def play(interaction: discord.Interaction, query: str):
     channel = interaction.user.voice.channel
     vc = interaction.guild.voice_client
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         song = await asyncio.wait_for(
             loop.run_in_executor(None, extract_audio_url, query),
@@ -961,14 +1065,14 @@ async def play(interaction: discord.Interaction, query: str):
     state = get_state(interaction.guild.id)
     state.queue.append(song)
 
-    if vc.is_playing():
+    if vc.is_playing() or vc.is_paused():
         embed = create_queued_embed(song, len(state.queue))
         await interaction.followup.send(embed=embed)
     else:
         state.current_song = song
         embed = create_now_playing_embed(song, elapsed=0.0, state=state)
         state.np_message = await interaction.followup.send(
-            embed=embed, view=MusicControls(interaction.guild.id)
+            embed=embed, view=MusicControls()
         )
         start_np_updater(interaction.guild.id)
         # /play already announced this song, so don't re-announce in play_next.
@@ -1094,6 +1198,11 @@ async def volume_cmd(interaction: discord.Interaction, level: app_commands.Range
     app_commands.Choice(name="低音ブースト", value="bassboost"),
     app_commands.Choice(name="8Dオーディオ", value="8d"),
     app_commands.Choice(name="Lo-Fi", value="lofi"),
+    app_commands.Choice(name="エコー", value="echo"),
+    app_commands.Choice(name="リバーブ", value="reverb"),
+    app_commands.Choice(name="トレモロ", value="tremolo"),
+    app_commands.Choice(name="ボーカルカット", value="karaoke"),
+    app_commands.Choice(name="高音ブースト", value="trebleboost"),
 ])
 async def preset_cmd(interaction: discord.Interaction, name: app_commands.Choice[str]):
     state = get_state(interaction.guild.id)
@@ -1163,6 +1272,9 @@ async def leave_cmd(interaction: discord.Interaction):
         return
     vc.stop()
     await vc.disconnect()
+    state = guild_states.get(interaction.guild.id)
+    if state:
+        cancel_np_updater(state)
     if interaction.guild.id in guild_states:
         del guild_states[interaction.guild.id]
     await interaction.response.send_message("👋 退出しました。")
@@ -1201,6 +1313,9 @@ async def stop(interaction: discord.Interaction):
     if vc:
         vc.stop()
         await vc.disconnect()
+    state = guild_states.get(interaction.guild.id)
+    if state:
+        cancel_np_updater(state)
     if interaction.guild.id in guild_states:
         del guild_states[interaction.guild.id]
     await interaction.response.send_message("停止してキューをクリアしました。")
@@ -1235,7 +1350,7 @@ async def nowplaying(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     elapsed = current_elapsed(vc, state) if vc and (vc.is_playing() or vc.is_paused()) else None
     embed = create_now_playing_embed(state.current_song, elapsed=elapsed, state=state)
-    await interaction.response.send_message(embed=embed, view=MusicControls(interaction.guild.id))
+    await interaction.response.send_message(embed=embed, view=MusicControls())
 
 
 @bot.tree.command(name="na-", description="ンアッー!(≧д≦)")
@@ -1262,6 +1377,7 @@ async def na_command(interaction: discord.Interaction):
         return
 
     logger.info("Playing sound effect via /na-")
+    state.resume_position = current_elapsed(vc, state)  # resume here after the effect
     state.is_playing_sound = True
     if vc and vc.is_connected():
         vc.stop()
@@ -1295,7 +1411,7 @@ async def refresh(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     global last_cookie_refresh
     last_cookie_refresh = 0
-    success = await asyncio.get_event_loop().run_in_executor(None, refresh_nico_cookies_sync, True)
+    success = await asyncio.get_running_loop().run_in_executor(None, refresh_nico_cookies_sync, True)
     if success:
         await interaction.followup.send("Cookieを更新しました！", ephemeral=True)
     else:
@@ -1322,6 +1438,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             text_channel = guild.get_channel(state.current_song["text_channel_id"])
         if not text_channel:
             text_channel = next((ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages), None)
+        cancel_np_updater(state)
         await state.voice_client.disconnect()
         if guild.id in guild_states:
             del guild_states[guild.id]
