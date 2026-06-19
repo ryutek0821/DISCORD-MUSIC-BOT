@@ -64,6 +64,7 @@ class GuildState:
         self.resume_position: float = 0.0  # song position to resume at after a sound effect
         self.np_message: Optional[discord.Message] = None  # live now-playing message
         self.np_updater: Optional[asyncio.Task] = None      # progress-bar refresh loop
+        self.reapply_task: Optional[asyncio.Task] = None    # debounced source-swap timer
 
 
 guild_states: Dict[int, GuildState] = {}
@@ -77,6 +78,13 @@ IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
 
 # How often (seconds) to edit the now-playing embed so the progress bar advances.
 NP_UPDATE_INTERVAL = 10
+
+# Coalesce a burst of effect/speed/pitch/volume changes (e.g. button mashing)
+# into one FFmpeg source swap, fired this many seconds after the last change.
+EFFECT_DEBOUNCE = 0.4
+# Delay (seconds) before killing a hot-swapped FFmpeg process, so the player
+# thread has moved to the new source and we never close a pipe it's reading.
+SOURCE_CLEANUP_DELAY = 2.0
 
 # Playback speed / pitch / volume limits shared by buttons and slash commands.
 SPEED_MIN, SPEED_MAX, SPEED_STEP = 0.5, 2.0, 0.1
@@ -597,6 +605,29 @@ async def refresh_now_playing(guild_id: int) -> None:
         logger.warning(f"Failed to refresh now playing message: {e}")
 
 
+def schedule_source_cleanup(source: discord.AudioSource) -> None:
+    """Kill a hot-swapped FFmpeg process after a short delay.
+
+    Cleaning up synchronously in swap_source_at can close the FFmpeg stdout pipe
+    while the player thread is still blocked in old_source.read() — that read
+    then returns b'' and discord.py stops playback. Easy to trigger when swaps
+    arrive faster than FFmpeg emits its first packet (button mashing). Delaying
+    the kill lets the player advance to the new source first.
+    """
+    def _kill() -> None:
+        try:
+            source.cleanup()
+        except Exception as e:
+            logger.warning(f"Failed to cleanup old audio source: {e}")
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.call_later(SOURCE_CLEANUP_DELAY, lambda: loop.run_in_executor(None, _kill))
+    except RuntimeError:
+        # No running loop (shouldn't happen during playback) — clean up inline.
+        _kill()
+
+
 def swap_source_at(vc: discord.VoiceClient, state: GuildState, seek: float) -> None:
     """Hot-swap the FFmpeg source to restart the current song at `seek` seconds.
 
@@ -614,10 +645,7 @@ def swap_source_at(vc: discord.VoiceClient, state: GuildState, seek: float) -> N
     if was_paused:
         vc.pause()
     if old_source:
-        try:
-            old_source.cleanup()
-        except Exception as e:
-            logger.warning(f"Failed to cleanup old audio source: {e}")
+        schedule_source_cleanup(old_source)
     player = getattr(vc, "_player", None)
     state.seek_position = seek
     state.loops_at_swap = getattr(player, "loops", 0) if player else 0
@@ -627,6 +655,35 @@ def swap_source_at(vc: discord.VoiceClient, state: GuildState, seek: float) -> N
 def reapply_audio_settings(vc: discord.VoiceClient, state: GuildState) -> None:
     """Re-render the current song in place from the current playback position."""
     swap_source_at(vc, state, current_elapsed(vc, state))
+
+
+def cancel_reapply(state: GuildState) -> None:
+    """Cancel a pending debounced source swap, if any."""
+    if state.reapply_task and not state.reapply_task.done():
+        state.reapply_task.cancel()
+    state.reapply_task = None
+
+
+def schedule_reapply(guild_id: int) -> None:
+    """Debounce in-place re-rendering: a burst of effect/speed/pitch/volume
+    changes (button mashing) triggers a single FFmpeg source swap after a short
+    quiet window instead of one per press. The state change is applied by the
+    caller immediately; only the (expensive, race-prone) swap is deferred."""
+    state = get_state(guild_id)
+    cancel_reapply(state)
+
+    async def _run():
+        try:
+            await asyncio.sleep(EFFECT_DEBOUNCE)
+        except asyncio.CancelledError:
+            return
+        state.reapply_task = None
+        vc = state.voice_client
+        if (vc and vc.is_connected() and (vc.is_playing() or vc.is_paused())
+                and not state.is_playing_sound):
+            reapply_audio_settings(vc, state)
+
+    state.reapply_task = asyncio.create_task(_run())
 
 
 class MusicControls(discord.ui.View):
@@ -667,6 +724,7 @@ class MusicControls(discord.ui.View):
         state = guild_states.get(interaction.guild.id)
         if state:
             cancel_np_updater(state)
+            cancel_reapply(state)
         if interaction.guild.id in guild_states:
             del guild_states[interaction.guild.id]
 
@@ -702,7 +760,7 @@ class MusicControls(discord.ui.View):
             state.pitch = pitch
         if effect is not None:
             state.effect = effect
-        reapply_audio_settings(vc, state)
+        schedule_reapply(interaction.guild.id)
         await refresh_now_playing(interaction.guild.id)
 
     @discord.ui.button(emoji="🐢", label="遅く", style=discord.ButtonStyle.secondary, row=1, custom_id="music:slow_down")
@@ -745,7 +803,7 @@ class MusicControls(discord.ui.View):
         state.speed = preset["speed"]
         state.pitch = preset["pitch"]
         state.effect = preset["effect"]
-        reapply_audio_settings(vc, state)
+        schedule_reapply(interaction.guild.id)
         await refresh_now_playing(interaction.guild.id)
 
     @discord.ui.select(
@@ -1159,7 +1217,7 @@ async def speed_cmd(interaction: discord.Interaction, rate: app_commands.Range[f
     vc = interaction.guild.voice_client
     state.speed = round(rate, 2)
     if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
-        reapply_audio_settings(vc, state)
+        schedule_reapply(interaction.guild.id)
         await refresh_now_playing(interaction.guild.id)
     await interaction.response.send_message(f"🎚️ 速度を **{state.speed:.2f}x** にしました。")
 
@@ -1171,7 +1229,7 @@ async def pitch_cmd(interaction: discord.Interaction, semitones: app_commands.Ra
     vc = interaction.guild.voice_client
     state.pitch = semitones
     if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
-        reapply_audio_settings(vc, state)
+        schedule_reapply(interaction.guild.id)
         await refresh_now_playing(interaction.guild.id)
     await interaction.response.send_message(f"🎚️ ピッチを **{state.pitch:+d}半音** にしました。")
 
@@ -1199,6 +1257,7 @@ async def seek_cmd(interaction: discord.Interaction, position: str):
             f"曲の長さ（{fmt_duration(duration)}）以内で指定してください。"
         )
         return
+    cancel_reapply(state)  # an explicit jump supersedes a pending effect swap
     swap_source_at(vc, state, secs)
     await interaction.response.send_message(f"⏩ **{fmt_duration(secs)}** へシークしました。")
 
@@ -1210,7 +1269,7 @@ async def volume_cmd(interaction: discord.Interaction, level: app_commands.Range
     vc = interaction.guild.voice_client
     state.volume = level
     if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
-        reapply_audio_settings(vc, state)
+        schedule_reapply(interaction.guild.id)
         await refresh_now_playing(interaction.guild.id)
     await interaction.response.send_message(f"🔊 音量を **{level}%** にしました。")
 
@@ -1238,7 +1297,7 @@ async def preset_cmd(interaction: discord.Interaction, name: app_commands.Choice
     state.pitch = preset["pitch"]
     state.effect = preset["effect"]
     if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
-        reapply_audio_settings(vc, state)
+        schedule_reapply(interaction.guild.id)
         await refresh_now_playing(interaction.guild.id)
     await interaction.response.send_message(f"🎛️ プリセット **{name.name}** を適用しました。")
 
