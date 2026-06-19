@@ -187,8 +187,12 @@ def effect_status_line(state: GuildState) -> str:
 def create_now_playing_embed(song: Dict[str, Any], *, elapsed: Optional[float] = None,
                              state: Optional[GuildState] = None) -> discord.Embed:
     """Create a 'now playing' embed, optionally with a progress bar and effects."""
+    title = "再生中"
+    if state is not None and state.loop_mode != "off":
+        loop_labels = {"song": "🔁 1曲リピート", "queue": "🔁 全体リピート"}
+        title += f"  {loop_labels.get(state.loop_mode, '')}"
     embed = discord.Embed(
-        title="再生中",
+        title=title,
         description=f"**[{song['title']}]({song['url']})**\nリクエスト: {song.get('requester', '不明')}",
         color=0x00ff00,
     )
@@ -636,29 +640,25 @@ class MusicControls(discord.ui.View):
 
     @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.secondary, custom_id="music:pause_resume")
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()  # 無言で承認（ポップアップなし）
         vc = interaction.guild.voice_client
         if vc and vc.is_playing():
             vc.pause()
-            await interaction.response.send_message("⏸️ 一時停止しました。", ephemeral=True)
         elif vc and vc.is_paused():
             vc.resume()
-            await interaction.response.send_message("▶️ 再開しました。", ephemeral=True)
-        else:
-            await interaction.response.send_message("再生していません。", ephemeral=True)
 
     @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="music:skip")
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()  # 無言で承認（ポップアップなし）
         vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
             state = get_state(interaction.guild.id)
             state.skip_flag = True
             vc.stop()
-            await interaction.response.send_message("⏭️ スキップしました。", ephemeral=True)
-        else:
-            await interaction.response.send_message("再生していません。", ephemeral=True)
 
     @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.danger, custom_id="music:stop")
     async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()  # 無言で承認（ポップアップなし）
         cancel_idle_task(interaction.guild.id)
         vc = interaction.guild.voice_client
         if vc:
@@ -669,40 +669,32 @@ class MusicControls(discord.ui.View):
             cancel_np_updater(state)
         if interaction.guild.id in guild_states:
             del guild_states[interaction.guild.id]
-        await interaction.response.send_message("⏹️ 停止しました。", ephemeral=True)
 
     @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="music:loop")
     async def loop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()  # 無言で承認。状態は再生パネルに表示
         state = get_state(interaction.guild.id)
         order = {"off": "song", "song": "queue", "queue": "off"}
         state.loop_mode = order.get(state.loop_mode, "off")
-        labels = {"off": "オフ", "song": "1曲リピート", "queue": "キュー全体リピート"}
-        await interaction.response.send_message(
-            f"🔁 リピート: **{labels[state.loop_mode]}**", ephemeral=True
-        )
+        await refresh_now_playing(interaction.guild.id)
 
     @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, custom_id="music:shuffle")
     async def shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()  # 無言で承認（ポップアップなし）
         state = get_state(interaction.guild.id)
-        if len(state.queue) < 2:
-            await interaction.response.send_message("シャッフルする曲が足りません。", ephemeral=True)
-            return
-        random.shuffle(state.queue)
-        await interaction.response.send_message(
-            f"🔀 キュー（{len(state.queue)}曲）をシャッフルしました。", ephemeral=True
-        )
+        if len(state.queue) >= 2:
+            random.shuffle(state.queue)
 
     async def _apply_speed_pitch(self, interaction: discord.Interaction, *,
                                  speed: Optional[float] = None,
                                  pitch: Optional[int] = None,
                                  effect: Optional[str] = None):
+        await interaction.response.defer()  # 無言で承認。変更は再生パネルに反映
         state = get_state(interaction.guild.id)
         vc = interaction.guild.voice_client
         if not vc or not (vc.is_playing() or vc.is_paused()):
-            await interaction.response.send_message("再生していません。", ephemeral=True)
             return
         if state.is_playing_sound:
-            await interaction.response.send_message("効果音の再生中は変更できません。", ephemeral=True)
             return
         if speed is not None:
             state.speed = speed
@@ -712,11 +704,6 @@ class MusicControls(discord.ui.View):
             state.effect = effect
         reapply_audio_settings(vc, state)
         await refresh_now_playing(interaction.guild.id)
-        await interaction.response.send_message(
-            f"🎚️ 速度 **{state.speed:.2f}x** / "
-            f"ピッチ **{state.pitch:+d}半音** に変更",
-            ephemeral=True,
-        )
 
     @discord.ui.button(emoji="🐢", label="遅く", style=discord.ButtonStyle.secondary, row=1, custom_id="music:slow_down")
     async def slow_down(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -747,13 +734,12 @@ class MusicControls(discord.ui.View):
         await self._apply_speed_pitch(interaction, speed=1.0, pitch=0, effect="off")
 
     async def _apply_preset(self, interaction: discord.Interaction, preset_key: str):
+        await interaction.response.defer()  # 無言で承認。変更は再生パネルに反映
         state = get_state(interaction.guild.id)
         vc = interaction.guild.voice_client
         if not vc or not (vc.is_playing() or vc.is_paused()):
-            await interaction.response.send_message("再生していません。", ephemeral=True)
             return
         if state.is_playing_sound:
-            await interaction.response.send_message("効果音の再生中は変更できません。", ephemeral=True)
             return
         preset = EFFECT_PRESETS[preset_key]
         state.speed = preset["speed"]
@@ -761,10 +747,6 @@ class MusicControls(discord.ui.View):
         state.effect = preset["effect"]
         reapply_audio_settings(vc, state)
         await refresh_now_playing(interaction.guild.id)
-        await interaction.response.send_message(
-            f"🎛️ プリセット **{EFFECT_LABELS.get(preset['effect'], preset_key)}** を適用しました。",
-            ephemeral=True,
-        )
 
     @discord.ui.select(
         placeholder="🎛️ エフェクトプリセットを選択…",
@@ -1126,7 +1108,7 @@ async def play(interaction: discord.Interaction, query: str):
 async def skip(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if not vc or not (vc.is_playing() or vc.is_paused()):
-        await interaction.response.send_message("再生していません。", ephemeral=True)
+        await interaction.response.send_message("再生していません。")
         return
     state = get_state(interaction.guild.id)
     state.skip_flag = True
@@ -1156,6 +1138,7 @@ async def loop_cmd(interaction: discord.Interaction, mode: app_commands.Choice[s
     state = get_state(interaction.guild.id)
     state.loop_mode = mode.value
     labels = {"off": "オフ", "song": "1曲リピート", "queue": "キュー全体リピート"}
+    await refresh_now_playing(interaction.guild.id)
     await interaction.response.send_message(f"🔁 リピート: **{labels[state.loop_mode]}**")
 
 
@@ -1163,7 +1146,7 @@ async def loop_cmd(interaction: discord.Interaction, mode: app_commands.Choice[s
 async def shuffle_cmd(interaction: discord.Interaction):
     state = get_state(interaction.guild.id)
     if len(state.queue) < 2:
-        await interaction.response.send_message("シャッフルする曲が足りません。", ephemeral=True)
+        await interaction.response.send_message("シャッフルする曲が足りません。")
         return
     random.shuffle(state.queue)
     await interaction.response.send_message(f"🔀 キュー（{len(state.queue)}曲）をシャッフルしました。")
@@ -1199,21 +1182,21 @@ async def seek_cmd(interaction: discord.Interaction, position: str):
     state = get_state(interaction.guild.id)
     vc = interaction.guild.voice_client
     if not vc or not (vc.is_playing() or vc.is_paused()):
-        await interaction.response.send_message("再生していません。", ephemeral=True)
+        await interaction.response.send_message("再生していません。")
         return
     if state.is_playing_sound:
-        await interaction.response.send_message("効果音の再生中は変更できません。", ephemeral=True)
+        await interaction.response.send_message("効果音の再生中は変更できません。")
         return
     secs = parse_time(position)
     if secs is None or secs < 0:
         await interaction.response.send_message(
-            "時間の形式が不正です（例: `90` または `1:30`）。", ephemeral=True
+            "時間の形式が不正です（例: `90` または `1:30`）。"
         )
         return
     duration = (state.current_song or {}).get("duration") or 0
     if duration and secs >= duration:
         await interaction.response.send_message(
-            f"曲の長さ（{fmt_duration(duration)}）以内で指定してください。", ephemeral=True
+            f"曲の長さ（{fmt_duration(duration)}）以内で指定してください。"
         )
         return
     swap_source_at(vc, state, secs)
@@ -1265,11 +1248,11 @@ async def preset_cmd(interaction: discord.Interaction, name: app_commands.Choice
 async def remove_cmd(interaction: discord.Interaction, position: int):
     state = get_state(interaction.guild.id)
     if not state.queue:
-        await interaction.response.send_message("キューは空です。", ephemeral=True)
+        await interaction.response.send_message("キューは空です。")
         return
     if position < 1 or position > len(state.queue):
         await interaction.response.send_message(
-            f"1〜{len(state.queue)} の範囲で指定してください。", ephemeral=True
+            f"1〜{len(state.queue)} の範囲で指定してください。"
         )
         return
     removed = state.queue.pop(position - 1)
@@ -1289,7 +1272,7 @@ async def clear_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="join", description="Join your voice channel")
 async def join_cmd(interaction: discord.Interaction):
     if not interaction.user.voice:
-        await interaction.response.send_message("先にVCに参加してください。", ephemeral=True)
+        await interaction.response.send_message("先にVCに参加してください。")
         return
     channel = interaction.user.voice.channel
     vc = interaction.guild.voice_client
@@ -1301,7 +1284,7 @@ async def join_cmd(interaction: discord.Interaction):
             vc = await channel.connect(timeout=15)
             state.voice_client = vc
     except Exception as e:
-        await interaction.response.send_message(f"VC接続失敗: {str(e)}", ephemeral=True)
+        await interaction.response.send_message(f"VC接続失敗: {str(e)}")
         return
     await interaction.response.send_message(f"🔊 接続しました: **{channel.name}**")
 
@@ -1311,7 +1294,7 @@ async def leave_cmd(interaction: discord.Interaction):
     cancel_idle_task(interaction.guild.id)
     vc = interaction.guild.voice_client
     if not vc:
-        await interaction.response.send_message("VCに接続していません。", ephemeral=True)
+        await interaction.response.send_message("VCに接続していません。")
         return
     vc.stop()
     await vc.disconnect()
@@ -1371,7 +1354,7 @@ async def pause(interaction: discord.Interaction):
         vc.pause()
         await interaction.response.send_message("一時停止しました。")
     else:
-        await interaction.response.send_message("再生していません。", ephemeral=True)
+        await interaction.response.send_message("再生していません。")
 
 
 @bot.tree.command(name="resume", description="Resume the paused song")
@@ -1403,16 +1386,16 @@ async def na_command(interaction: discord.Interaction):
 
     vc = state.voice_client
     if not vc or not vc.is_connected():
-        await interaction.response.send_message("VCに接続していません。", ephemeral=True)
+        await interaction.response.send_message("VCに接続していません。")
         return
 
     if not vc.is_playing():
-        await interaction.response.send_message("再生していません。", ephemeral=True)
+        await interaction.response.send_message("再生していません。")
         return
 
     mp3_file = os.path.join(SOUNDS_DIR, "na-.mp3")
     if not os.path.exists(mp3_file):
-        await interaction.response.send_message("効果音ファイルが見つかりません。", ephemeral=True)
+        await interaction.response.send_message("効果音ファイルが見つかりません。")
         return
 
     if state.is_playing_sound:
@@ -1440,13 +1423,13 @@ async def na_command(interaction: discord.Interaction):
             options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
         )
         vc.play(source, after=after_sound)
-        await interaction.response.send_message("ンアッー!", ephemeral=True)
+        await interaction.response.send_message("ンアッー!")
     except Exception as e:
         logger.error(f"Failed to play sound: {e}")
         state.is_playing_sound = False
         if vc and vc.is_connected():
             vc.resume()
-        await interaction.response.send_message("効果音の再生に失敗しました。", ephemeral=True)
+        await interaction.response.send_message("効果音の再生に失敗しました。")
 
 
 @bot.tree.command(name="refresh", description="Refresh niconico cookies")
