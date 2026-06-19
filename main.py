@@ -746,6 +746,49 @@ class MusicControls(discord.ui.View):
     async def reset_effects(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._apply_speed_pitch(interaction, speed=1.0, pitch=0, effect="off")
 
+    async def _apply_preset(self, interaction: discord.Interaction, preset_key: str):
+        state = get_state(interaction.guild.id)
+        vc = interaction.guild.voice_client
+        if not vc or not (vc.is_playing() or vc.is_paused()):
+            await interaction.response.send_message("再生していません。", ephemeral=True)
+            return
+        if state.is_playing_sound:
+            await interaction.response.send_message("効果音の再生中は変更できません。", ephemeral=True)
+            return
+        preset = EFFECT_PRESETS[preset_key]
+        state.speed = preset["speed"]
+        state.pitch = preset["pitch"]
+        state.effect = preset["effect"]
+        reapply_audio_settings(vc, state)
+        await refresh_now_playing(interaction.guild.id)
+        await interaction.response.send_message(
+            f"🎛️ プリセット **{EFFECT_LABELS.get(preset['effect'], preset_key)}** を適用しました。",
+            ephemeral=True,
+        )
+
+    @discord.ui.select(
+        placeholder="🎛️ エフェクトプリセットを選択…",
+        row=2,
+        min_values=1,
+        max_values=1,
+        custom_id="music:preset_select",
+        options=[
+            discord.SelectOption(label="オフ（通常）", value="off", emoji="🎚️"),
+            discord.SelectOption(label="ナイトコア", value="nightcore", emoji="⚡", description="1.25x / +3半音"),
+            discord.SelectOption(label="ベイパーウェイブ", value="vaporwave", emoji="🌊", description="0.85x / -3半音"),
+            discord.SelectOption(label="低音ブースト", value="bassboost", emoji="🔊"),
+            discord.SelectOption(label="8Dオーディオ", value="8d", emoji="🎧"),
+            discord.SelectOption(label="Lo-Fi", value="lofi", emoji="📼", description="0.9x"),
+            discord.SelectOption(label="エコー", value="echo", emoji="📢"),
+            discord.SelectOption(label="リバーブ", value="reverb", emoji="🏛️"),
+            discord.SelectOption(label="トレモロ", value="tremolo", emoji="📳"),
+            discord.SelectOption(label="ボーカルカット", value="karaoke", emoji="🎤"),
+            discord.SelectOption(label="高音ブースト", value="trebleboost", emoji="🔔"),
+        ],
+    )
+    async def preset_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        await self._apply_preset(interaction, select.values[0])
+
 
 async def advance_queue(guild_id: int, finished_song: Dict[str, Any]) -> None:
     """Decide what to enqueue next based on loop/skip state, then play."""
