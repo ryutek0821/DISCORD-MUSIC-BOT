@@ -1,0 +1,293 @@
+"""Queue advancement, playback lifecycle, idle disconnect, and the now-playing
+progress-bar updater. Sits above audio + ui; imported by cog and bot."""
+import asyncio
+import os
+from typing import Any, Dict
+
+from .audio import (current_elapsed, download_audio, make_audio_source,
+                    reapply_audio_settings)
+from .config import (DOWNLOAD_TIMEOUT, EFFECT_DEBOUNCE, IDLE_TIMEOUT,
+                     NP_UPDATE_INTERVAL, logger)
+from .state import GuildState, get_state, guild_states
+from .ui import MusicControls, create_now_playing_embed
+from .util import fmt_duration
+
+
+def cancel_idle_task(guild_id: int) -> None:
+    state = get_state(guild_id)
+    if state.idle_task:
+        state.idle_task.cancel()
+        state.idle_task = None
+
+
+async def schedule_disconnect(guild_id: int) -> None:
+    try:
+        await asyncio.sleep(IDLE_TIMEOUT)
+        state = get_state(guild_id)
+        vc = state.voice_client
+        if vc and vc.is_connected() and not vc.is_playing():
+            logger.info(f"Idle timeout ({IDLE_TIMEOUT}s), disconnecting")
+            await vc.disconnect()
+            if guild_id in guild_states:
+                del guild_states[guild_id]
+    except asyncio.CancelledError:
+        pass
+
+
+def cancel_np_updater(state: GuildState) -> None:
+    """Stop the running now-playing progress-bar refresh loop, if any."""
+    if state.np_updater is not None:
+        state.np_updater.cancel()
+        state.np_updater = None
+
+
+def start_np_updater(guild_id: int, interval: float = NP_UPDATE_INTERVAL) -> None:
+    """Periodically refresh the now-playing message's progress bar."""
+    state = get_state(guild_id)
+    cancel_np_updater(state)
+
+    async def _updater():
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                vc = state.voice_client
+                song = state.current_song
+                msg = state.np_message
+                if not vc or not vc.is_connected() or not song or not msg:
+                    break
+                if not (vc.is_playing() or vc.is_paused()):
+                    break
+                elapsed = current_elapsed(vc, state)
+                try:
+                    embed = create_now_playing_embed(song, elapsed=elapsed, state=state)
+                    await msg.edit(embed=embed)
+                except Exception as e:
+                    logger.warning(f"Failed to update now playing message: {e}")
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    state.np_updater = asyncio.create_task(_updater())
+
+
+async def refresh_now_playing(guild_id: int) -> None:
+    """Re-render the live now-playing embed to reflect new playback settings."""
+    state = get_state(guild_id)
+    vc = state.voice_client
+    msg = state.np_message
+    song = state.current_song
+    if not vc or not msg or not song:
+        return
+    playing = vc.is_playing() or vc.is_paused()
+    elapsed = current_elapsed(vc, state) if playing else None
+    try:
+        embed = create_now_playing_embed(song, elapsed=elapsed, state=state)
+        await msg.edit(embed=embed)
+    except Exception as e:
+        logger.warning(f"Failed to refresh now playing message: {e}")
+
+
+def cancel_reapply(state: GuildState) -> None:
+    """Cancel a pending debounced source swap, if any."""
+    if state.reapply_task and not state.reapply_task.done():
+        state.reapply_task.cancel()
+    state.reapply_task = None
+
+
+def schedule_reapply(guild_id: int) -> None:
+    """Debounce in-place re-rendering: a burst of effect/speed/pitch/volume
+    changes (button mashing) triggers a single FFmpeg source swap after a short
+    quiet window instead of one per press. The state change is applied by the
+    caller immediately; only the (expensive, race-prone) swap is deferred."""
+    state = get_state(guild_id)
+    cancel_reapply(state)
+
+    async def _run():
+        try:
+            await asyncio.sleep(EFFECT_DEBOUNCE)
+        except asyncio.CancelledError:
+            return
+        state.reapply_task = None
+        vc = state.voice_client
+        if (vc and vc.is_connected() and (vc.is_playing() or vc.is_paused())
+                and not state.is_playing_sound):
+            reapply_audio_settings(vc, state)
+
+    state.reapply_task = asyncio.create_task(_run())
+
+
+async def advance_queue(guild_id: int, finished_song: Dict[str, Any]) -> None:
+    """Decide what to enqueue next based on loop/skip state, then play."""
+    state = get_state(guild_id)
+    if state.skip_flag:
+        # Manual skip overrides loop: drop the finished song and move on.
+        state.skip_flag = False
+    elif state.loop_mode == "song":
+        finished_song["local_file"] = None  # temp file already cleaned up
+        state.queue.insert(0, finished_song)
+    elif state.loop_mode == "queue":
+        finished_song["local_file"] = None
+        state.queue.append(finished_song)
+    await play_next(guild_id)
+
+
+async def play_next(guild_id: int, announce: bool = True) -> None:
+    state = get_state(guild_id)
+    vc = state.voice_client
+
+    if not vc or not vc.is_connected():
+        return
+
+    if len(state.queue) == 0:
+        state.current_song = None
+        cancel_np_updater(state)
+        state.np_message = None
+        logger.info(f"Queue empty, scheduling disconnect in {IDLE_TIMEOUT}s")
+        cancel_idle_task(guild_id)
+        state.idle_task = asyncio.create_task(schedule_disconnect(guild_id))
+        return
+
+    cancel_idle_task(guild_id)
+
+    song = state.queue.pop(0)
+    state.current_song = song
+    logger.info(f"Playing: {song['title']}")
+
+    # Capture the running loop so the threaded `after` callback can hop back.
+    loop = asyncio.get_running_loop()
+
+    if announce:
+        try:
+            embed = create_now_playing_embed(song, elapsed=0.0, state=state)
+            channel_id = song.get("text_channel_id")
+            guild = vc.channel.guild
+            text_channel = guild.get_channel(channel_id) if channel_id else None
+            if not text_channel:
+                # Fall back to the first channel the bot may actually post in.
+                text_channel = next(
+                    (ch for ch in guild.text_channels
+                     if ch.permissions_for(guild.me).send_messages),
+                    None,
+                )
+            if text_channel:
+                state.np_message = await text_channel.send(embed=embed, view=MusicControls())
+                start_np_updater(guild_id)
+        except Exception as e:
+            logger.warning(f"Failed to send now playing message: {e}")
+
+    def after_play(error):
+        if error:
+            logger.error(f"Play error: {error}")
+        local_file = song.get("local_file")
+        if local_file and os.path.exists(local_file):
+            try:
+                os.remove(local_file)
+                song["local_file"] = None
+                logger.info(f"Cleaned up temp file: {local_file}")
+            except Exception as e:
+                logger.warning(f"Failed to remove temp file: {e}")
+        if not state.is_playing_sound:
+            asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), loop)
+
+    try:
+        if song.get("needs_local") and not song.get("local_file"):
+            try:
+                local_file = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        None, download_audio, song["url"]
+                    ),
+                    timeout=DOWNLOAD_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Download timed out after {DOWNLOAD_TIMEOUT}s, skipping: {song['title']}")
+                await play_next(guild_id)
+                return
+            if not local_file:
+                logger.error("Failed to download audio")
+                await play_next(guild_id)
+                return
+            song["local_file"] = local_file
+
+        # A fresh FFmpeg process starts at loops=0; reset the seek bookkeeping.
+        state.seek_position = 0.0
+        state.loops_at_swap = 0
+        state.speed_at_swap = state.speed
+        source = make_audio_source(song, state, seek=0.0)
+        vc.play(source, after=after_play)
+    except Exception as e:
+        logger.error(f"Play failed: {e}")
+        await play_next(guild_id)
+
+
+async def restart_song(guild_id: int) -> None:
+    await asyncio.sleep(0.3)
+    state = get_state(guild_id)
+    vc = state.voice_client
+
+    song = state.current_song
+    if not song:
+        logger.warning("No current song found")
+        state.is_playing_sound = False
+        return
+
+    if not vc or not vc.is_connected():
+        logger.warning(f"VC not available for guild {guild_id}")
+        state.is_playing_sound = False
+        return
+
+    # Capture the running loop so the threaded `finish` callback can hop back.
+    loop = asyncio.get_running_loop()
+
+    def finish(error=None):
+        # Shared teardown for both the skip path and the normal end-of-song path.
+        if error:
+            logger.error(f"Restart error: {error}")
+        state.is_playing_sound = False
+        local_file = song.get("local_file")
+        if local_file and os.path.exists(local_file):
+            try:
+                os.remove(local_file)
+                song["local_file"] = None
+                logger.info(f"Cleaned up temp file: {local_file}")
+            except Exception as e:
+                logger.warning(f"Failed to remove temp file: {e}")
+        # The song is done (finished or skipped) — advance the queue.
+        asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), loop)
+
+    # A skip requested during the sound effect should move on, not replay the song.
+    if state.skip_flag:
+        logger.info("Skip requested during sound effect; advancing instead of restarting")
+        finish()
+        return
+
+    seek = max(0.0, state.resume_position)
+    logger.info(f"Resuming song at {fmt_duration(seek)}: {song['title']}")
+
+    try:
+        if song.get("needs_local") and not song.get("local_file"):
+            try:
+                local_file = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        None, download_audio, song["url"]
+                    ),
+                    timeout=DOWNLOAD_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Download timed out after {DOWNLOAD_TIMEOUT}s during restart: {song['title']}")
+                state.is_playing_sound = False
+                return
+            if not local_file:
+                logger.error("Failed to download audio for restart")
+                state.is_playing_sound = False
+                return
+            song["local_file"] = local_file
+
+        # Resume from where the sound effect interrupted, keeping speed/pitch.
+        state.seek_position = seek
+        state.loops_at_swap = 0
+        state.speed_at_swap = state.speed
+        source = make_audio_source(song, state, seek=seek)
+        vc.play(source, after=finish)
+    except Exception as e:
+        logger.error(f"Failed to restart song: {e}")
+        state.is_playing_sound = False
