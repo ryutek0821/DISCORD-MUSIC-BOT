@@ -1,0 +1,8 @@
+# Conservative lint: pyflakes (F) + syntax errors (E9) only, so CI can gate on
+# real bugs without churning the existing single-file codebase. Broaden the rule
+# set (imports, style) once Phase 3 splits main.py into modules.
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = ["E9", "F"]

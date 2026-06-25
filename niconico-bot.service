@@ -1,0 +1,20 @@
+[Unit]
+Description=INMERMUSIC Discord music bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ryu
+WorkingDirectory=/home/ryu/niconico-discord-bot
+EnvironmentFile=/home/ryu/niconico-discord-bot/.env
+ExecStart=/home/ryu/niconico-discord-bot/venv/bin/python /home/ryu/niconico-discord-bot/main.py
+Restart=always
+RestartSec=5
+# yt-dlp/ffmpeg spawn child processes; clean them up with the unit.
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
