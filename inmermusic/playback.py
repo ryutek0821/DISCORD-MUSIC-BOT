@@ -4,6 +4,8 @@ import asyncio
 import os
 from typing import Any, Dict
 
+import discord
+
 from .audio import (current_elapsed, download_audio, make_audio_source,
                     reapply_audio_settings)
 from .config import (DOWNLOAD_TIMEOUT, EFFECT_DEBOUNCE, IDLE_TIMEOUT,
@@ -291,3 +293,44 @@ async def restart_song(guild_id: int) -> None:
     except Exception as e:
         logger.error(f"Failed to restart song: {e}")
         state.is_playing_sound = False
+
+
+def play_sound_effect(guild_id: int, sound_path: str) -> bool:
+    """Interrupt the current song with a one-shot sound effect, then resume it.
+
+    Shared by /na-, /sound and the message triggers. Returns False if nothing
+    is playing or a sound effect is already in progress. Must be called from a
+    coroutine (it captures the running loop for the threaded `after` callback).
+    """
+    state = get_state(guild_id)
+    vc = state.voice_client
+    if not vc or not vc.is_connected() or not vc.is_playing():
+        return False
+    if state.is_playing_sound:
+        return False
+
+    loop = asyncio.get_running_loop()
+    state.resume_position = current_elapsed(vc, state)  # resume here after the effect
+    state.is_playing_sound = True
+    vc.stop()
+
+    def after_sound(error):
+        if error:
+            logger.error(f"Sound effect error: {error}")
+        try:
+            asyncio.run_coroutine_threadsafe(restart_song(guild_id), loop)
+        except Exception as e:
+            logger.error(f"Failed to schedule restart: {e}")
+            state.is_playing_sound = False
+
+    try:
+        source = discord.FFmpegOpusAudio(
+            sound_path,
+            options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
+        )
+        vc.play(source, after=after_sound)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to play sound: {e}")
+        state.is_playing_sound = False
+        return False

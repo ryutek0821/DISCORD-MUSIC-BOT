@@ -6,7 +6,7 @@ rather than importing the value by name.
 """
 import os
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
@@ -112,3 +112,20 @@ EFFECT_LABELS: Dict[str, str] = {
     "karaoke": "ボーカルカット",
     "trebleboost": "高音ブースト",
 }
+
+
+def list_sound_names() -> List[str]:
+    """Sorted names (without .mp3) of the soundboard files in SOUNDS_DIR."""
+    try:
+        return sorted(os.path.splitext(f)[0] for f in os.listdir(SOUNDS_DIR)
+                      if f.lower().endswith(".mp3"))
+    except OSError:
+        return []
+
+
+def resolve_sound(name: str) -> Optional[str]:
+    """Map a soundboard name to its file path, guarding against path traversal."""
+    if not name or "/" in name or "\\" in name or ".." in name:
+        return None
+    path = os.path.join(SOUNDS_DIR, name + ".mp3")
+    return path if os.path.isfile(path) else None
