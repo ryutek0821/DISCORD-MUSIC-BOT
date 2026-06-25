@@ -68,9 +68,46 @@ def test_make_progress_bar():
     assert main.make_progress_bar(9999, 180) != ""  # clamps over 100%
 
 
+def test_write_netscape_cookies():
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    original = main.COOKIE_FILE
+    try:
+        main.COOKIE_FILE = path
+        count = main.write_netscape_cookies([
+            {"name": "user_session", "value": "abc", "domain": "nicovideo.jp",
+             "path": "/", "secure": True, "expiry": 1999999999},
+            {"name": "lang", "value": "ja"},  # minimal record -> defaults applied
+        ])
+        assert count == 2
+        with open(path) as f:
+            content = f.read()
+        assert content.startswith("# Netscape HTTP Cookie File\n")
+        rows = [ln.split("\t") for ln in content.splitlines()
+                if ln and not ln.startswith("#")]
+        assert len(rows) == 2
+        # Full record: leading dot added, secure TRUE, expiry preserved.
+        assert rows[0] == [".nicovideo.jp", "TRUE", "/", "TRUE", "1999999999",
+                           "user_session", "abc"]
+        # Minimal record: domain/path/secure/expiry fall back to defaults.
+        assert rows[1] == [".nicovideo.jp", "TRUE", "/", "FALSE", "0", "lang", "ja"]
+        # Cookie file must stay private.
+        assert (os.stat(path).st_mode & 0o777) == 0o600
+    finally:
+        main.COOKIE_FILE = original
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def test_preset_integrity():
-    assert set(main.EFFECT_PRESETS) == {"off", "nightcore", "vaporwave", "bassboost", "8d", "lofi"}
-    assert all(v["effect"] in main.EFFECT_FILTERS for v in main.EFFECT_PRESETS.values())
+    # Presets and labels must cover exactly the same set of keys, so a new
+    # preset can't ship without a UI label (or vice versa).
+    assert set(main.EFFECT_PRESETS) == set(main.EFFECT_LABELS)
+    # Every preset references a defined effect filter and carries a full spec.
+    for key, preset in main.EFFECT_PRESETS.items():
+        assert preset["effect"] in main.EFFECT_FILTERS, key
+        assert {"speed", "pitch", "effect"} <= set(preset), key
 
 
 if __name__ == "__main__":
