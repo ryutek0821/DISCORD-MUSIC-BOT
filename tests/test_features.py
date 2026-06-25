@@ -100,6 +100,33 @@ def test_write_netscape_cookies():
             os.remove(path)
 
 
+def test_cleanup_temp_files():
+    import tempfile
+    import time
+    d = tempfile.mkdtemp()
+    old = os.path.join(d, "dl_old.m4a")
+    recent = os.path.join(d, "dl_recent.m4a")
+    keep = os.path.join(d, "keep.txt")
+    for p in (old, recent, keep):
+        with open(p, "w") as f:
+            f.write("x")
+    past = time.time() - 7200  # 2h old, past the 1h threshold
+    os.utime(old, (past, past))
+    original = main.tempfile.gettempdir
+    try:
+        main.tempfile.gettempdir = lambda: d
+        removed = main.cleanup_temp_files(max_age=3600)
+    finally:
+        main.tempfile.gettempdir = original
+    assert removed == 1
+    assert not os.path.exists(old)       # aged dl_* removed
+    assert os.path.exists(recent)        # fresh dl_* kept
+    assert os.path.exists(keep)          # non-dl_* untouched
+    for p in (recent, keep):
+        os.remove(p)
+    os.rmdir(d)
+
+
 def test_preset_integrity():
     # Presets and labels must cover exactly the same set of keys, so a new
     # preset can't ship without a UI label (or vice versa).

@@ -31,9 +31,18 @@ SOUNDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
 if not os.path.isdir(SOUNDS_DIR):
     os.makedirs(SOUNDS_DIR, exist_ok=True)
 
+# journald (systemd) captures stdout, so the stream handler is enough in
+# production; set LOG_FILE to additionally keep a bounded, rotating log file.
+_log_handlers: List[logging.Handler] = [logging.StreamHandler()]
+LOG_FILE = os.getenv("LOG_FILE")
+if LOG_FILE:
+    from logging.handlers import RotatingFileHandler
+    _log_handlers.append(RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3))
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=_log_handlers,
 )
 logger = logging.getLogger("niconico-bot")
 
@@ -1009,6 +1018,36 @@ def download_audio(url: str) -> str:
     return None
 
 
+def cleanup_temp_files(max_age: float = 3600) -> int:
+    """Remove orphaned dl_* temp files left by a previous crash.
+
+    Downloads are normally deleted in the play `after` callback, but a crash
+    mid-playback leaks them in the temp dir. Sweep ones older than max_age on
+    startup so they don't accumulate. Returns the number removed.
+    """
+    removed = 0
+    tmpdir = tempfile.gettempdir()
+    now = time.time()
+    try:
+        names = os.listdir(tmpdir)
+    except OSError as e:
+        logger.warning(f"Temp cleanup failed to list {tmpdir}: {e}")
+        return 0
+    for name in names:
+        if not name.startswith("dl_"):
+            continue
+        path = os.path.join(tmpdir, name)
+        try:
+            if now - os.path.getmtime(path) > max_age:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            pass
+    if removed:
+        logger.info(f"Cleaned up {removed} orphaned temp file(s)")
+    return removed
+
+
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user}")
@@ -1020,6 +1059,8 @@ async def on_ready():
     # on_ready can fire again on gateway reconnects; run startup work only once.
     if not getattr(bot, "_startup_done", False):
         bot._startup_done = True
+        # Clear temp downloads orphaned by a previous crash.
+        cleanup_temp_files()
         # Register the persistent control view so now-playing buttons keep
         # working after a restart, and start the single cookie-refresh loop.
         bot.add_view(MusicControls())
