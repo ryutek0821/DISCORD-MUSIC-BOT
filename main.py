@@ -1,5 +1,6 @@
 import os
 import asyncio
+import threading
 import random
 import logging
 from typing import Optional, Dict, List, Any
@@ -71,10 +72,19 @@ guild_states: Dict[int, GuildState] = {}
 
 last_cookie_refresh = 0
 COOKIE_TTL = int(os.getenv("COOKIE_TTL", "3600"))
-cookie_refresh_lock = asyncio.Lock()
+# threading.Lock (not asyncio): cookie refreshes run in executor threads, so the
+# foreground extract path and the background loop must serialize there, not on
+# the event loop. cookie_refresh_lock avoids duplicate logins; cookie_file_lock
+# guards the atomic file write so a concurrent yt-dlp read never sees a partial.
+cookie_refresh_lock = threading.Lock()
+cookie_file_lock = threading.Lock()
 
 # Idle disconnect timeout (seconds) configurable via env
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
+
+# Max seconds to wait for a single audio download before giving up, so a stalled
+# fetch can't wedge the queue. Also passed to yt-dlp as socket_timeout (capped).
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "120"))
 
 # How often (seconds) to edit the now-playing embed so the progress bar advances.
 NP_UPDATE_INTERVAL = 10
@@ -252,31 +262,82 @@ def login_via_api() -> requests.cookies.RequestsCookieJar:
     return session.cookies
 
 
+def write_netscape_cookies(records: List[Dict[str, Any]]) -> int:
+    """Atomically write cookie records to COOKIE_FILE in Netscape format.
+
+    Each record needs name/value plus optional domain/path/secure/expiry. Writes
+    go through a temp file + os.replace (atomic on POSIX) under cookie_file_lock,
+    so a concurrent yt-dlp read or another writer never sees a half-written file.
+    Returns the number of cookies written.
+    """
+    lines = ["# Netscape HTTP Cookie File\n"]
+    for r in records:
+        domain = r.get("domain") or ".nicovideo.jp"
+        if not domain.startswith("."):
+            domain = "." + domain.lstrip(".")
+        path = r.get("path") or "/"
+        secure = "TRUE" if r.get("secure") else "FALSE"
+        expiry = str(int(r["expiry"])) if r.get("expiry") else "0"
+        lines.append(f"{domain}\tTRUE\t{path}\t{secure}\t{expiry}\t{r['name']}\t{r['value']}\n")
+
+    target_dir = os.path.dirname(os.path.abspath(COOKIE_FILE))
+    with cookie_file_lock:
+        fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=".cookies_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.writelines(lines)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, COOKIE_FILE)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+    return len(records)
+
+
 def save_session_cookies(cookies: requests.cookies.RequestsCookieJar) -> None:
-    with open(COOKIE_FILE, "w") as f:
-        f.write("# Netscape HTTP Cookie File\n")
-        for cookie in cookies:
-            domain = cookie.domain
-            if not domain.startswith("."):
-                domain = "." + domain.lstrip(".")
-            path = cookie.path
-            secure = "TRUE" if cookie.secure else "FALSE"
-            expiry = str(int(cookie.expires)) if cookie.expires else "0"
-            f.write(f"{domain}\tTRUE\t{path}\t{secure}\t{expiry}\t{cookie.name}\t{cookie.value}\n")
-    try:
-        os.chmod(COOKIE_FILE, 0o600)
-    except Exception as e:
-        logger.warning(f"Failed to set restrictive permissions on cookie file: {e}")
-    logger.info(f"Saved {len(cookies)} session cookies")
+    records = [
+        {
+            "domain": c.domain,
+            "path": c.path,
+            "secure": c.secure,
+            "expiry": c.expires,
+            "name": c.name,
+            "value": c.value,
+        }
+        for c in cookies
+    ]
+    count = write_netscape_cookies(records)
+    logger.info(f"Saved {count} session cookies")
 
 
 def refresh_nico_cookies_sync(force: bool = False) -> bool:
-    global last_cookie_refresh
-    now = time.time()
-    if not force and (now - last_cookie_refresh) < COOKIE_TTL:
-        if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
-            logger.info("Using cached cookies (not expired)")
+    def _cache_valid() -> bool:
+        return (not force
+                and (time.time() - last_cookie_refresh) < COOKIE_TTL
+                and bool(COOKIE_FILE)
+                and os.path.exists(COOKIE_FILE)
+                and os.path.getsize(COOKIE_FILE) > 0)
+
+    if _cache_valid():
+        logger.info("Using cached cookies (not expired)")
+        return True
+
+    # Serialize logins across the foreground extract path and the background
+    # loop so we never run two logins (or two cookie writes) concurrently.
+    with cookie_refresh_lock:
+        if _cache_valid():
+            logger.info("Using cached cookies (refreshed by another task)")
             return True
+        return _do_refresh_nico_cookies()
+
+
+def _do_refresh_nico_cookies() -> bool:
+    """Run the actual niconico login (API, then Selenium fallback).
+
+    The caller holds cookie_refresh_lock, so only one refresh runs at a time.
+    """
+    global last_cookie_refresh
 
     logger.info("Refreshing niconico cookies via API...")
     try:
@@ -321,17 +382,7 @@ def refresh_nico_cookies_sync(force: bool = False) -> bool:
             time.sleep(10)
 
             cookies = driver.get_cookies()
-            with open(COOKIE_FILE, "w") as f:
-                f.write("# Netscape HTTP Cookie File\n")
-                for cookie in cookies:
-                    domain = cookie.get("domain", ".nicovideo.jp")
-                    if not domain.startswith("."):
-                        domain = "." + domain.lstrip(".")
-                    path = cookie.get("path", "/")
-                    secure = "TRUE" if cookie.get("secure", False) else "FALSE"
-                    expiry = str(int(cookie["expiry"])) if "expiry" in cookie else "0"
-                    f.write(f"{domain}\tTRUE\t{path}\t{secure}\t{expiry}\t{cookie['name']}\t{cookie['value']}\n")
-
+            write_netscape_cookies(cookies)
             last_cookie_refresh = time.time()
             logger.info(f"Saved {len(cookies)} cookies via Selenium")
             return True
@@ -902,9 +953,17 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
 
     try:
         if song.get("needs_local") and not song.get("local_file"):
-            local_file = await asyncio.get_running_loop().run_in_executor(
-                None, download_audio, song["url"]
-            )
+            try:
+                local_file = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        None, download_audio, song["url"]
+                    ),
+                    timeout=DOWNLOAD_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Download timed out after {DOWNLOAD_TIMEOUT}s, skipping: {song['title']}")
+                await play_next(guild_id)
+                return
             if not local_file:
                 logger.error("Failed to download audio")
                 await play_next(guild_id)
@@ -932,7 +991,11 @@ def download_audio(url: str) -> str:
     tmpdir = tempfile.gettempdir()
     output_template = os.path.join(tmpdir, "dl_%(id)s.%(ext)s")
 
-    ydl_opts = build_ydl_opts(url, outtmpl=output_template)
+    # socket_timeout caps individual network reads so a dead connection raises
+    # instead of blocking this executor thread forever (the async wait_for in
+    # the callers only abandons the await, it can't kill the thread).
+    ydl_opts = build_ydl_opts(url, outtmpl=output_template,
+                              socket_timeout=min(30, DOWNLOAD_TIMEOUT))
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -967,8 +1030,9 @@ async def background_cookie_refresh():
     await asyncio.sleep(2)
     while True:
         try:
-            async with cookie_refresh_lock:
-                await asyncio.get_running_loop().run_in_executor(None, refresh_nico_cookies_sync, True)
+            # Serialization with on-demand refreshes happens inside
+            # refresh_nico_cookies_sync via cookie_refresh_lock (threading.Lock).
+            await asyncio.get_running_loop().run_in_executor(None, refresh_nico_cookies_sync, True)
         except Exception as e:
             logger.error(f"Background cookie refresh error: {e}")
         await asyncio.sleep(COOKIE_TTL)
@@ -1080,9 +1144,17 @@ async def restart_song(guild_id: int) -> None:
 
     try:
         if song.get("needs_local") and not song.get("local_file"):
-            local_file = await asyncio.get_running_loop().run_in_executor(
-                None, download_audio, song["url"]
-            )
+            try:
+                local_file = await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(
+                        None, download_audio, song["url"]
+                    ),
+                    timeout=DOWNLOAD_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Download timed out after {DOWNLOAD_TIMEOUT}s during restart: {song['title']}")
+                state.is_playing_sound = False
+                return
             if not local_file:
                 logger.error("Failed to download audio for restart")
                 state.is_playing_sound = False
