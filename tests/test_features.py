@@ -146,10 +146,48 @@ def test_cog_registration():
     names = {c.name for c in MusicCog(bot).get_app_commands()}
     expected = {
         "play", "skip", "queue", "loop", "shuffle", "speed", "pitch", "seek",
-        "volume", "preset", "remove", "clear", "join", "leave", "help", "stop",
-        "pause", "resume", "nowplaying", "na-", "refresh",
+        "volume", "preset", "remove", "move", "clear", "join", "leave", "help",
+        "stop", "pause", "resume", "nowplaying", "na-", "sound", "refresh",
     }
     assert names == expected, (expected - names, names - expected)
+
+
+def test_move_queue_item():
+    from inmermusic.state import move_queue_item
+    q = ["a", "b", "c", "d"]
+    assert move_queue_item(q, 1, 3) is True
+    assert q == ["b", "c", "a", "d"]      # first -> 3rd
+    assert move_queue_item(q, 4, 1) is True
+    assert q == ["d", "b", "c", "a"]      # last -> first
+    # No-ops and out-of-range leave the queue unchanged.
+    assert move_queue_item(q, 2, 2) is False
+    assert move_queue_item(q, 0, 1) is False
+    assert move_queue_item(q, 1, 99) is False
+    assert move_queue_item(["only"], 1, 1) is False
+    assert q == ["d", "b", "c", "a"]
+
+
+def test_soundboard_helpers():
+    import tempfile
+    d = tempfile.mkdtemp()
+    for f in ("na-.mp3", "boo.mp3", "notes.txt"):
+        open(os.path.join(d, f), "w").close()
+    original = config.SOUNDS_DIR
+    try:
+        config.SOUNDS_DIR = d
+        assert config.list_sound_names() == ["boo", "na-"]   # sorted, .mp3 only
+        assert config.resolve_sound("na-") == os.path.join(d, "na-.mp3")
+        assert config.resolve_sound("missing") is None
+        # Path traversal must be rejected.
+        assert config.resolve_sound("../secret") is None
+        assert config.resolve_sound("a/b") is None
+        assert config.resolve_sound("..") is None
+        assert config.resolve_sound("") is None
+    finally:
+        config.SOUNDS_DIR = original
+        for f in ("na-.mp3", "boo.mp3", "notes.txt"):
+            os.remove(os.path.join(d, f))
+        os.rmdir(d)
 
 
 if __name__ == "__main__":

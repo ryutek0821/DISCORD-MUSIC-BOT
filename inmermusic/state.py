@@ -35,3 +35,16 @@ def get_state(guild_id: int) -> GuildState:
     if guild_id not in guild_states:
         guild_states[guild_id] = GuildState()
     return guild_states[guild_id]
+
+
+def move_queue_item(queue: List[Any], from_pos: int, to_pos: int) -> bool:
+    """Move a queue entry from 1-based from_pos to to_pos, in place.
+
+    Returns False (no change) for an empty/single queue, out-of-range
+    positions, or a no-op move.
+    """
+    n = len(queue)
+    if n < 2 or not (1 <= from_pos <= n) or not (1 <= to_pos <= n) or from_pos == to_pos:
+        return False
+    queue.insert(to_pos - 1, queue.pop(from_pos - 1))
+    return True

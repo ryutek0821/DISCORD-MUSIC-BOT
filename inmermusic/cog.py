@@ -1,6 +1,5 @@
 """All slash commands and the message/voice listeners, as a single cog."""
 import asyncio
-import os
 import random
 
 import discord
@@ -9,11 +8,11 @@ from discord.ext import commands
 
 from . import cookies
 from .audio import current_elapsed, extract_audio_url, swap_source_at
-from .config import EFFECT_PRESETS, SOUNDS_DIR, logger
+from .config import EFFECT_PRESETS, list_sound_names, logger, resolve_sound
 from .playback import (cancel_idle_task, cancel_np_updater, cancel_reapply,
-                       play_next, refresh_now_playing, restart_song,
+                       play_next, play_sound_effect, refresh_now_playing,
                        schedule_reapply, start_np_updater)
-from .state import get_state, guild_states
+from .state import get_state, guild_states, move_queue_item
 from .ui import MusicControls, create_now_playing_embed, create_queued_embed
 from .util import fmt_duration, parse_time
 
@@ -102,8 +101,16 @@ class MusicCog(commands.Cog):
         if not state.queue:
             await interaction.response.send_message("キューは空です。")
             return
-        desc = "\n".join(f"{i+1}. **[{s['title']}]({s['url']})** (by {s.get('requester', '不明')})" for i, s in enumerate(state.queue[:10]))
-        embed = discord.Embed(title="キュー", description=desc, color=0x00ff00)
+        total = len(state.queue)
+        lines = [f"{i+1}. **[{s['title']}]({s['url']})** (by {s.get('requester', '不明')})"
+                 for i, s in enumerate(state.queue[:20])]
+        desc = "\n".join(lines)
+        if total > 20:
+            desc += f"\n…他 {total - 20} 曲"
+        embed = discord.Embed(title=f"キュー（{total}曲）", description=desc, color=0x00ff00)
+        total_dur = sum((s.get("duration") or 0) for s in state.queue)
+        if total_dur:
+            embed.set_footer(text=f"合計再生時間: {fmt_duration(total_dur)}")
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="loop", description="Set repeat mode (off / song / queue)")
@@ -231,6 +238,26 @@ class MusicCog(commands.Cog):
         removed = state.queue.pop(position - 1)
         await interaction.response.send_message(f"🗑️ 削除しました: **{removed['title']}**")
 
+    @app_commands.command(name="move", description="Reorder a song in the queue")
+    @app_commands.describe(from_pos="移動元の番号", to_pos="移動先の番号")
+    async def move_cmd(self, interaction: discord.Interaction, from_pos: int, to_pos: int):
+        state = get_state(interaction.guild.id)
+        n = len(state.queue)
+        if n < 2:
+            await interaction.response.send_message("並べ替える曲がありません。")
+            return
+        if not (1 <= from_pos <= n) or not (1 <= to_pos <= n):
+            await interaction.response.send_message(f"1〜{n} の範囲で指定してください。")
+            return
+        if from_pos == to_pos:
+            await interaction.response.send_message("移動元と移動先が同じです。")
+            return
+        title = state.queue[from_pos - 1]["title"]
+        move_queue_item(state.queue, from_pos, to_pos)
+        await interaction.response.send_message(
+            f"↕️ **{title}** を #{from_pos} → #{to_pos} に移動しました。"
+        )
+
     @app_commands.command(name="clear", description="Clear the queue without disconnecting")
     async def clear_cmd(self, interaction: discord.Interaction):
         state = get_state(interaction.guild.id)
@@ -292,9 +319,11 @@ class MusicCog(commands.Cog):
         embed.add_field(name="/seek <時間>", value="再生位置へジャンプ (例 1:30)", inline=True)
         embed.add_field(name="/preset <名前>", value="エフェクト（ナイトコア等）", inline=True)
         embed.add_field(name="/remove <番号>", value="キューから曲を削除", inline=True)
+        embed.add_field(name="/move <元> <先>", value="キューの曲を並べ替え", inline=True)
         embed.add_field(name="/clear", value="キューをクリア（再生は継続）", inline=True)
         embed.add_field(name="/join・/leave", value="VCに参加・退出", inline=True)
         embed.add_field(name="/na-", value="効果音（同一曲中1回）", inline=True)
+        embed.add_field(name="/sound <名前>", value="サウンドボード再生", inline=True)
         embed.add_field(name="/refresh", value="ニコニコCookie更新", inline=True)
         embed.add_field(name="再生中ボタン", value="🐢🐇 速度 / 🔽🔼 ピッチ / 🎚️ リセット", inline=False)
         embed.add_field(name="メッセージトリガー", value="`んあー` / `んあーと` で効果音", inline=False)
@@ -343,58 +372,43 @@ class MusicCog(commands.Cog):
         embed = create_now_playing_embed(state.current_song, elapsed=elapsed, state=state)
         await interaction.response.send_message(embed=embed, view=MusicControls())
 
-    @app_commands.command(name="na-", description="ンアッー!(≧д≦)")
-    async def na_command(self, interaction: discord.Interaction):
-        guild_id = interaction.guild.id
-        state = get_state(guild_id)
-
+    async def _play_named_sound(self, interaction: discord.Interaction, name: str, success_msg: str):
+        """Shared handler for /na- and /sound: validate, play, and reply."""
+        state = get_state(interaction.guild.id)
         vc = state.voice_client
         if not vc or not vc.is_connected():
             await interaction.response.send_message("VCに接続していません。")
             return
-
         if not vc.is_playing():
             await interaction.response.send_message("再生していません。")
             return
-
-        mp3_file = os.path.join(SOUNDS_DIR, "na-.mp3")
-        if not os.path.exists(mp3_file):
+        path = resolve_sound(name)
+        if not path:
             await interaction.response.send_message("効果音ファイルが見つかりません。")
             return
-
         if state.is_playing_sound:
             await interaction.response.send_message("同一楽曲再生中に1度しか流せません")
             return
-
-        logger.info("Playing sound effect via /na-")
-        loop = asyncio.get_running_loop()
-        state.resume_position = current_elapsed(vc, state)  # resume here after the effect
-        state.is_playing_sound = True
-        if vc and vc.is_connected():
-            vc.stop()
-
-        def after_sound(error):
-            if error:
-                logger.error(f"Sound effect error: {error}")
-            try:
-                asyncio.run_coroutine_threadsafe(restart_song(guild_id), loop)
-            except Exception as e:
-                logger.error(f"Failed to schedule restart: {e}")
-                state.is_playing_sound = False
-
-        try:
-            source = discord.FFmpegOpusAudio(
-                mp3_file,
-                options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
-            )
-            vc.play(source, after=after_sound)
-            await interaction.response.send_message("ンアッー!")
-        except Exception as e:
-            logger.error(f"Failed to play sound: {e}")
-            state.is_playing_sound = False
-            if vc and vc.is_connected():
-                vc.resume()
+        logger.info(f"Playing sound effect '{name}' via slash command")
+        if play_sound_effect(interaction.guild.id, path):
+            await interaction.response.send_message(success_msg)
+        else:
             await interaction.response.send_message("効果音の再生に失敗しました。")
+
+    @app_commands.command(name="na-", description="ンアッー!(≧д≦)")
+    async def na_command(self, interaction: discord.Interaction):
+        await self._play_named_sound(interaction, "na-", "ンアッー!")
+
+    @app_commands.command(name="sound", description="効果音を再生（同一曲中に1回）")
+    @app_commands.describe(name="効果音の名前")
+    async def sound_cmd(self, interaction: discord.Interaction, name: str):
+        await self._play_named_sound(interaction, name, f"🔊 {name}")
+
+    @sound_cmd.autocomplete("name")
+    async def sound_autocomplete(self, interaction: discord.Interaction, current: str):
+        current = current.lower()
+        return [app_commands.Choice(name=n, value=n)
+                for n in list_sound_names() if current in n.lower()][:25]
 
     @app_commands.command(name="refresh", description="Refresh niconico cookies")
     async def refresh(self, interaction: discord.Interaction):
@@ -413,52 +427,14 @@ class MusicCog(commands.Cog):
         # process_commands, so we only handle the sound-effect trigger here.
         if message.author.bot or not message.guild:
             return
-
-        guild_id = message.guild.id
-        content = message.content
-        if content not in ("んあー", "んあーと"):
+        if message.content not in ("んあー", "んあーと"):
             return
-
-        state = get_state(guild_id)
-        if state.is_playing_sound:
+        path = resolve_sound("na-")
+        if not path:
+            logger.warning("Sound file 'na-' not found")
             return
-
-        vc = state.voice_client
-        if not vc or not vc.is_connected():
-            return
-
-        if not vc.is_playing():
-            return
-
-        mp3_file = os.path.join(SOUNDS_DIR, "na-.mp3")
-        if not os.path.exists(mp3_file):
-            logger.warning(f"Sound file not found: {mp3_file}")
-            return
-
-        logger.info(f"Playing sound effect for trigger: {content}")
-        loop = asyncio.get_running_loop()
-        state.resume_position = current_elapsed(vc, state)  # resume here after the effect
-        state.is_playing_sound = True
-        vc.stop()
-
-        def after_sound(error):
-            if error:
-                logger.error(f"Sound effect error: {error}")
-            try:
-                asyncio.run_coroutine_threadsafe(restart_song(guild_id), loop)
-            except Exception as e:
-                logger.error(f"Failed to schedule restart: {e}")
-                state.is_playing_sound = False
-
-        try:
-            source = discord.FFmpegOpusAudio(
-                mp3_file,
-                options="-c:a libopus -b:a 192k -ar 48000 -ac 2",
-            )
-            vc.play(source, after=after_sound)
-        except Exception as e:
-            logger.error(f"Failed to play sound: {e}")
-            state.is_playing_sound = False
+        logger.info(f"Playing sound effect for trigger: {message.content}")
+        play_sound_effect(message.guild.id, path)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
