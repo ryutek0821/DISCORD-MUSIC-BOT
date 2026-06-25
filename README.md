@@ -78,7 +78,13 @@ NICO_PASSWORD=ニコニコパスワード
 CHROMEDRIVER_PATH=/usr/bin/chromedriver  # オプション
 COOKIE_TTL=3600                           # オプション、Cookie有効期限（秒）
 IDLE_TIMEOUT=180                          # オプション、アイドル切断時間（秒）
+DOWNLOAD_TIMEOUT=120                       # オプション、1曲のDLタイムアウト（秒）
+LOG_FILE=bot.log                          # オプション、指定時はローテーションログも出力
+YT_PROXY=http://100.114.153.17:8888       # オプション、YouTube用の住宅IPプロキシ
 ```
+
+> ログは標準出力（systemd運用時は journald が収集）に出ます。`LOG_FILE` を設定すると
+> 5MB×3世代のローテーションファイルにも出力します。
 
 ## 起動
 
@@ -109,7 +115,13 @@ sudo systemctl start niconico-bot
 
 ## GitOps
 
-このプロジェクトは自動化されたGitOpsワークフローを使用しています：
-- PR to master → Auto merge
-- Merge to master → Version tag
-- Daily 18:00 JST → Deploy to Raspberry Pi via Tailscale
+自動化されたGitOpsワークフロー：
+
+1. **PR → CI**（`ci.yml`）: ruff + `tests/test_features.py` を実行
+2. **CI green → Auto merge**（`auto-merge.yml`）: CI成功時のみ squash マージ
+3. **Auto merge → Deploy**: マージ後に `deploy-on-push.yml` を dispatch し RYU-RASPBERRYPI へ反映
+   （`GITHUB_TOKEN` のマージは `push` を発火しないため明示 dispatch している）
+4. **master へ直接 push**: `deploy-on-push.yml`（deploy）と `version-tag.yml`（タグ付け）が発火
+
+> CI が赤の PR はマージされない。`niconico-bot.service` はリポジトリ管理下にあり、
+> 上記「systemdサービスとして起動」の手順で `/etc/systemd/system/` に配置する。

@@ -1,36 +1,71 @@
 name: Auto Merge PR to master
 
+# Gate: only react once CI (ruff + tests) has finished. A token-merge does not
+# fire on:push, so after merging we explicitly dispatch the deploy workflow.
 on:
-  pull_request:
+  workflow_run:
+    workflows: ["CI"]
     types:
-      - opened
-      - synchronize
-    branches:
-      - master
+      - completed
 
 permissions:
   contents: write
   pull-requests: write
+  actions: write   # required to dispatch deploy-on-push.yml after merging
 
 jobs:
   auto-merge:
+    # Only when CI passed for a pull request (ignore CI runs from push to master).
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_branch != 'master'
     runs-on: ubuntu-latest
     steps:
-      - name: Auto merge PR
+      - name: Merge the green PR, then trigger deploy
         uses: actions/github-script@v7
         with:
           script: |
-            const pr = context.payload.pull_request;
-            if (!pr.merged) {
-              try {
-                await github.rest.pulls.merge({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  pull_number: pr.number,
-                  merge_method: 'squash'
-                });
-                console.log('PR merged');
-              } catch (e) {
-                console.log('Merge may be blocked or already merged: ' + e.message);
-              }
+            const run = context.payload.workflow_run;
+            const { owner, repo } = context.repo;
+
+            // Resolve the open PR from the branch CI ran on.
+            const { data: prs } = await github.rest.pulls.list({
+              owner, repo, state: 'open',
+              head: `${owner}:${run.head_branch}`,
+            });
+            if (prs.length === 0) {
+              console.log(`No open PR for branch ${run.head_branch}; nothing to merge.`);
+              return;
+            }
+            const pr = prs[0];
+            if (pr.base.ref !== 'master') {
+              console.log(`PR #${pr.number} targets ${pr.base.ref}, not master; skipping.`);
+              return;
+            }
+
+            try {
+              await github.rest.pulls.merge({
+                owner, repo,
+                pull_number: pr.number,
+                merge_method: 'squash',
+                sha: run.head_sha,   // only merge the exact commit CI tested
+              });
+              console.log(`Merged PR #${pr.number}`);
+            } catch (e) {
+              console.log(`Merge skipped/failed for PR #${pr.number}: ${e.message}`);
+              return;
+            }
+
+            // GITHUB_TOKEN merges don't fire on:push, so kick the deploy here.
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner, repo,
+                workflow_id: 'deploy-on-push.yml',
+                ref: 'master',
+                inputs: { reason: `Auto-deploy after merging PR #${pr.number}` },
+              });
+              console.log('Dispatched deploy workflow on master');
+            } catch (e) {
+              console.log(`Deploy dispatch failed: ${e.message}`);
             }
