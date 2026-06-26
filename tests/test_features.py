@@ -136,6 +136,27 @@ def test_preset_integrity():
     for key, preset in config.EFFECT_PRESETS.items():
         assert preset["effect"] in config.EFFECT_FILTERS, key
         assert {"speed", "pitch", "effect"} <= set(preset), key
+    # Every preset has a dropdown emoji, within Discord's 25-option cap.
+    assert set(config.EFFECT_EMOJI) == set(config.EFFECT_PRESETS)
+    assert len(config.EFFECT_PRESETS) <= 25
+
+
+def test_preset_filters_emitted():
+    # Each effect's filter tokens must actually appear in the built -af chain.
+    for key, preset in config.EFFECT_PRESETS.items():
+        af = audio.build_audio_filter(preset["speed"], preset["pitch"], 100, preset["effect"])
+        for token in config.EFFECT_FILTERS[preset["effect"]]:
+            assert af and token in af, (key, token)
+
+
+def test_preset_ui_in_sync():
+    # Dropdown options and slash choices are generated from config; verify they
+    # cover exactly the presets so the UI can't drift out of sync.
+    from inmermusic import ui
+    from inmermusic.cog import _PRESET_CHOICES
+    keys = set(config.EFFECT_PRESETS)
+    assert {o.value for o in ui._PRESET_OPTIONS} == keys
+    assert {c.value for c in _PRESET_CHOICES} == keys
 
 
 def test_cog_registration():
