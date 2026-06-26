@@ -82,6 +82,16 @@ EFFECT_FILTERS: Dict[str, List[str]] = {
     "tremolo": ["tremolo=f=6:d=0.7"],
     "karaoke": ["pan=stereo|c0=c0-c1|c1=c1-c0"],   # remove center-panned vocals
     "trebleboost": ["treble=g=10"],
+    "chipmunk": [],                        # pitch only (set via preset)
+    "deep": [],                            # pitch only (set via preset)
+    "chorus": ["chorus=0.7:0.9:55:0.4:0.25:2"],
+    "phaser": ["aphaser"],
+    "flanger": ["flanger"],
+    "vibrato": ["vibrato=f=6:d=0.5"],
+    "telephone": ["highpass=f=300", "lowpass=f=3400"],
+    "crystalizer": ["crystalizer=i=2.5"],
+    "wide": ["extrastereo=m=2.5"],
+    "underwater": ["lowpass=f=500"],
 }
 
 # Presets bundle a tempo/pitch pair with an effect filter set.
@@ -97,6 +107,16 @@ EFFECT_PRESETS: Dict[str, Dict[str, Any]] = {
     "tremolo":   {"speed": 1.0,  "pitch": 0,  "effect": "tremolo"},
     "karaoke":   {"speed": 1.0,  "pitch": 0,  "effect": "karaoke"},
     "trebleboost": {"speed": 1.0, "pitch": 0, "effect": "trebleboost"},
+    "chipmunk":  {"speed": 1.0,  "pitch": 7,  "effect": "chipmunk"},
+    "deep":      {"speed": 1.0,  "pitch": -7, "effect": "deep"},
+    "chorus":    {"speed": 1.0,  "pitch": 0,  "effect": "chorus"},
+    "phaser":    {"speed": 1.0,  "pitch": 0,  "effect": "phaser"},
+    "flanger":   {"speed": 1.0,  "pitch": 0,  "effect": "flanger"},
+    "vibrato":   {"speed": 1.0,  "pitch": 0,  "effect": "vibrato"},
+    "telephone": {"speed": 1.0,  "pitch": 0,  "effect": "telephone"},
+    "crystalizer": {"speed": 1.0, "pitch": 0, "effect": "crystalizer"},
+    "wide":      {"speed": 1.0,  "pitch": 0,  "effect": "wide"},
+    "underwater": {"speed": 1.0, "pitch": 0,  "effect": "underwater"},
 }
 
 EFFECT_LABELS: Dict[str, str] = {
@@ -111,6 +131,27 @@ EFFECT_LABELS: Dict[str, str] = {
     "tremolo": "トレモロ",
     "karaoke": "ボーカルカット",
     "trebleboost": "高音ブースト",
+    "chipmunk": "チップマンク",
+    "deep": "重低音ボイス",
+    "chorus": "コーラス",
+    "phaser": "フェイザー",
+    "flanger": "フランジャー",
+    "vibrato": "ビブラート",
+    "telephone": "電話越し",
+    "crystalizer": "クリスタル",
+    "wide": "ワイドステレオ",
+    "underwater": "水中",
+}
+
+# Emoji per preset, used by the now-playing dropdown. Kept here so the UI and
+# slash choices can be generated from config (one source of truth). Must cover
+# every EFFECT_PRESETS key (enforced by tests).
+EFFECT_EMOJI: Dict[str, str] = {
+    "off": "🎚️", "nightcore": "⚡", "vaporwave": "🌊", "bassboost": "🔊",
+    "8d": "🎧", "lofi": "📼", "echo": "📢", "reverb": "🏛️", "tremolo": "📳",
+    "karaoke": "🎤", "trebleboost": "🔔", "chipmunk": "🐿️", "deep": "😈",
+    "chorus": "👥", "phaser": "🌀", "flanger": "✈️", "vibrato": "〰️",
+    "telephone": "☎️", "crystalizer": "💎", "wide": "↔️", "underwater": "🫧",
 }
 
 
