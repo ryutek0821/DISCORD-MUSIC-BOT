@@ -190,6 +190,45 @@ def test_soundboard_helpers():
         os.rmdir(d)
 
 
+def test_is_playlist_url():
+    playlists = [
+        "https://www.youtube.com/playlist?list=PLabc",
+        "https://music.youtube.com/playlist?list=OLAK5",
+        "https://www.nicovideo.jp/user/123/mylist/456",
+        "https://www.nicovideo.jp/series/789",
+    ]
+    singles = [
+        "https://www.youtube.com/watch?v=abc",
+        "https://youtu.be/abc",
+        "https://www.youtube.com/watch?v=abc&list=RDxyz",  # single video inside a mix
+        "https://www.nicovideo.jp/watch/sm123",
+        "never gonna give you up",
+        "best playlist 2020",
+    ]
+    for u in playlists:
+        assert audio.is_playlist_url(u) is True, u
+    for u in singles:
+        assert audio.is_playlist_url(u) is False, u
+
+
+def test_playlist_entry_to_song():
+    from inmermusic.audio import _playlist_entry_to_song
+    # Entry carrying a URL.
+    s = _playlist_entry_to_song(
+        {"url": "https://youtu.be/x", "title": "T", "duration": 100, "thumbnail": "th"}, False)
+    assert s["url"] == "https://youtu.be/x"
+    assert (s["title"], s["duration"], s["thumbnail"]) == ("T", 100, "th")
+    assert s["needs_local"] is True and s["audio_url"] is None and s["local_file"] is None
+    # Bare id -> constructed watch URL.
+    assert _playlist_entry_to_song({"id": "abc123"}, False)["url"] == \
+        "https://www.youtube.com/watch?v=abc123"
+    # niconico flag preserved; missing title defaults.
+    s3 = _playlist_entry_to_song({"url": "https://nicovideo.jp/watch/sm1"}, True)
+    assert s3["is_niconico"] is True and s3["title"] == "Unknown"
+    # No url and no id -> skipped.
+    assert _playlist_entry_to_song({"title": "no url"}, False) is None
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

@@ -3,7 +3,7 @@ import asyncio
 import os
 import tempfile
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import discord
 import yt_dlp
@@ -124,6 +124,58 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Failed to extract audio URL: {e}")
         raise
+
+
+def is_playlist_url(query: str) -> bool:
+    """True if the query should be treated as a playlist (enqueue all entries).
+
+    Conservative: a ``watch?v=...&list=...`` link still plays the single video,
+    so sharing a video that happens to sit in a playlist/mix won't dump 50 songs.
+    """
+    q = query.lower()
+    if "youtube.com/playlist" in q or "/playlist?" in q:
+        return True
+    if "list=" in q and "watch?" not in q and "v=" not in q and "youtu.be/" not in q:
+        return True
+    if "nicovideo.jp" in q and ("/mylist/" in q or "/series/" in q):
+        return True
+    return False
+
+
+def _playlist_entry_to_song(entry: Dict[str, Any], is_niconico: bool) -> Optional[Dict[str, Any]]:
+    """Map a flat-extracted playlist entry to a lazy song dict (fetched at play time)."""
+    vid_url = entry.get("url") or entry.get("webpage_url")
+    if not vid_url:
+        vid = entry.get("id")
+        if not vid:
+            return None
+        vid_url = vid if "://" in str(vid) else f"https://www.youtube.com/watch?v={vid}"
+    return {
+        "url": vid_url,
+        "audio_url": None,
+        "title": entry.get("title") or "Unknown",
+        "duration": entry.get("duration") or 0,
+        "thumbnail": entry.get("thumbnail") or "",
+        "is_niconico": is_niconico,
+        "needs_local": True,   # re-extracted + downloaded lazily in play_next
+        "local_file": None,
+    }
+
+
+def extract_playlist(url: str) -> Tuple[List[Dict[str, Any]], str]:
+    """Flat-extract a playlist URL into lazy song dicts + the playlist title.
+
+    extract_flat avoids resolving every video up front (fast); each entry is
+    downloaded on demand in play_next, routing YouTube through the proxy.
+    """
+    opts = build_ydl_opts(url, noplaylist=False, extract_flat="in_playlist", socket_timeout=15)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    is_niconico = "nicovideo.jp" in url
+    entries = info.get("entries") or []
+    songs = [_playlist_entry_to_song(e, is_niconico) for e in entries if e]
+    songs = [s for s in songs if s]
+    return songs, info.get("title") or "プレイリスト"
 
 
 def download_audio(url: str) -> Optional[str]:

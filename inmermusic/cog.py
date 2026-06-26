@@ -7,7 +7,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from . import cookies
-from .audio import current_elapsed, extract_audio_url, swap_source_at
+from .audio import (current_elapsed, extract_audio_url, extract_playlist,
+                    is_playlist_url, swap_source_at)
 from .config import EFFECT_PRESETS, list_sound_names, logger, resolve_sound
 from .playback import (cancel_idle_task, cancel_np_updater, cancel_reapply,
                        play_next, play_sound_effect, refresh_now_playing,
@@ -23,19 +24,44 @@ class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="play", description="Play a song from NicoNico or YouTube")
-    @app_commands.describe(query="NicoNico URL, YouTube URL, or search keyword")
+    async def _connect_for_play(self, interaction: discord.Interaction):
+        """Connect to / move into the user's VC. Returns the voice client, or
+        None after replying with an error."""
+        if not interaction.user.voice:
+            await interaction.followup.send("VCに参加してください。")
+            return None
+        channel = interaction.user.voice.channel
+        vc = interaction.guild.voice_client
+        state = get_state(interaction.guild.id)
+        if not vc:
+            try:
+                vc = await channel.connect(timeout=15)
+                state.voice_client = vc
+            except Exception as e:
+                await interaction.followup.send(f"VC接続失敗: {str(e)}")
+                return None
+        elif vc.channel != channel:
+            try:
+                await vc.move_to(channel)
+            except Exception as e:
+                await interaction.followup.send(f"チャンネル移動失敗: {str(e)}")
+                return None
+        return vc
+
+    @app_commands.command(name="play", description="Play from NicoNico/YouTube (URL, playlist, or search)")
+    @app_commands.describe(query="NicoNico/YouTube URL, playlist URL, or search keyword")
     async def play(self, interaction: discord.Interaction, query: str):
         if not interaction.user.voice:
             await interaction.response.send_message("VCに参加してください。")
             return
 
         await interaction.response.defer()
-
-        channel = interaction.user.voice.channel
-        vc = interaction.guild.voice_client
-
         loop = asyncio.get_running_loop()
+
+        if is_playlist_url(query):
+            await self._play_playlist(interaction, query, loop)
+            return
+
         try:
             song = await asyncio.wait_for(
                 loop.run_in_executor(None, extract_audio_url, query),
@@ -51,20 +77,9 @@ class MusicCog(commands.Cog):
         song["text_channel_id"] = interaction.channel.id
         song["requester"] = interaction.user.display_name
 
+        vc = await self._connect_for_play(interaction)
         if not vc:
-            try:
-                vc = await channel.connect(timeout=15)
-                state = get_state(interaction.guild.id)
-                state.voice_client = vc
-            except Exception as e:
-                await interaction.followup.send(f"VC接続失敗: {str(e)}")
-                return
-        elif vc.channel != channel:
-            try:
-                await vc.move_to(channel)
-            except Exception as e:
-                await interaction.followup.send(f"チャンネル移動失敗: {str(e)}")
-                return
+            return
 
         cancel_idle_task(interaction.guild.id)
 
@@ -83,6 +98,38 @@ class MusicCog(commands.Cog):
             start_np_updater(interaction.guild.id)
             # /play already announced this song, so don't re-announce in play_next.
             await play_next(interaction.guild.id, announce=False)
+
+    async def _play_playlist(self, interaction: discord.Interaction, query: str, loop):
+        try:
+            songs, pl_title = await asyncio.wait_for(
+                loop.run_in_executor(None, extract_playlist, query),
+                timeout=90
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send("プレイリストの取得がタイムアウトしました。")
+            return
+        except Exception as e:
+            await interaction.followup.send(f"プレイリストの取得に失敗しました: {str(e)}")
+            return
+        if not songs:
+            await interaction.followup.send("プレイリストから曲を取得できませんでした。")
+            return
+
+        vc = await self._connect_for_play(interaction)
+        if not vc:
+            return
+
+        cancel_idle_task(interaction.guild.id)
+        state = get_state(interaction.guild.id)
+        for s in songs:
+            s["text_channel_id"] = interaction.channel.id
+            s["requester"] = interaction.user.display_name
+        was_playing = vc.is_playing() or vc.is_paused()
+        state.queue.extend(songs)
+        await interaction.followup.send(f"🎶 **{pl_title}** から {len(songs)}曲を追加しました。")
+        if not was_playing:
+            # Nothing playing yet — start the first track (announces to the channel).
+            await play_next(interaction.guild.id)
 
     @app_commands.command(name="skip", description="Skip the current song")
     async def skip(self, interaction: discord.Interaction):
@@ -305,7 +352,7 @@ class MusicCog(commands.Cog):
     @app_commands.command(name="help", description="Show available commands")
     async def help_cmd(self, interaction: discord.Interaction):
         embed = discord.Embed(title="INMERMUSIC BOT コマンド一覧", color=0x00ff00)
-        embed.add_field(name="/play <URL/キーワード>", value="ニコニコ/YouTube/検索キーワードで再生", inline=False)
+        embed.add_field(name="/play <URL/キーワード>", value="ニコニコ/YouTube/プレイリスト/検索で再生", inline=False)
         embed.add_field(name="/skip", value="現在の曲をスキップ", inline=True)
         embed.add_field(name="/pause・/resume", value="一時停止・再開", inline=True)
         embed.add_field(name="/stop", value="停止してキュー削除・退出", inline=True)
