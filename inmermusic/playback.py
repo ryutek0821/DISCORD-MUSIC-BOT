@@ -62,7 +62,7 @@ def start_np_updater(guild_id: int, interval: float = NP_UPDATE_INTERVAL) -> Non
                 elapsed = current_elapsed(vc, state)
                 try:
                     embed = create_now_playing_embed(song, elapsed=elapsed, state=state)
-                    await msg.edit(embed=embed)
+                    await msg.edit(embed=embed, view=MusicControls())
                 except Exception as e:
                     logger.warning(f"Failed to update now playing message: {e}")
                     break
@@ -84,7 +84,7 @@ async def refresh_now_playing(guild_id: int) -> None:
     elapsed = current_elapsed(vc, state) if playing else None
     try:
         embed = create_now_playing_embed(song, elapsed=elapsed, state=state)
-        await msg.edit(embed=embed)
+        await msg.edit(embed=embed, view=MusicControls())
     except Exception as e:
         logger.warning(f"Failed to refresh now playing message: {e}")
 
