@@ -8,13 +8,21 @@ from discord.ext import commands
 
 from . import cookies
 from .audio import current_elapsed, extract_audio_url, swap_source_at
-from .config import EFFECT_PRESETS, list_sound_names, logger, resolve_sound
+from .config import (EFFECT_LABELS, EFFECT_PRESETS, list_sound_names, logger,
+                     resolve_sound)
 from .playback import (cancel_idle_task, cancel_np_updater, cancel_reapply,
                        play_next, play_sound_effect, refresh_now_playing,
                        schedule_reapply, start_np_updater)
 from .state import get_state, guild_states, move_queue_item
 from .ui import MusicControls, create_now_playing_embed, create_queued_embed
 from .util import fmt_duration, parse_time
+
+
+# /preset choices generated from config so adding an effect there is the only
+# edit needed (Discord allows at most 25 choices).
+_PRESET_CHOICES = [
+    app_commands.Choice(name=EFFECT_LABELS[k], value=k) for k in EFFECT_PRESETS
+]
 
 
 class MusicCog(commands.Cog):
@@ -198,19 +206,7 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="preset", description="Apply an audio effect preset")
     @app_commands.describe(name="エフェクトプリセット")
-    @app_commands.choices(name=[
-        app_commands.Choice(name="オフ（通常）", value="off"),
-        app_commands.Choice(name="ナイトコア", value="nightcore"),
-        app_commands.Choice(name="ベイパーウェイブ", value="vaporwave"),
-        app_commands.Choice(name="低音ブースト", value="bassboost"),
-        app_commands.Choice(name="8Dオーディオ", value="8d"),
-        app_commands.Choice(name="Lo-Fi", value="lofi"),
-        app_commands.Choice(name="エコー", value="echo"),
-        app_commands.Choice(name="リバーブ", value="reverb"),
-        app_commands.Choice(name="トレモロ", value="tremolo"),
-        app_commands.Choice(name="ボーカルカット", value="karaoke"),
-        app_commands.Choice(name="高音ブースト", value="trebleboost"),
-    ])
+    @app_commands.choices(name=_PRESET_CHOICES)
     async def preset_cmd(self, interaction: discord.Interaction, name: app_commands.Choice[str]):
         state = get_state(interaction.guild.id)
         vc = interaction.guild.voice_client

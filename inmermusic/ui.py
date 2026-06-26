@@ -9,8 +9,8 @@ from typing import Any, Dict, Optional
 
 import discord
 
-from .config import (EFFECT_LABELS, EFFECT_PRESETS, PITCH_MAX, PITCH_MIN,
-                     SPEED_MAX, SPEED_MIN, SPEED_STEP)
+from .config import (EFFECT_EMOJI, EFFECT_LABELS, EFFECT_PRESETS, PITCH_MAX,
+                     PITCH_MIN, SPEED_MAX, SPEED_MIN, SPEED_STEP)
 from .state import GuildState, get_state, guild_states
 from .util import fmt_duration
 
@@ -76,6 +76,29 @@ def create_queued_embed(song: Dict[str, Any], position: int) -> discord.Embed:
     if song.get("thumbnail"):
         embed.set_thumbnail(url=song["thumbnail"])
     return embed
+
+
+def _preset_description(preset: Dict[str, Any]) -> Optional[str]:
+    """Short '1.25x / +3半音' hint from a preset's speed/pitch, or None."""
+    parts = []
+    if abs(preset["speed"] - 1.0) > 1e-6:
+        parts.append(f"{preset['speed']:.2f}x")
+    if preset["pitch"]:
+        parts.append(f"{preset['pitch']:+d}半音")
+    return " / ".join(parts) or None
+
+
+# Built once from config so adding an effect in config.py also updates the
+# dropdown (Discord allows at most 25 options).
+_PRESET_OPTIONS = [
+    discord.SelectOption(
+        label=EFFECT_LABELS[key],
+        value=key,
+        emoji=EFFECT_EMOJI.get(key),
+        description=_preset_description(preset),
+    )
+    for key, preset in EFFECT_PRESETS.items()
+]
 
 
 class MusicControls(discord.ui.View):
@@ -208,19 +231,7 @@ class MusicControls(discord.ui.View):
         min_values=1,
         max_values=1,
         custom_id="music:preset_select",
-        options=[
-            discord.SelectOption(label="オフ（通常）", value="off", emoji="🎚️"),
-            discord.SelectOption(label="ナイトコア", value="nightcore", emoji="⚡", description="1.25x / +3半音"),
-            discord.SelectOption(label="ベイパーウェイブ", value="vaporwave", emoji="🌊", description="0.85x / -3半音"),
-            discord.SelectOption(label="低音ブースト", value="bassboost", emoji="🔊"),
-            discord.SelectOption(label="8Dオーディオ", value="8d", emoji="🎧"),
-            discord.SelectOption(label="Lo-Fi", value="lofi", emoji="📼", description="0.9x"),
-            discord.SelectOption(label="エコー", value="echo", emoji="📢"),
-            discord.SelectOption(label="リバーブ", value="reverb", emoji="🏛️"),
-            discord.SelectOption(label="トレモロ", value="tremolo", emoji="📳"),
-            discord.SelectOption(label="ボーカルカット", value="karaoke", emoji="🎤"),
-            discord.SelectOption(label="高音ブースト", value="trebleboost", emoji="🔔"),
-        ],
+        options=_PRESET_OPTIONS,
     )
     async def preset_select(self, interaction: discord.Interaction, select: discord.ui.Select):
         await self._apply_preset(interaction, select.values[0])
