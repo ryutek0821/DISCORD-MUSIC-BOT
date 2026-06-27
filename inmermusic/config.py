@@ -87,7 +87,7 @@ EFFECT_FILTERS: Dict[str, List[str]] = {
     "chorus": ["chorus=0.7:0.9:55:0.4:0.25:2"],
     "phaser": ["aphaser"],
     "flanger": ["flanger"],
-    "vibrato": ["vibrato=f=6:d=0.5"],
+    "vibrato": ["vibrato=f=7:d=0.9"],
     "telephone": ["highpass=f=300", "lowpass=f=3400"],
     "crystalizer": ["crystalizer=i=2.5"],
     "wide": ["extrastereo=m=2.5"],
