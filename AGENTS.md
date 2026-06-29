@@ -1,7 +1,7 @@
 # AGENTS.md for INMERMUSIC_BOT
 
 ## Project Overview
-Discord Music Bot for NicoNico/YouTube playback. Single-file Python app (`main.py`).
+Discord Music Bot for NicoNico/YouTube playback, written in Python with discord.py.
 
 ## Dev Commands
 ```bash
@@ -9,31 +9,47 @@ Discord Music Bot for NicoNico/YouTube playback. Single-file Python app (`main.p
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
+# Lint
+ruff check .
+
+# Test
+python tests/test_features.py
+
 # Run
 python main.py
 ```
 
 ## Environment Variables (.env)
 ```
-DISCORD_TOKEN=your_discord_bot_token_here
-COOKIE_FILE=cookies.txt   # Netscape format cookie file
-NICO_EMAIL=...
-NICO_PASSWORD=...
+DISCORD_TOKEN=your_discord_bot_token
+COOKIE_FILE=cookies.txt
+NICO_EMAIL=your_niconico_email
+NICO_PASSWORD=your_niconico_password
 ```
 
 ## Architecture
-- Single `main.py` with no test files, no type hints, no linter config
-- discord.py 2.x with slash commands (`@bot.tree.command`)
-- yt-dlp for media download
-- Optional: Selenium + Chromium for cookie fallback
+Package `inmermusic/` with the following modules:
+- `bot.py` — Bot startup (loads Cog, connects to Discord)
+- `cog.py` — All slash command definitions (`discord.ext.commands.Cog`)
+- `state.py` — `GuildState` dataclass (per-guild queue, VC, current track, idle task)
+- `playback.py` — Queue progression, loop modes, skip logic
+- `audio.py` — FFmpeg option builder, effect parameters, preset definitions
+- `ui.py` — Now-playing Embed and control button View
+- `cookies.py` — NicoNico cookie acquisition (API login + Selenium fallback)
+- `config.py` — `Settings` dataclass loaded from env vars
+- `util.py` — Shared helpers
 
-## Known Bugs (DO NOT IGNORE)
-All previously listed bugs have been fixed. Current known issues:
-- None at this time.
+`main.py` is a thin entry point that calls `inmermusic.bot.run()`.
 
-## Critical Constraints
-- No tests, no CI, no type checking
-- Selenium fallback hardcoded path: `/usr/bin/chromedriver`
-- Cookie TTL: 3600s hardcoded
-- IDLE_TIMEOUT: 180s hardcoded
-- Target: Raspberry Pi 4 (aarch64), Python 3.11+
+## Key Implementation Details
+- NicoNico audio is downloaded locally via yt-dlp before playback (avoids 403 errors)
+- YouTube uses streaming playback
+- Temp files are deleted after each track ends
+- Cookies are refreshed via NicoNico API; Selenium (Chromium) is the fallback
+- All per-guild state lives in `GuildState`; concurrent guilds are fully isolated
+
+## CI/CD
+- `ci.yml`: ruff lint + test_features.py on every PR and push to master
+- `auto-merge.yml`: squash-merges PRs when CI passes
+- `deploy-on-push.yml`: rsync + systemctl restart to RYU-RASPBERRYPI via Tailscale SSH
+- `version-tag.yml`: tags master commits with a version number
