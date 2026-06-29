@@ -4,3 +4,7 @@ __pycache__/
 .env
 cookies.txt
 *.log
+.git.broken.bak/
+.serena/
+.claude/
+.ruff_cache/
