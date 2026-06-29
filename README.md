@@ -1,6 +1,6 @@
 # INMERMUSIC BOT
 
-[![CI](https://github.com/ryutek0821/DISCORD-MUSIC-BOT/actions/workflows/ci.yml/badge.svg)](https://github.com/ryutek0821/DISCORD-MUSIC-BOT/actions/workflows/ci.yml)
+[![CI](https://github.com/ryutek0821/INMERMUSIC_BOT/actions/workflows/ci.yml/badge.svg)](https://github.com/ryutek0821/INMERMUSIC_BOT/actions/workflows/ci.yml)
 
 Discord でニコニコ動画・YouTube を再生できる Music Bot。
 
