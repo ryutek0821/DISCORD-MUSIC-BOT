@@ -10,12 +10,13 @@ from . import cookies
 from .audio import current_elapsed, extract_audio_url, swap_source_at
 from .config import (EFFECT_LABELS, EFFECT_PRESETS, list_sound_names, logger,
                      resolve_sound)
-from .playback import (cancel_idle_task, cancel_np_updater, cancel_reapply,
+from .playback import (cancel_idle_task, cancel_reapply, cleanup_guild_state,
                        play_next, play_sound_effect, refresh_now_playing,
-                       schedule_reapply, start_np_updater)
+                       resolve_text_channel, schedule_reapply,
+                       start_np_updater)
 from .state import get_state, guild_states, move_queue_item
 from .ui import MusicControls, create_now_playing_embed, create_queued_embed
-from .util import fmt_duration, parse_time
+from .util import fmt_duration, friendly_extract_error, parse_time
 
 
 # /preset choices generated from config so adding an effect there is the only
@@ -53,7 +54,7 @@ class MusicCog(commands.Cog):
             await interaction.followup.send("曲の取得がタイムアウトしました。")
             return
         except Exception as e:
-            await interaction.followup.send(f"曲が見つかりません: {str(e)}")
+            await interaction.followup.send(friendly_extract_error(str(e)))
             return
 
         song["text_channel_id"] = interaction.channel.id
@@ -83,14 +84,18 @@ class MusicCog(commands.Cog):
             embed = create_queued_embed(song, len(state.queue))
             await interaction.followup.send(embed=embed)
         else:
-            state.current_song = song
-            embed = create_now_playing_embed(song, elapsed=0.0, state=state)
-            state.np_message = await interaction.followup.send(
-                embed=embed, view=MusicControls()
-            )
-            start_np_updater(interaction.guild.id)
-            # /play already announced this song, so don't re-announce in play_next.
+            # Let play_next actually start playback first, so a failed track
+            # (bad URL, dead link) never leaves a stale Now Playing behind.
             await play_next(interaction.guild.id, announce=False)
+            started = state.current_song
+            if started is not None:
+                embed = create_now_playing_embed(started, elapsed=0.0, state=state)
+                state.np_message = await interaction.followup.send(
+                    embed=embed, view=MusicControls()
+                )
+                start_np_updater(interaction.guild.id)
+            else:
+                await interaction.followup.send("⚠️ 再生できませんでした。")
 
     @app_commands.command(name="skip", description="Skip the current song")
     async def skip(self, interaction: discord.Interaction):
@@ -291,11 +296,7 @@ class MusicCog(commands.Cog):
             return
         vc.stop()
         await vc.disconnect()
-        state = guild_states.get(interaction.guild.id)
-        if state:
-            cancel_np_updater(state)
-        if interaction.guild.id in guild_states:
-            del guild_states[interaction.guild.id]
+        cleanup_guild_state(interaction.guild.id)
         await interaction.response.send_message("👋 退出しました。")
 
     @app_commands.command(name="help", description="Show available commands")
@@ -332,11 +333,7 @@ class MusicCog(commands.Cog):
         if vc:
             vc.stop()
             await vc.disconnect()
-        state = guild_states.get(interaction.guild.id)
-        if state:
-            cancel_np_updater(state)
-        if interaction.guild.id in guild_states:
-            del guild_states[interaction.guild.id]
+        cleanup_guild_state(interaction.guild.id)
         await interaction.response.send_message("停止してキューをクリアしました。")
 
     @app_commands.command(name="pause", description="Pause the current song")
@@ -447,14 +444,14 @@ class MusicCog(commands.Cog):
         if len(human_members) == 0:
             logger.info("All users left the voice channel, disconnecting bot")
             cancel_idle_task(guild.id)
-            text_channel = None
-            if state.current_song and state.current_song.get("text_channel_id"):
-                text_channel = guild.get_channel(state.current_song["text_channel_id"])
-            if not text_channel:
-                text_channel = next((ch for ch in guild.text_channels if ch.permissions_for(guild.me).send_messages), None)
-            cancel_np_updater(state)
+            text_channel = resolve_text_channel(guild, state.current_song or {})
             await state.voice_client.disconnect()
-            if guild.id in guild_states:
-                del guild_states[guild.id]
+            cleanup_guild_state(guild.id)
             if text_channel:
                 await text_channel.send("誰も居なくなったので退出しました。")
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild):
+        # Bot kicked/banned or the guild was deleted — drop any leftover state
+        # (queued tasks, now-playing message ref) so it doesn't linger forever.
+        cleanup_guild_state(guild.id)

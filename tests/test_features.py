@@ -7,12 +7,13 @@ Run either way:
 Importing the package is safe: bot.run() is only called from main.py under
 __name__ == "__main__", so importing here never starts the bot.
 """
+import asyncio
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from inmermusic import audio, config, cookies, ui, util
+from inmermusic import audio, config, cookies, playback, ui, util
 
 
 def test_build_audio_filter_defaults():
@@ -209,6 +210,195 @@ def test_soundboard_helpers():
         for f in ("na-.mp3", "boo.mp3", "notes.txt"):
             os.remove(os.path.join(d, f))
         os.rmdir(d)
+
+
+class FakeVoiceClient:
+    """Minimal stand-in for discord.VoiceClient, just enough for play_next."""
+    def __init__(self):
+        self.played = []
+        self._playing = False
+
+    def is_connected(self):
+        return True
+
+    def is_playing(self):
+        return self._playing
+
+    def is_paused(self):
+        return False
+
+    def play(self, source, after=None):
+        self._playing = True
+        self.played.append(source)
+
+    def stop(self):
+        self._playing = False
+
+
+def test_advance_queue_decision_tree():
+    # play_next itself is irrelevant here; only the queue mutation matters.
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900101
+    calls = []
+
+    async def fake_play_next(gid, announce=True):
+        calls.append(gid)
+
+    original = playback.play_next
+    playback.play_next = fake_play_next
+    try:
+        state = get_state(guild_id)
+
+        # skip_flag overrides loop_mode: the finished song is dropped either way.
+        state.skip_flag = True
+        state.loop_mode = "song"
+        state.queue = []
+        finished = {"title": "a", "local_file": "/tmp/a"}
+        asyncio.run(playback.advance_queue(guild_id, finished))
+        assert state.skip_flag is False
+        assert state.queue == []
+
+        # loop_mode == "song": finished song is reinserted at the front.
+        state.loop_mode = "song"
+        state.queue = [{"title": "next"}]
+        finished = {"title": "b", "local_file": "/tmp/b"}
+        asyncio.run(playback.advance_queue(guild_id, finished))
+        assert state.queue[0] is finished
+        assert finished["local_file"] is None  # temp file already cleaned up
+        assert state.queue[1]["title"] == "next"
+
+        # loop_mode == "queue": finished song is appended at the tail.
+        state.loop_mode = "queue"
+        state.queue = [{"title": "next"}]
+        finished = {"title": "c", "local_file": "/tmp/c"}
+        asyncio.run(playback.advance_queue(guild_id, finished))
+        assert state.queue[-1] is finished
+        assert finished["local_file"] is None
+
+        # loop_mode == "off": the finished song is simply dropped.
+        state.loop_mode = "off"
+        state.queue = [{"title": "next"}]
+        finished = {"title": "d"}
+        asyncio.run(playback.advance_queue(guild_id, finished))
+        assert state.queue == [{"title": "next"}]
+
+        assert calls == [guild_id] * 4
+    finally:
+        playback.play_next = original
+        guild_states.pop(guild_id, None)
+
+
+def test_play_next_skip_and_drain():
+    from inmermusic.state import get_state, guild_states
+
+    def fake_make_audio_source(song, state, seek=0.0):
+        if song["title"] == "bad":
+            raise RuntimeError("boom")
+        return "SENTINEL_SOURCE"
+
+    skip_calls = []
+
+    async def fake_notify_skip(gid, song, reason):
+        skip_calls.append((song["title"], reason))
+
+    async def fake_announce_now_playing(gid):
+        pass
+
+    def fake_start_np_updater(gid, interval=None):
+        pass
+
+    async def fake_schedule_disconnect(gid):
+        pass
+
+    orig_make_audio_source = playback.make_audio_source
+    orig_notify_skip = playback.notify_skip
+    orig_announce_now_playing = playback.announce_now_playing
+    orig_start_np_updater = playback.start_np_updater
+    orig_schedule_disconnect = playback.schedule_disconnect
+    playback.make_audio_source = fake_make_audio_source
+    playback.notify_skip = fake_notify_skip
+    playback.announce_now_playing = fake_announce_now_playing
+    playback.start_np_updater = fake_start_np_updater
+    playback.schedule_disconnect = fake_schedule_disconnect
+
+    guild_a, guild_b = 900102, 900103
+    try:
+        # [bad] -> every song fails, queue drains, current_song stays None.
+        state = get_state(guild_a)
+        state.voice_client = FakeVoiceClient()
+        state.queue = [{"title": "bad", "needs_local": False}]
+        asyncio.run(playback.play_next(guild_a))
+        assert state.current_song is None
+        assert skip_calls == [("bad", "再生エラー")]
+
+        # [bad, good] -> the bad song is skipped, the good one plays.
+        skip_calls.clear()
+        state = get_state(guild_b)
+        state.voice_client = FakeVoiceClient()
+        good_song = {"title": "good", "needs_local": False}
+        state.queue = [{"title": "bad", "needs_local": False}, good_song]
+        asyncio.run(playback.play_next(guild_b))
+        assert state.current_song == good_song
+        assert skip_calls == [("bad", "再生エラー")]
+    finally:
+        playback.make_audio_source = orig_make_audio_source
+        playback.notify_skip = orig_notify_skip
+        playback.announce_now_playing = orig_announce_now_playing
+        playback.start_np_updater = orig_start_np_updater
+        playback.schedule_disconnect = orig_schedule_disconnect
+        guild_states.pop(guild_a, None)
+        guild_states.pop(guild_b, None)
+
+
+def test_cleanup_guild_state():
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900104
+
+    async def _sleep_forever():
+        await asyncio.sleep(100)
+
+    async def _run():
+        state = get_state(guild_id)
+        state.idle_task = asyncio.create_task(_sleep_forever())
+        state.np_updater = asyncio.create_task(_sleep_forever())
+        state.reapply_task = asyncio.create_task(_sleep_forever())
+        state.np_message = object()
+        await asyncio.sleep(0)  # let the tasks actually start running
+
+        tasks = (state.idle_task, state.np_updater, state.reapply_task)
+        playback.cleanup_guild_state(guild_id)
+        assert guild_id not in guild_states
+        assert state.np_message is None
+
+        for t in tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        assert all(t.cancelled() for t in tasks)
+
+    try:
+        asyncio.run(_run())
+    finally:
+        guild_states.pop(guild_id, None)
+
+
+def test_friendly_extract_error():
+    f = util.friendly_extract_error
+    assert f("ERROR: Private video. Sign in if you've been granted access") == \
+        "ログインが必要な動画のため再生できません。"
+    assert f("This video requires age verification") == \
+        "年齢制限付きの動画のため再生できません。"
+    assert f("This video is not available in your country due to copyright") == \
+        "地域制限により再生できません。"
+    assert f("Video unavailable. This video has been removed") == \
+        "動画が削除・非公開のため見つかりません。"
+    assert f("HTTP Error 504: Connection timed out") == \
+        "ネットワークエラーです。時間をおいて再試行してください。"
+    assert f("some completely different failure") == \
+        "取得に失敗しました。URLやキーワードを確認してください。"
 
 
 if __name__ == "__main__":
