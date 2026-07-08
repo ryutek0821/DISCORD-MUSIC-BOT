@@ -26,3 +26,19 @@ def parse_time(value: str) -> Optional[float]:
         return float(value)
     except ValueError:
         return None
+
+
+def friendly_extract_error(message: str) -> str:
+    """Map a yt-dlp/extraction error string to a short Japanese explanation."""
+    m = message.lower()
+    if any(k in m for k in ("private", "login", "sign in", "members-only", "cookies")):
+        return "ログインが必要な動画のため再生できません。"
+    if "age" in m or "confirm your age" in m:
+        return "年齢制限付きの動画のため再生できません。"
+    if any(k in m for k in ("geo", "not available in your country", "region")):
+        return "地域制限により再生できません。"
+    if any(k in m for k in ("unavailable", "removed", "deleted", "does not exist", "not found")):
+        return "動画が削除・非公開のため見つかりません。"
+    if any(k in m for k in ("timed out", "timeout", "connection", "unable to download", "network")):
+        return "ネットワークエラーです。時間をおいて再試行してください。"
+    return "取得に失敗しました。URLやキーワードを確認してください。"
