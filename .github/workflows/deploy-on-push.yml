@@ -1,9 +1,14 @@
 name: Auto Deploy on Push to Master
 
+concurrency:
+  group: deploy-master
+  cancel-in-progress: false
+
 on:
-  push:
-    branches:
-      - master
+  # Deploy only after the CI workflow for the master push has passed.
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       reason:
@@ -13,10 +18,20 @@ on:
 
 jobs:
   deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'master')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # workflow_run must deploy exactly the commit CI validated.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Connect to Tailscale
         env:
@@ -30,14 +45,15 @@ jobs:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ryu
           SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
         run: |
-          # Install SSH key (runner -> RYU-SERVER)
-          mkdir -p ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
+          test -n "$SSH_HOST" -a -n "$SSH_KEY" -a -n "$SSH_KNOWN_HOSTS"
 
-          # Disable host key checking
-          printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n' >> ~/.ssh/config
+          # Install SSH key and a pinned host key (never disable verification).
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
 
           # Sync the checked-out repo to the server. The server does not need
           # GitHub access; files are pushed directly over SSH (Tailscale IP).
@@ -56,7 +72,7 @@ jobs:
           ssh "$SSH_USER@$SSH_HOST" << 'EOF'
             set -e
             cd ~/niconico-discord-bot
-            ./venv/bin/pip install -q -r requirements.txt
+            ./venv/bin/pip install --disable-pip-version-check -q -r requirements.txt
             sudo systemctl restart niconico-bot
             sleep 5
             systemctl is-active niconico-bot

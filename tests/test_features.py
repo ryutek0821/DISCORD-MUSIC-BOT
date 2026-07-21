@@ -55,6 +55,27 @@ def test_parse_time():
     assert util.parse_time("1:2:3:4") is None
 
 
+def test_parse_time_rejects_non_finite_values():
+    """NaN/Infinity must not become seek positions."""
+    assert util.parse_time("nan") is None
+    assert util.parse_time("inf") is None
+    assert util.parse_time("-inf") is None
+    assert util.parse_time("1:nan") is None
+
+
+def test_validate_media_query_allowlist():
+    audio.validate_query("夜に駆ける")
+    audio.validate_query("https://www.youtube.com/watch?v=abc")
+    audio.validate_query("https://www.nicovideo.jp/watch/sm9")
+    for query in ("http://127.0.0.1:8080/", "https://example.com/a", "file:///tmp/a"):
+        try:
+            audio.validate_query(query)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"query unexpectedly accepted: {query}")
+
+
 def test_fmt_duration():
     assert util.fmt_duration(90) == "1:30"
     assert util.fmt_duration(3723) == "1:02:03"
@@ -382,6 +403,47 @@ def test_cleanup_guild_state():
     try:
         asyncio.run(_run())
     finally:
+        guild_states.pop(guild_id, None)
+
+
+def test_stale_after_callback_does_not_recreate_state():
+    """A callback from a stopped track must not resurrect GuildState."""
+    from inmermusic.state import get_state, guild_states
+
+    class CapturingVoiceClient(FakeVoiceClient):
+        def play(self, source, after=None):
+            super().play(source, after=after)
+            self.after = after
+
+    guild_id = 900105
+    original_make = playback.make_audio_source
+    original_announce = playback.announce_now_playing
+    original_updater = playback.start_np_updater
+
+    async def fake_announce(_guild_id):
+        return None
+
+    playback.make_audio_source = lambda song, state, seek=0.0: "SOURCE"
+    playback.announce_now_playing = fake_announce
+    playback.start_np_updater = lambda *args, **kwargs: None
+
+    async def scenario():
+        state = get_state(guild_id)
+        state.voice_client = CapturingVoiceClient()
+        state.queue = [{"title": "stale", "needs_local": False}]
+        await playback.play_next(guild_id)
+        callback = state.voice_client.after
+        playback.cleanup_guild_state(guild_id)
+        callback(None)
+        await asyncio.sleep(0.05)
+        assert guild_id not in guild_states
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        playback.make_audio_source = original_make
+        playback.announce_now_playing = original_announce
+        playback.start_np_updater = original_updater
         guild_states.pop(guild_id, None)
 
 

@@ -2,6 +2,7 @@
 progress-bar updater. Sits above audio + ui; imported by cog and bot."""
 import asyncio
 import os
+import time
 from typing import Any, Dict, Optional
 
 import discord
@@ -16,7 +17,9 @@ from .util import fmt_duration
 
 
 def cancel_idle_task(guild_id: int) -> None:
-    state = get_state(guild_id)
+    state = guild_states.get(guild_id)
+    if state is None:
+        return
     if state.idle_task:
         state.idle_task.cancel()
         state.idle_task = None
@@ -183,26 +186,54 @@ def cleanup_guild_state(guild_id: int) -> None:
     guild_states.pop(guild_id, None)
 
 
-async def advance_queue(guild_id: int, finished_song: Dict[str, Any]) -> None:
+def mark_paused(state: GuildState, vc: discord.VoiceClient) -> None:
+    if not state.clock_paused:
+        state.paused_position = current_elapsed(vc, state)
+        state.clock_paused = True
+
+
+def mark_resumed(state: GuildState) -> None:
+    state.clock_base = state.paused_position
+    state.clock_speed = state.speed
+    state.clock_started_at = time.monotonic()
+    state.clock_paused = False
+
+
+async def advance_queue(guild_id: int, finished_song: Dict[str, Any],
+                        expected_state: Optional[GuildState] = None) -> None:
     """Decide what to enqueue next based on loop/skip state, then play."""
+    if expected_state is not None and guild_states.get(guild_id) is not expected_state:
+        return
     state = get_state(guild_id)
-    if state.skip_flag:
-        # Manual skip overrides loop: drop the finished song and move on.
-        state.skip_flag = False
-    elif state.loop_mode == "song":
-        finished_song["local_file"] = None  # temp file already cleaned up
-        state.queue.insert(0, finished_song)
-    elif state.loop_mode == "queue":
-        finished_song["local_file"] = None
-        state.queue.append(finished_song)
+    async with state.lock:
+        if expected_state is not None and guild_states.get(guild_id) is not state:
+            return
+        if state.skip_flag:
+            # Manual skip overrides loop: drop the finished song and move on.
+            state.skip_flag = False
+        elif state.loop_mode == "song":
+            finished_song["local_file"] = None  # temp file already cleaned up
+            state.queue.insert(0, finished_song)
+        elif state.loop_mode == "queue":
+            finished_song["local_file"] = None
+            state.queue.append(finished_song)
     await play_next(guild_id)
 
 
 async def play_next(guild_id: int, announce: bool = True) -> None:
     state = get_state(guild_id)
+    async with state.lock:
+        await _play_next(guild_id, state, announce)
+
+
+async def _play_next(guild_id: int, state: GuildState, announce: bool = True) -> None:
+    if guild_states.get(guild_id) is not state:
+        return
     vc = state.voice_client
 
     if not vc or not vc.is_connected():
+        return
+    if vc.is_playing() or vc.is_paused():
         return
 
     cancel_idle_task(guild_id)
@@ -210,6 +241,7 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
     while state.queue:
         song = state.queue.pop(0)
         state.current_song = song
+        state.sound_used = False
         logger.info(f"Playing: {song['title']}")
 
         # Capture the running loop so the threaded `after` callback can hop back.
@@ -226,8 +258,10 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                     logger.info(f"Cleaned up temp file: {local_file}")
                 except Exception as e:
                     logger.warning(f"Failed to remove temp file: {e}")
-            if not state.is_playing_sound:
-                asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), loop)
+            if not state.is_playing_sound and guild_states.get(guild_id) is state:
+                asyncio.run_coroutine_threadsafe(
+                    advance_queue(guild_id, song, expected_state=state), loop
+                )
 
         try:
             if song.get("needs_local") and not song.get("local_file"):
@@ -246,12 +280,31 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
                     continue
                 song["local_file"] = local_file
 
+            # /stop or an external VC disconnect may have removed this state
+            # while yt-dlp was running. Never attach the completed download to
+            # a dead voice client or a new playback session.
+            if (guild_states.get(guild_id) is not state
+                    or state.voice_client is not vc or not vc.is_connected()):
+                local_file = song.get("local_file")
+                if local_file and os.path.exists(local_file):
+                    try:
+                        os.remove(local_file)
+                    except OSError:
+                        pass
+                song["local_file"] = None
+                return
+
             # A fresh FFmpeg process starts at loops=0; reset the seek bookkeeping.
             state.seek_position = 0.0
             state.loops_at_swap = 0
             state.speed_at_swap = state.speed
             source = make_audio_source(song, state, seek=0.0)
             vc.play(source, after=after_play)
+            state.clock_base = 0.0
+            state.clock_speed = state.speed
+            state.clock_started_at = time.monotonic()
+            state.clock_paused = False
+            state.paused_position = 0.0
         except Exception as e:
             logger.error(f"Play failed: {e}")
             await notify_skip(guild_id, song, "再生エラー")
@@ -272,8 +325,10 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
     state.idle_task = asyncio.create_task(schedule_disconnect(guild_id))
 
 
-async def restart_song(guild_id: int) -> None:
+async def restart_song(guild_id: int, expected_state: Optional[GuildState] = None) -> None:
     await asyncio.sleep(0.3)
+    if expected_state is not None and guild_states.get(guild_id) is not expected_state:
+        return
     state = get_state(guild_id)
     vc = state.voice_client
 
@@ -305,7 +360,10 @@ async def restart_song(guild_id: int) -> None:
             except Exception as e:
                 logger.warning(f"Failed to remove temp file: {e}")
         # The song is done (finished or skipped) — advance the queue.
-        asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), loop)
+        if guild_states.get(guild_id) is state:
+            asyncio.run_coroutine_threadsafe(
+                advance_queue(guild_id, song, expected_state=state), loop
+            )
 
     # A skip requested during the sound effect should move on, not replay the song.
     if state.skip_flag:
@@ -327,13 +385,27 @@ async def restart_song(guild_id: int) -> None:
                 )
             except asyncio.TimeoutError:
                 logger.error(f"Download timed out after {DOWNLOAD_TIMEOUT}s during restart: {song['title']}")
-                state.is_playing_sound = False
+                await notify_skip(guild_id, song, "読み込みタイムアウト")
+                await advance_queue(guild_id, song, expected_state=state)
                 return
             if not local_file:
                 logger.error("Failed to download audio for restart")
-                state.is_playing_sound = False
+                await notify_skip(guild_id, song, "読み込み失敗")
+                await advance_queue(guild_id, song, expected_state=state)
                 return
             song["local_file"] = local_file
+
+        if (guild_states.get(guild_id) is not state
+                or state.voice_client is not vc or not vc.is_connected()):
+            local_file = song.get("local_file")
+            if local_file and os.path.exists(local_file):
+                try:
+                    os.remove(local_file)
+                except OSError:
+                    pass
+            song["local_file"] = None
+            state.is_playing_sound = False
+            return
 
         # Resume from where the sound effect interrupted, keeping speed/pitch.
         state.seek_position = seek
@@ -341,9 +413,17 @@ async def restart_song(guild_id: int) -> None:
         state.speed_at_swap = state.speed
         source = make_audio_source(song, state, seek=seek)
         vc.play(source, after=finish)
+        state.is_playing_sound = False
+        state.clock_base = seek
+        state.clock_speed = state.speed
+        state.clock_started_at = time.monotonic()
+        state.clock_paused = False
+        state.paused_position = seek
     except Exception as e:
         logger.error(f"Failed to restart song: {e}")
         state.is_playing_sound = False
+        await notify_skip(guild_id, song, "再開失敗")
+        await advance_queue(guild_id, song, expected_state=state)
 
 
 def play_sound_effect(guild_id: int, sound_path: str) -> bool:
@@ -359,17 +439,23 @@ def play_sound_effect(guild_id: int, sound_path: str) -> bool:
         return False
     if state.is_playing_sound:
         return False
+    if state.sound_used:
+        return False
 
     loop = asyncio.get_running_loop()
     state.resume_position = current_elapsed(vc, state)  # resume here after the effect
     state.is_playing_sound = True
+    state.sound_used = True
     vc.stop()
 
     def after_sound(error):
         if error:
             logger.error(f"Sound effect error: {error}")
         try:
-            asyncio.run_coroutine_threadsafe(restart_song(guild_id), loop)
+            if guild_states.get(guild_id) is state:
+                asyncio.run_coroutine_threadsafe(
+                    restart_song(guild_id, expected_state=state), loop
+                )
         except Exception as e:
             logger.error(f"Failed to schedule restart: {e}")
             state.is_playing_sound = False
@@ -383,5 +469,10 @@ def play_sound_effect(guild_id: int, sound_path: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"Failed to play sound: {e}")
-        state.is_playing_sound = False
+        # The original song has already been stopped; use the same recovery
+        # path as a normally finished sound effect.
+        if guild_states.get(guild_id) is state:
+            asyncio.run_coroutine_threadsafe(
+                restart_song(guild_id, expected_state=state), loop
+            )
         return False

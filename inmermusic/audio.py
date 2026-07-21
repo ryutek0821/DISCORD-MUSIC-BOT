@@ -3,13 +3,16 @@ import asyncio
 import os
 import tempfile
 import time
+import uuid
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 import discord
 import yt_dlp
 
 from . import config
-from .config import (DOWNLOAD_TIMEOUT, EFFECT_FILTERS, NICO_EMAIL, NICO_PASSWORD,
+from .config import (DOWNLOAD_TIMEOUT, EFFECT_FILTERS, MAX_TRACK_DURATION,
+                     NICO_EMAIL, NICO_PASSWORD,
                      SOURCE_CLEANUP_DELAY, YT_PROXY, logger)
 from .cookies import ensure_cookie_file, refresh_nico_cookies_sync
 from .state import GuildState
@@ -28,7 +31,7 @@ def build_ydl_opts(url: str, **overrides: Any) -> Dict[str, Any]:
     }
     ydl_opts.update(overrides)
 
-    is_niconico = "nicovideo.jp" in url
+    is_niconico = _is_niconico_url(url)
 
     if config.COOKIE_FILE:
         ensure_cookie_file()
@@ -50,9 +53,33 @@ def build_ydl_opts(url: str, **overrides: Any) -> Dict[str, Any]:
     return ydl_opts
 
 
+def _is_niconico_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    return host == "nicovideo.jp" or host.endswith(".nicovideo.jp") or host == "nico.ms"
+
+
+def validate_query(query: str) -> None:
+    """Allow only supported media hosts; bare text remains a YouTube search."""
+    if not query or len(query) > 200:
+        raise ValueError("検索語が長すぎます")
+    parsed = urlparse(query)
+    if not parsed.scheme or "://" not in query:
+        return
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("対応していないURL形式です")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    allowed = (
+        host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+        or host == "nicovideo.jp" or host.endswith(".nicovideo.jp") or host == "nico.ms"
+    )
+    if not allowed:
+        raise ValueError("YouTubeまたはニコニコ動画のURLのみ利用できます")
+
+
 def extract_audio_url(url: str) -> Dict[str, Any]:
     """Extract audio stream URL or download for niconico."""
-    if "nicovideo.jp" in url:
+    validate_query(url)
+    if _is_niconico_url(url):
         refresh_nico_cookies_sync()
 
     ydl_opts = build_ydl_opts(url, socket_timeout=10)
@@ -99,12 +126,16 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
                           f"({selected_format.get('abr', 'unknown')}kbps, "
                           f"{selected_format.get('asr', 'unknown')}Hz)")
 
-            is_niconico = "nicovideo.jp" in url
             # A bare keyword resolves to a YouTube video via default_search, so
             # detect YouTube from the resolved info rather than the input string.
             extractor = (info.get("extractor_key") or info.get("extractor") or "")
             webpage_url = info.get("webpage_url") or url
+            is_niconico = _is_niconico_url(webpage_url)
             is_youtube = "youtube" in extractor.lower() or "youtube.com" in webpage_url
+
+            duration = info.get("duration") or 0
+            if duration and duration > MAX_TRACK_DURATION:
+                raise ValueError("動画が長すぎます")
 
             # YouTube media URLs are IP-locked to the proxy used for extraction,
             # so they can't be streamed directly from the VPS. Fetch them to a
@@ -115,7 +146,7 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
                 "url": webpage_url if is_youtube else url,
                 "audio_url": audio_url,
                 "title": info.get("title", "Unknown"),
-                "duration": info.get("duration", 0),
+                "duration": duration,
                 "thumbnail": info.get("thumbnail", ""),
                 "is_niconico": is_niconico,
                 "needs_local": is_niconico or is_youtube,
@@ -134,7 +165,9 @@ def download_audio(url: str) -> Optional[str]:
     fetched from the same IP that extracted it.
     """
     tmpdir = tempfile.gettempdir()
-    output_template = os.path.join(tmpdir, "dl_%(id)s.%(ext)s")
+    output_template = os.path.join(
+        tmpdir, f"dl_{uuid.uuid4().hex}_%(id)s.%(ext)s"
+    )
 
     # socket_timeout caps individual network reads so a dead connection raises
     # instead of blocking this executor thread forever (the async wait_for in
@@ -243,6 +276,13 @@ def make_audio_source(song: Dict[str, Any], state: GuildState, seek: float = 0.0
 
 def current_elapsed(vc: discord.VoiceClient, state: GuildState) -> float:
     """Best-effort playback position (s) within the current song, seek-aware."""
+    if state.clock_paused:
+        return max(0.0, state.paused_position)
+    if state.clock_started_at is not None:
+        return max(0.0, state.clock_base +
+                   (time.monotonic() - state.clock_started_at) * state.clock_speed)
+
+    # Compatibility fallback for states created by older code/tests.
     player = getattr(vc, "_player", None)
     loops = getattr(player, "loops", 0) if player else 0
     # Each 20ms output frame covers 0.02 * speed seconds of song content (atempo
@@ -296,6 +336,11 @@ def swap_source_at(vc: discord.VoiceClient, state: GuildState, seek: float) -> N
     state.seek_position = seek
     state.loops_at_swap = getattr(player, "loops", 0) if player else 0
     state.speed_at_swap = state.speed
+    state.clock_base = seek
+    state.clock_speed = state.speed
+    state.paused_position = seek
+    state.clock_paused = was_paused
+    state.clock_started_at = None if was_paused else time.monotonic()
 
 
 def reapply_audio_settings(vc: discord.VoiceClient, state: GuildState) -> None:

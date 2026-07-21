@@ -31,13 +31,15 @@ def login_via_api() -> requests.cookies.RequestsCookieJar:
     })
     # niconico deprecated /api/v1/login; the current login flow posts to
     # /login/redirector and sets the `user_session` cookie on success.
-    session.get(f"{NICO_LOGIN_BASE}/login")
+    session.get(f"{NICO_LOGIN_BASE}/login", timeout=(10, 30))
     resp = session.post(
         f"{NICO_LOGIN_BASE}/login/redirector",
         data={"mail_tel": NICO_EMAIL, "password": NICO_PASSWORD},
         headers={"Referer": f"{NICO_LOGIN_BASE}/login"},
         allow_redirects=True,
+        timeout=(10, 30),
     )
+    resp.raise_for_status()
     logger.info(f"API login status: {resp.status_code}")
     return session.cookies
 
@@ -103,6 +105,10 @@ def refresh_nico_cookies_sync(force: bool = False) -> bool:
         logger.info("Using cached cookies (not expired)")
         return True
 
+    if not config.COOKIE_FILE or not NICO_EMAIL or not NICO_PASSWORD:
+        logger.warning("Niconico credentials/cookie path are not configured")
+        return False
+
     # Serialize logins across the foreground extract path and the background
     # loop so we never run two logins (or two cookie writes) concurrently.
     with cookie_refresh_lock:
@@ -150,6 +156,8 @@ def _do_refresh_nico_cookies() -> bool:
         driver = webdriver.Chrome(service=service, options=options)
 
         try:
+            driver.set_page_load_timeout(30)
+            driver.set_script_timeout(30)
             driver.get("https://account.nicovideo.jp/login?site=niconico")
             time.sleep(3)
             mail_field = WebDriverWait(driver, 10).until(
@@ -162,6 +170,8 @@ def _do_refresh_nico_cookies() -> bool:
             time.sleep(10)
 
             cookies = driver.get_cookies()
+            if not any(c.get("name") == "user_session" for c in cookies):
+                raise RuntimeError("Selenium login did not return user_session")
             write_netscape_cookies(cookies)
             last_cookie_refresh = time.time()
             logger.info(f"Saved {len(cookies)} cookies via Selenium")

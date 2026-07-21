@@ -13,6 +13,8 @@ class GuildState:
         self.current_song: Optional[Dict[str, Any]] = None
         self.idle_task: Optional[asyncio.Task] = None
         self.is_playing_sound: bool = False
+        self.sound_used: bool = False
+        self.lock: asyncio.Lock = asyncio.Lock()
         self.loop_mode: str = "off"  # "off" | "song" | "queue"
         self.skip_flag: bool = False
         self.speed: float = 1.0          # playback tempo (0.5–2.0), pitch preserved
@@ -23,6 +25,13 @@ class GuildState:
         self.loops_at_swap: int = 0      # player.loops captured when seek_position was set
         self.speed_at_swap: float = 1.0  # tempo active for the current source segment
         self.resume_position: float = 0.0  # song position to resume at after a sound effect
+        # Monotonic playback clock.  discord.py resets its private player loop
+        # counter on resume, so elapsed time must not depend on that counter.
+        self.clock_started_at: Optional[float] = None
+        self.clock_base: float = 0.0
+        self.clock_speed: float = 1.0
+        self.clock_paused: bool = False
+        self.paused_position: float = 0.0
         self.np_message: Optional[discord.Message] = None  # live now-playing message
         self.np_updater: Optional[asyncio.Task] = None      # progress-bar refresh loop
         self.reapply_task: Optional[asyncio.Task] = None    # debounced source-swap timer

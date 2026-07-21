@@ -110,14 +110,37 @@ class MusicControls(discord.ui.View):
         # the guild from the interaction, so no per-guild state is stored here.
         super().__init__(timeout=None)
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "この操作はサーバー内で使用してください。", ephemeral=True
+            )
+            return False
+        vc = interaction.guild.voice_client
+        if not vc or interaction.guild.id not in guild_states:
+            await interaction.response.send_message(
+                "現在再生中の曲はありません。", ephemeral=True
+            )
+            return False
+        user_voice = getattr(interaction.user, "voice", None)
+        if vc and vc.channel and (not user_voice or user_voice.channel != vc.channel):
+            await interaction.response.send_message(
+                "BOTと同じVCに参加してから操作してください。", ephemeral=True
+            )
+            return False
+        return True
+
     @discord.ui.button(emoji="⏯️", style=discord.ButtonStyle.secondary, custom_id="music:pause_resume")
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()  # 無言で承認（ポップアップなし）
+        from . import playback
         vc = interaction.guild.voice_client
         if vc and vc.is_playing():
+            playback.mark_paused(get_state(interaction.guild.id), vc)
             vc.pause()
         elif vc and vc.is_paused():
             vc.resume()
+            playback.mark_resumed(get_state(interaction.guild.id))
 
     @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="music:skip")
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
