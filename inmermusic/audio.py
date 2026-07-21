@@ -1,9 +1,9 @@
 """Audio extraction/download (yt-dlp) and FFmpeg source building/seeking."""
 import asyncio
 import os
+import shutil
 import tempfile
 import time
-import uuid
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
@@ -60,7 +60,9 @@ def _is_niconico_url(url: str) -> bool:
 
 def validate_query(query: str) -> None:
     """Allow only supported media hosts; bare text remains a YouTube search."""
-    if not query or len(query) > 200:
+    if not query or not query.strip():
+        raise ValueError("検索語を入力してください")
+    if len(query) > 200:
         raise ValueError("検索語が長すぎます")
     parsed = urlparse(query)
     if not parsed.scheme or "://" not in query:
@@ -158,16 +160,19 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
 
 
 def download_audio(url: str) -> Optional[str]:
-    """Download audio to a temp file and return the path.
+    """Download audio to a fresh per-request temp directory and return the path.
 
     Used for niconico and YouTube; for YouTube the request is routed through
     the residential proxy (via build_ydl_opts) so the IP-locked media URL is
     fetched from the same IP that extracted it.
+
+    Each call gets its own `dl_*` directory (instead of a uuid-suffixed
+    filename directly in the shared temp dir) so a timed-out caller can find
+    and remove the whole directory once the download eventually finishes —
+    see `cleanup_download` and the callers in playback.py.
     """
-    tmpdir = tempfile.gettempdir()
-    output_template = os.path.join(
-        tmpdir, f"dl_{uuid.uuid4().hex}_%(id)s.%(ext)s"
-    )
+    tmpdir = tempfile.mkdtemp(prefix="dl_", dir=tempfile.gettempdir())
+    output_template = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
     # socket_timeout caps individual network reads so a dead connection raises
     # instead of blocking this executor thread forever (the async wait_for in
@@ -184,15 +189,35 @@ def download_audio(url: str) -> Optional[str]:
                 return filename
     except Exception as e:
         logger.error(f"Failed to download audio: {e}")
+    # Nothing usable was produced — remove the directory we just created so
+    # a failed download doesn't leave an empty/partial orphan behind.
+    shutil.rmtree(tmpdir, ignore_errors=True)
     return None
 
 
+def cleanup_download(path: Optional[str]) -> None:
+    """Remove a downloaded track's temp directory (see `download_audio`).
+
+    Deletes the whole per-request `dl_*` directory rather than just the file,
+    so nothing is left behind. Only ever touches a directory whose name
+    actually starts with `dl_`, so a bad/unexpected path is a silent no-op
+    rather than a footgun.
+    """
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if os.path.basename(parent).startswith("dl_") and os.path.isdir(parent):
+        shutil.rmtree(parent, ignore_errors=True)
+
+
 def cleanup_temp_files(max_age: float = 3600) -> int:
-    """Remove orphaned dl_* temp files left by a previous crash.
+    """Remove orphaned dl_* temp files/directories left by a previous crash.
 
     Downloads are normally deleted in the play `after` callback, but a crash
     mid-playback leaks them in the temp dir. Sweep ones older than max_age on
-    startup so they don't accumulate. Returns the number removed.
+    startup so they don't accumulate. Handles both the current per-request
+    `dl_*` directories and any pre-migration `dl_*` files. Returns the number
+    removed.
     """
     removed = 0
     tmpdir = tempfile.gettempdir()
@@ -208,7 +233,10 @@ def cleanup_temp_files(max_age: float = 3600) -> int:
         path = os.path.join(tmpdir, name)
         try:
             if now - os.path.getmtime(path) > max_age:
-                os.remove(path)
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
                 removed += 1
         except OSError:
             pass

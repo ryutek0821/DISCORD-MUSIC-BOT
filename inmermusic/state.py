@@ -35,6 +35,11 @@ class GuildState:
         self.np_message: Optional[discord.Message] = None  # live now-playing message
         self.np_updater: Optional[asyncio.Task] = None      # progress-bar refresh loop
         self.reapply_task: Optional[asyncio.Task] = None    # debounced source-swap timer
+        # True while _play_next has popped a song and is downloading/starting
+        # it with state.lock released; guards against a second concurrent
+        # play_next call (e.g. two racing /play commands) popping a second
+        # song before the first has actually started playing.
+        self.dispatching: bool = False
 
 
 guild_states: Dict[int, GuildState] = {}

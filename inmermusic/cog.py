@@ -27,6 +27,23 @@ _PRESET_CHOICES = [
 ]
 
 
+def _drop_abandoned_state(guild_id: int, request_state, created: bool) -> None:
+    """Drop a GuildState this /play call just created, if extraction failed
+    before anything else touched it.
+
+    "queue is empty" alone does NOT mean "nothing happened" — a song may
+    already be playing (popped from the queue into current_song). Only ever
+    remove a state this very call created, and only when it's still
+    completely untouched (no queue, no current song, no voice client).
+    """
+    if not created:
+        return
+    if (guild_states.get(guild_id) is request_state and not request_state.queue
+            and request_state.current_song is None
+            and request_state.voice_client is None):
+        guild_states.pop(guild_id, None)
+
+
 class MusicCog(commands.Cog):
     """NicoNico/YouTube music playback commands and triggers."""
 
@@ -80,6 +97,7 @@ class MusicCog(commands.Cog):
 
         await interaction.response.defer()
 
+        created = interaction.guild.id not in guild_states
         state = get_state(interaction.guild.id)
         request_state = state
 
@@ -93,13 +111,11 @@ class MusicCog(commands.Cog):
                 timeout=60
             )
         except asyncio.TimeoutError:
-            if guild_states.get(interaction.guild.id) is request_state and not request_state.queue:
-                guild_states.pop(interaction.guild.id, None)
+            _drop_abandoned_state(interaction.guild.id, request_state, created)
             await interaction.followup.send("曲の取得がタイムアウトしました。")
             return
         except Exception as e:
-            if guild_states.get(interaction.guild.id) is request_state and not request_state.queue:
-                guild_states.pop(interaction.guild.id, None)
+            _drop_abandoned_state(interaction.guild.id, request_state, created)
             await interaction.followup.send(friendly_extract_error(str(e)))
             return
 
@@ -117,9 +133,18 @@ class MusicCog(commands.Cog):
         if not vc:
             try:
                 vc = await channel.connect(timeout=15)
-                state.voice_client = vc
             except Exception as e:
                 await interaction.followup.send(f"VC接続失敗: {str(e)}")
+                return
+            if guild_states.get(interaction.guild.id) is not request_state:
+                # /stop (or similar) raced us while we were connecting; this
+                # request has been abandoned, so tear down the VC connection
+                # we just opened rather than leaving an orphaned session.
+                try:
+                    await vc.disconnect()
+                except Exception as e:
+                    logger.warning(f"Failed to disconnect abandoned VC: {e}")
+                await interaction.followup.send("再生リクエストはキャンセルされました。")
                 return
         elif vc.channel != channel:
             try:
@@ -127,11 +152,21 @@ class MusicCog(commands.Cog):
             except Exception as e:
                 await interaction.followup.send(f"チャンネル移動失敗: {str(e)}")
                 return
+            if guild_states.get(interaction.guild.id) is not request_state:
+                # Existing connection — it isn't ours to tear down, just
+                # abandon this request.
+                await interaction.followup.send("再生リクエストはキャンセルされました。")
+                return
+
+        # Unconditional: the bot may already be connected to the right channel
+        # (neither branch above runs), and a state created after the previous
+        # session was cleaned up would otherwise keep voice_client = None and
+        # make play_next silently bail out.
+        request_state.voice_client = vc
 
         cancel_idle_task(interaction.guild.id)
 
-        state = get_state(interaction.guild.id)
-        state.voice_client = vc
+        state = request_state
         if len(state.queue) >= MAX_QUEUE_SIZE:
             await interaction.followup.send(
                 f"キューが上限（{MAX_QUEUE_SIZE}曲）に達しています。", ephemeral=True
@@ -448,7 +483,7 @@ class MusicCog(commands.Cog):
         if not path:
             await interaction.response.send_message("効果音ファイルが見つかりません。")
             return
-        if state.is_playing_sound:
+        if state.is_playing_sound or state.sound_used:
             await interaction.response.send_message("同一楽曲再生中に1度しか流せません")
             return
         logger.info(f"Playing sound effect '{name}' via slash command")
