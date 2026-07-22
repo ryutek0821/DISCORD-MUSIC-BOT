@@ -55,6 +55,27 @@ def test_parse_time():
     assert util.parse_time("1:2:3:4") is None
 
 
+def test_parse_time_rejects_non_finite_values():
+    """NaN/Infinity must not become seek positions."""
+    assert util.parse_time("nan") is None
+    assert util.parse_time("inf") is None
+    assert util.parse_time("-inf") is None
+    assert util.parse_time("1:nan") is None
+
+
+def test_validate_media_query_allowlist():
+    audio.validate_query("夜に駆ける")
+    audio.validate_query("https://www.youtube.com/watch?v=abc")
+    audio.validate_query("https://www.nicovideo.jp/watch/sm9")
+    for query in ("http://127.0.0.1:8080/", "https://example.com/a", "file:///tmp/a"):
+        try:
+            audio.validate_query(query)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"query unexpectedly accepted: {query}")
+
+
 def test_fmt_duration():
     assert util.fmt_duration(90) == "1:30"
     assert util.fmt_duration(3723) == "1:02:03"
@@ -299,7 +320,7 @@ def test_play_next_skip_and_drain():
 
     skip_calls = []
 
-    async def fake_notify_skip(gid, song, reason):
+    async def fake_notify_skip(gid, song, reason, expected_state=None):
         skip_calls.append((song["title"], reason))
 
     async def fake_announce_now_playing(gid):
@@ -382,6 +403,268 @@ def test_cleanup_guild_state():
     try:
         asyncio.run(_run())
     finally:
+        guild_states.pop(guild_id, None)
+
+
+def test_stale_after_callback_does_not_recreate_state():
+    """A callback from a stopped track must not resurrect GuildState."""
+    from inmermusic.state import get_state, guild_states
+
+    class CapturingVoiceClient(FakeVoiceClient):
+        def play(self, source, after=None):
+            super().play(source, after=after)
+            self.after = after
+
+    guild_id = 900105
+    original_make = playback.make_audio_source
+    original_announce = playback.announce_now_playing
+    original_updater = playback.start_np_updater
+
+    async def fake_announce(_guild_id):
+        return None
+
+    playback.make_audio_source = lambda song, state, seek=0.0: "SOURCE"
+    playback.announce_now_playing = fake_announce
+    playback.start_np_updater = lambda *args, **kwargs: None
+
+    async def scenario():
+        state = get_state(guild_id)
+        state.voice_client = CapturingVoiceClient()
+        state.queue = [{"title": "stale", "needs_local": False}]
+        await playback.play_next(guild_id)
+        callback = state.voice_client.after
+        playback.cleanup_guild_state(guild_id)
+        callback(None)
+        await asyncio.sleep(0.05)
+        assert guild_id not in guild_states
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        playback.make_audio_source = original_make
+        playback.announce_now_playing = original_announce
+        playback.start_np_updater = original_updater
+        guild_states.pop(guild_id, None)
+
+
+def test_validate_query_empty_message():
+    # An empty/whitespace-only query must get its own message, not the
+    # "too long" one.
+    for empty in ("", "   ", "\t\n"):
+        try:
+            audio.validate_query(empty)
+        except ValueError as e:
+            assert str(e) == "検索語を入力してください", (empty, str(e))
+        else:
+            raise AssertionError(f"empty query unexpectedly accepted: {empty!r}")
+    try:
+        audio.validate_query("a" * 201)
+    except ValueError as e:
+        assert str(e) == "検索語が長すぎます"
+    else:
+        raise AssertionError("overlong query unexpectedly accepted")
+
+
+def test_drop_abandoned_state_keeps_active_session():
+    # Regression for review item 1: a /play whose extraction failed must
+    # never destroy a GuildState that's already hosting a session (a song
+    # popped into current_song, even with an empty queue) or one that
+    # predates this call.
+    from inmermusic.cog import _drop_abandoned_state
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900110
+    try:
+        # created=True but a song is already playing (queue empty) -> keep.
+        state = get_state(guild_id)
+        state.current_song = {"title": "playing"}
+        state.queue = []
+        _drop_abandoned_state(guild_id, state, created=True)
+        assert guild_states.get(guild_id) is state
+
+        # created=False (state pre-existed this /play call) -> never drop,
+        # even though it looks empty/untouched.
+        state.current_song = None
+        _drop_abandoned_state(guild_id, state, created=False)
+        assert guild_states.get(guild_id) is state
+
+        # created=True and genuinely untouched (this call's own state) -> drop.
+        _drop_abandoned_state(guild_id, state, created=True)
+        assert guild_id not in guild_states
+    finally:
+        guild_states.pop(guild_id, None)
+
+
+def test_restart_song_download_failure_resets_flag_and_skips_reinsert():
+    # Regression for review item 2: a failed resume-download after a sound
+    # effect must clear is_playing_sound and must NOT be reinserted into the
+    # queue even under loop_mode="song" (it's a forced skip, not a normal
+    # end-of-song).
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900111
+    skip_reasons = []
+    play_next_calls = []
+
+    async def fake_notify_skip(gid, song, reason, expected_state=None):
+        skip_reasons.append(reason)
+
+    async def fake_play_next(gid, announce=True):
+        play_next_calls.append(gid)
+
+    original_download = playback.download_audio
+    original_notify_skip = playback.notify_skip
+    original_play_next = playback.play_next
+    playback.download_audio = lambda url: None  # simulates a failed download
+    playback.notify_skip = fake_notify_skip
+    playback.play_next = fake_play_next
+
+    try:
+        state = get_state(guild_id)
+        state.voice_client = FakeVoiceClient()
+        song = {"title": "resume-me", "needs_local": True, "local_file": None,
+                "url": "http://example.com/x"}
+        state.current_song = song
+        state.loop_mode = "song"
+        state.queue = []
+        state.is_playing_sound = True
+        state.resume_position = 5.0
+
+        asyncio.run(playback.restart_song(guild_id, expected_state=state))
+
+        assert state.is_playing_sound is False
+        assert song not in state.queue      # not reinserted despite loop_mode="song"
+        assert state.queue == []
+        assert skip_reasons == ["読み込み失敗"]
+        assert play_next_calls == [guild_id]
+    finally:
+        playback.download_audio = original_download
+        playback.notify_skip = original_notify_skip
+        playback.play_next = original_play_next
+        guild_states.pop(guild_id, None)
+
+
+def test_notify_skip_after_cleanup_does_not_recreate_state():
+    # Regression for review item 3: notify_skip must use guild_states.get()
+    # (never get_state()), so a callback racing a cleanup_guild_state() can't
+    # resurrect a dropped GuildState.
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900112
+    try:
+        state = get_state(guild_id)
+        playback.cleanup_guild_state(guild_id)
+        assert guild_id not in guild_states
+
+        asyncio.run(playback.notify_skip(guild_id, {"title": "x"}, "reason",
+                                         expected_state=state))
+        assert guild_id not in guild_states
+
+        # Also without an expected_state — guild_states.get() alone must
+        # short-circuit before ever touching state.voice_client.
+        asyncio.run(playback.notify_skip(guild_id, {"title": "x"}, "reason"))
+        assert guild_id not in guild_states
+    finally:
+        guild_states.pop(guild_id, None)
+
+
+def test_download_audio_removes_temp_dir_on_failure():
+    # Regression for review item 5: a failed download must not leave its
+    # per-request dl_* directory behind.
+    import tempfile as _tempfile
+
+    class FakeYDL:
+        def __init__(self, opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download=True):
+            raise RuntimeError("boom")
+
+    d = _tempfile.mkdtemp()
+    original_gettempdir = audio.tempfile.gettempdir
+    original_ydl = audio.yt_dlp.YoutubeDL
+    original_cookie_file = config.COOKIE_FILE
+    audio.tempfile.gettempdir = lambda: d
+    audio.yt_dlp.YoutubeDL = FakeYDL
+    config.COOKIE_FILE = None  # avoid touching the real cookie file path
+    try:
+        result = audio.download_audio("https://example.com/video")
+        assert result is None
+        leftovers = [n for n in os.listdir(d) if n.startswith("dl_")]
+        assert leftovers == []
+    finally:
+        audio.tempfile.gettempdir = original_gettempdir
+        audio.yt_dlp.YoutubeDL = original_ydl
+        config.COOKIE_FILE = original_cookie_file
+        os.rmdir(d)
+
+
+def test_cleanup_late_download_removes_dir_after_timeout():
+    """Regression for review item 5.
+
+    A download that finishes AFTER its asyncio.wait_for timeout must still
+    have its temp directory removed. This drives the real _play_next timeout
+    path rather than calling _cleanup_late_download directly, because the bug
+    lived in the wait_for/add_done_callback interaction: wait_for cancels its
+    argument before raising, so without asyncio.shield() the callback fires
+    immediately on an already-cancelled future and cleans up nothing.
+    """
+    import tempfile as _tempfile
+    import time as _time
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900106
+    made = {}
+
+    def slow_download(url):
+        d = _tempfile.mkdtemp(prefix="dl_")
+        made["dir"] = d
+        path = os.path.join(d, "video.m4a")
+        with open(path, "w") as f:
+            f.write("x")
+        _time.sleep(0.5)  # finishes well after the wait_for timeout below
+        return path
+
+    async def fake_notify_skip(gid, song, reason, expected_state=None):
+        return None
+
+    original_download = playback.download_audio
+    original_timeout = playback.DOWNLOAD_TIMEOUT
+    original_notify = playback.notify_skip
+    playback.download_audio = slow_download
+    playback.DOWNLOAD_TIMEOUT = 0.1
+    playback.notify_skip = fake_notify_skip
+
+    async def scenario():
+        state = get_state(guild_id)
+        state.voice_client = FakeVoiceClient()
+        state.queue = [{"title": "slow", "needs_local": True,
+                        "url": "https://www.youtube.com/watch?v=x"}]
+        await playback.play_next(guild_id)
+        # Timed out and skipped; nothing should have started playing.
+        assert state.voice_client.played == []
+        assert made["dir"] is not None
+        # Let the abandoned executor thread finish and the done-callback run.
+        for _ in range(40):
+            if not os.path.isdir(made["dir"]):
+                break
+            await asyncio.sleep(0.05)
+        assert not os.path.isdir(made["dir"]), \
+            "timed-out download left its temp dir behind"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        playback.download_audio = original_download
+        playback.DOWNLOAD_TIMEOUT = original_timeout
+        playback.notify_skip = original_notify
+        playback.cleanup_guild_state(guild_id)
         guild_states.pop(guild_id, None)
 
 

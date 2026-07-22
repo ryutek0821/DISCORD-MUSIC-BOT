@@ -36,7 +36,10 @@ class MusicBot(commands.Bot):
         self.add_view(MusicControls())
 
 
-bot = MusicBot(command_prefix="!", intents=intents)
+bot = MusicBot(
+    command_prefix="!", intents=intents,
+    allowed_mentions=discord.AllowedMentions.none(),
+)
 
 
 @bot.event

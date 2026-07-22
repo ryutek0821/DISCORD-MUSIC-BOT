@@ -7,13 +7,14 @@ from discord import app_commands
 from discord.ext import commands
 
 from . import cookies
-from .audio import current_elapsed, extract_audio_url, swap_source_at
-from .config import (EFFECT_LABELS, EFFECT_PRESETS, list_sound_names, logger,
+from .audio import current_elapsed, extract_audio_url, swap_source_at, validate_query
+from .config import (EFFECT_LABELS, EFFECT_PRESETS, MAX_QUEUE_SIZE,
+                     list_sound_names, logger,
                      resolve_sound)
 from .playback import (cancel_idle_task, cancel_reapply, cleanup_guild_state,
                        play_next, play_sound_effect, refresh_now_playing,
                        resolve_text_channel, schedule_reapply,
-                       start_np_updater)
+                       start_np_updater, mark_paused, mark_resumed)
 from .state import get_state, guild_states, move_queue_item
 from .ui import MusicControls, create_now_playing_embed, create_queued_embed
 from .util import fmt_duration, friendly_extract_error, parse_time
@@ -26,11 +27,54 @@ _PRESET_CHOICES = [
 ]
 
 
+def _drop_abandoned_state(guild_id: int, request_state, created: bool) -> None:
+    """Drop a GuildState this /play call just created, if extraction failed
+    before anything else touched it.
+
+    "queue is empty" alone does NOT mean "nothing happened" — a song may
+    already be playing (popped from the queue into current_song). Only ever
+    remove a state this very call created, and only when it's still
+    completely untouched (no queue, no current song, no voice client).
+    """
+    if not created:
+        return
+    if (guild_states.get(guild_id) is request_state and not request_state.queue
+            and request_state.current_song is None
+            and request_state.voice_client is None):
+        guild_states.pop(guild_id, None)
+
+
 class MusicCog(commands.Cog):
     """NicoNico/YouTube music playback commands and triggers."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Reject DMs and prevent users from hijacking another VC's player."""
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "このコマンドはサーバー内で使用してください。", ephemeral=True
+            )
+            return False
+        command = getattr(interaction.command, "name", "")
+        if command == "refresh":
+            allowed = getattr(interaction.user.guild_permissions, "manage_guild", False)
+            if not allowed:
+                await interaction.response.send_message(
+                    "Cookie更新にはサーバー管理権限が必要です。", ephemeral=True
+                )
+            return allowed
+        if command in {"help", "queue", "nowplaying"}:
+            return True
+        vc = interaction.guild.voice_client
+        user_voice = getattr(interaction.user, "voice", None)
+        if vc and vc.channel and (not user_voice or user_voice.channel != vc.channel):
+            await interaction.response.send_message(
+                "BOTと同じVCに参加してから操作してください。", ephemeral=True
+            )
+            return False
+        return True
 
     @app_commands.command(name="play", description="Play a song from NicoNico or YouTube")
     @app_commands.describe(query="NicoNico URL, YouTube URL, or search keyword")
@@ -39,7 +83,23 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("VCに参加してください。")
             return
 
+        try:
+            validate_query(query)
+        except ValueError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+        existing_state = guild_states.get(interaction.guild.id)
+        if existing_state and len(existing_state.queue) >= MAX_QUEUE_SIZE:
+            await interaction.response.send_message(
+                f"キューが上限（{MAX_QUEUE_SIZE}曲）に達しています。", ephemeral=True
+            )
+            return
+
         await interaction.response.defer()
+
+        created = interaction.guild.id not in guild_states
+        state = get_state(interaction.guild.id)
+        request_state = state
 
         channel = interaction.user.voice.channel
         vc = interaction.guild.voice_client
@@ -51,11 +111,21 @@ class MusicCog(commands.Cog):
                 timeout=60
             )
         except asyncio.TimeoutError:
+            _drop_abandoned_state(interaction.guild.id, request_state, created)
             await interaction.followup.send("曲の取得がタイムアウトしました。")
             return
         except Exception as e:
+            _drop_abandoned_state(interaction.guild.id, request_state, created)
             await interaction.followup.send(friendly_extract_error(str(e)))
             return
+
+        if guild_states.get(interaction.guild.id) is not request_state:
+            await interaction.followup.send("再生リクエストはキャンセルされました。")
+            return
+
+        # Refresh the VC reference after extraction; /stop or a forced
+        # disconnect may have invalidated the one captured before the await.
+        vc = interaction.guild.voice_client
 
         song["text_channel_id"] = interaction.channel.id
         song["requester"] = interaction.user.display_name
@@ -63,10 +133,18 @@ class MusicCog(commands.Cog):
         if not vc:
             try:
                 vc = await channel.connect(timeout=15)
-                state = get_state(interaction.guild.id)
-                state.voice_client = vc
             except Exception as e:
                 await interaction.followup.send(f"VC接続失敗: {str(e)}")
+                return
+            if guild_states.get(interaction.guild.id) is not request_state:
+                # /stop (or similar) raced us while we were connecting; this
+                # request has been abandoned, so tear down the VC connection
+                # we just opened rather than leaving an orphaned session.
+                try:
+                    await vc.disconnect()
+                except Exception as e:
+                    logger.warning(f"Failed to disconnect abandoned VC: {e}")
+                await interaction.followup.send("再生リクエストはキャンセルされました。")
                 return
         elif vc.channel != channel:
             try:
@@ -74,10 +152,26 @@ class MusicCog(commands.Cog):
             except Exception as e:
                 await interaction.followup.send(f"チャンネル移動失敗: {str(e)}")
                 return
+            if guild_states.get(interaction.guild.id) is not request_state:
+                # Existing connection — it isn't ours to tear down, just
+                # abandon this request.
+                await interaction.followup.send("再生リクエストはキャンセルされました。")
+                return
+
+        # Unconditional: the bot may already be connected to the right channel
+        # (neither branch above runs), and a state created after the previous
+        # session was cleaned up would otherwise keep voice_client = None and
+        # make play_next silently bail out.
+        request_state.voice_client = vc
 
         cancel_idle_task(interaction.guild.id)
 
-        state = get_state(interaction.guild.id)
+        state = request_state
+        if len(state.queue) >= MAX_QUEUE_SIZE:
+            await interaction.followup.send(
+                f"キューが上限（{MAX_QUEUE_SIZE}曲）に達しています。", ephemeral=True
+            )
+            return
         state.queue.append(song)
 
         if vc.is_playing() or vc.is_paused():
@@ -87,13 +181,20 @@ class MusicCog(commands.Cog):
             # Let play_next actually start playback first, so a failed track
             # (bad URL, dead link) never leaves a stale Now Playing behind.
             await play_next(interaction.guild.id, announce=False)
+            if guild_states.get(interaction.guild.id) is not state:
+                await interaction.followup.send("再生は停止されました。")
+                return
             started = state.current_song
-            if started is not None:
+            if started is song:
                 embed = create_now_playing_embed(started, elapsed=0.0, state=state)
                 state.np_message = await interaction.followup.send(
                     embed=embed, view=MusicControls()
                 )
                 start_np_updater(interaction.guild.id)
+            elif vc.is_playing() or vc.is_paused():
+                await interaction.followup.send(
+                    embed=create_queued_embed(song, len(state.queue))
+                )
             else:
                 await interaction.followup.send("⚠️ 再生できませんでした。")
 
@@ -281,7 +382,7 @@ class MusicCog(commands.Cog):
                 await vc.move_to(channel)
             else:
                 vc = await channel.connect(timeout=15)
-                state.voice_client = vc
+            state.voice_client = vc
         except Exception as e:
             await interaction.response.send_message(f"VC接続失敗: {str(e)}")
             return
@@ -292,6 +393,7 @@ class MusicCog(commands.Cog):
         cancel_idle_task(interaction.guild.id)
         vc = interaction.guild.voice_client
         if not vc:
+            cleanup_guild_state(interaction.guild.id)
             await interaction.response.send_message("VCに接続していません。")
             return
         vc.stop()
@@ -340,6 +442,7 @@ class MusicCog(commands.Cog):
     async def pause(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if vc and vc.is_playing():
+            mark_paused(get_state(interaction.guild.id), vc)
             vc.pause()
             await interaction.response.send_message("一時停止しました。")
         else:
@@ -350,6 +453,7 @@ class MusicCog(commands.Cog):
         vc = interaction.guild.voice_client
         if vc and vc.is_paused():
             vc.resume()
+            mark_resumed(get_state(interaction.guild.id))
             await interaction.response.send_message("再開しました。")
         else:
             await interaction.response.send_message("一時停止していません。")
@@ -379,7 +483,7 @@ class MusicCog(commands.Cog):
         if not path:
             await interaction.response.send_message("効果音ファイルが見つかりません。")
             return
-        if state.is_playing_sound:
+        if state.is_playing_sound or state.sound_used:
             await interaction.response.send_message("同一楽曲再生中に1度しか流せません")
             return
         logger.info(f"Playing sound effect '{name}' via slash command")
@@ -426,12 +530,19 @@ class MusicCog(commands.Cog):
         if not path:
             logger.warning("Sound file 'na-' not found")
             return
+        state = guild_states.get(message.guild.id)
+        user_voice = getattr(message.author, "voice", None)
+        if (not state or not state.voice_client or not user_voice
+                or user_voice.channel != state.voice_client.channel):
+            return
         logger.info(f"Playing sound effect for trigger: {message.content}")
         play_sound_effect(message.guild.id, path)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         if member.bot:
+            if self.bot.user and member.id == self.bot.user.id and after.channel is None:
+                cleanup_guild_state(member.guild.id)
             return
 
         guild = member.guild

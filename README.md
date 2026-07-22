@@ -1,6 +1,6 @@
 # INMERMUSIC BOT
 
-[![CI](https://github.com/ryutek0821/INMERMUSIC_BOT/actions/workflows/ci.yml/badge.svg)](https://github.com/ryutek0821/INMERMUSIC_BOT/actions/workflows/ci.yml)
+[![CI](https://github.com/ryutek0821/DISCORD-MUSIC-BOT/actions/workflows/ci.yml/badge.svg)](https://github.com/ryutek0821/DISCORD-MUSIC-BOT/actions/workflows/ci.yml)
 
 Discord でニコニコ動画・YouTube を再生できる Music Bot。
 
@@ -20,7 +20,7 @@ Discord でニコニコ動画・YouTube を再生できる Music Bot。
 |----------|------|
 | `/play <URL/キーワード>` | 曲を再生（ニコニコ動画URL、YouTubeURL、または検索キーワード） |
 | `/skip` | 現在の曲をスキップ |
-| `/queue` | キューを表示（最大10件） |
+| `/queue` | キューを表示（最大20件を表示） |
 | `/loop <off/song/queue>` | リピート再生（オフ／1曲／キュー全体） |
 | `/shuffle` | キューをシャッフル |
 | `/speed <0.5-2.0>` | 再生速度を変更（ピッチ維持） |
@@ -28,7 +28,6 @@ Discord でニコニコ動画・YouTube を再生できる Music Bot。
 | `/volume <0-200>` | 音量を変更（%） |
 | `/seek <時間>` | 再生位置へジャンプ（秒 または `mm:ss`） |
 | `/preset <名前>` | エフェクトプリセット適用（ナイトコア／ベイパーウェイブ／低音ブースト／8D／Lo-Fi） |
-| `/effect <名前> <値>` | 個別エフェクト設定 |
 | `/move <from> <to>` | キュー内の曲を並び替え |
 | `/remove <番号>` | 指定したキューの曲を削除 |
 | `/clear` | キューをクリア（再生中の曲は継続） |
@@ -89,6 +88,8 @@ CHROMEDRIVER_PATH=/usr/bin/chromedriver
 COOKIE_TTL=3600          # Cookie有効期限（秒）
 IDLE_TIMEOUT=180         # アイドル切断時間（秒）
 DOWNLOAD_TIMEOUT=120     # 1曲のDLタイムアウト（秒）
+MAX_TRACK_DURATION=14400 # 1曲の最大長（秒）
+MAX_QUEUE_SIZE=100       # Guildごとのキュー上限
 LOG_FILE=bot.log         # 指定時はローテーションログも出力
 YT_PROXY=http://your-proxy-host:8888  # YouTube用プロキシ（住宅IPが必要な場合）
 ```
@@ -130,7 +131,7 @@ main.py          # エントリポイント（inmermusic.bot を呼び出す）
 ```
 
 - ニコニコ動画の音声は yt-dlp でローカルにダウンロードしてから再生（403 エラー回避）
-- YouTube はストリーム再生
+- YouTube もプロキシ制約のため一時ファイルへダウンロードして再生
 - 再生終了後に一時ファイルを自動削除
 - Cookie は API ログインで取得、失敗時に Selenium フォールバック
 
@@ -153,4 +154,5 @@ main.py          # エントリポイント（inmermusic.bot を呼び出す）
 | `TAILSCALE_AUTHKEY` | Tailscale のオースキー（Ephemeral推奨） |
 | `SSH_HOST` | デプロイ先サーバーのIP（Tailscale IP） |
 | `SSH_KEY` | デプロイ用SSHプライベートキー |
+| `SSH_KNOWN_HOSTS` | デプロイ先の固定済みknown_hosts行 |
 | `PAT_FOR_AUTOMERGE` | auto-merge ワークフロー用 Personal Access Token |

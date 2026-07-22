@@ -1,15 +1,18 @@
 """Audio extraction/download (yt-dlp) and FFmpeg source building/seeking."""
 import asyncio
 import os
+import shutil
 import tempfile
 import time
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 import discord
 import yt_dlp
 
 from . import config
-from .config import (DOWNLOAD_TIMEOUT, EFFECT_FILTERS, NICO_EMAIL, NICO_PASSWORD,
+from .config import (DOWNLOAD_TIMEOUT, EFFECT_FILTERS, MAX_TRACK_DURATION,
+                     NICO_EMAIL, NICO_PASSWORD,
                      SOURCE_CLEANUP_DELAY, YT_PROXY, logger)
 from .cookies import ensure_cookie_file, refresh_nico_cookies_sync
 from .state import GuildState
@@ -28,7 +31,7 @@ def build_ydl_opts(url: str, **overrides: Any) -> Dict[str, Any]:
     }
     ydl_opts.update(overrides)
 
-    is_niconico = "nicovideo.jp" in url
+    is_niconico = _is_niconico_url(url)
 
     if config.COOKIE_FILE:
         ensure_cookie_file()
@@ -50,9 +53,35 @@ def build_ydl_opts(url: str, **overrides: Any) -> Dict[str, Any]:
     return ydl_opts
 
 
+def _is_niconico_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    return host == "nicovideo.jp" or host.endswith(".nicovideo.jp") or host == "nico.ms"
+
+
+def validate_query(query: str) -> None:
+    """Allow only supported media hosts; bare text remains a YouTube search."""
+    if not query or not query.strip():
+        raise ValueError("検索語を入力してください")
+    if len(query) > 200:
+        raise ValueError("検索語が長すぎます")
+    parsed = urlparse(query)
+    if not parsed.scheme or "://" not in query:
+        return
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("対応していないURL形式です")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    allowed = (
+        host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+        or host == "nicovideo.jp" or host.endswith(".nicovideo.jp") or host == "nico.ms"
+    )
+    if not allowed:
+        raise ValueError("YouTubeまたはニコニコ動画のURLのみ利用できます")
+
+
 def extract_audio_url(url: str) -> Dict[str, Any]:
     """Extract audio stream URL or download for niconico."""
-    if "nicovideo.jp" in url:
+    validate_query(url)
+    if _is_niconico_url(url):
         refresh_nico_cookies_sync()
 
     ydl_opts = build_ydl_opts(url, socket_timeout=10)
@@ -99,12 +128,16 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
                           f"({selected_format.get('abr', 'unknown')}kbps, "
                           f"{selected_format.get('asr', 'unknown')}Hz)")
 
-            is_niconico = "nicovideo.jp" in url
             # A bare keyword resolves to a YouTube video via default_search, so
             # detect YouTube from the resolved info rather than the input string.
             extractor = (info.get("extractor_key") or info.get("extractor") or "")
             webpage_url = info.get("webpage_url") or url
+            is_niconico = _is_niconico_url(webpage_url)
             is_youtube = "youtube" in extractor.lower() or "youtube.com" in webpage_url
+
+            duration = info.get("duration") or 0
+            if duration and duration > MAX_TRACK_DURATION:
+                raise ValueError("動画が長すぎます")
 
             # YouTube media URLs are IP-locked to the proxy used for extraction,
             # so they can't be streamed directly from the VPS. Fetch them to a
@@ -115,7 +148,7 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
                 "url": webpage_url if is_youtube else url,
                 "audio_url": audio_url,
                 "title": info.get("title", "Unknown"),
-                "duration": info.get("duration", 0),
+                "duration": duration,
                 "thumbnail": info.get("thumbnail", ""),
                 "is_niconico": is_niconico,
                 "needs_local": is_niconico or is_youtube,
@@ -127,14 +160,19 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
 
 
 def download_audio(url: str) -> Optional[str]:
-    """Download audio to a temp file and return the path.
+    """Download audio to a fresh per-request temp directory and return the path.
 
     Used for niconico and YouTube; for YouTube the request is routed through
     the residential proxy (via build_ydl_opts) so the IP-locked media URL is
     fetched from the same IP that extracted it.
+
+    Each call gets its own `dl_*` directory (instead of a uuid-suffixed
+    filename directly in the shared temp dir) so a timed-out caller can find
+    and remove the whole directory once the download eventually finishes —
+    see `cleanup_download` and the callers in playback.py.
     """
-    tmpdir = tempfile.gettempdir()
-    output_template = os.path.join(tmpdir, "dl_%(id)s.%(ext)s")
+    tmpdir = tempfile.mkdtemp(prefix="dl_", dir=tempfile.gettempdir())
+    output_template = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
     # socket_timeout caps individual network reads so a dead connection raises
     # instead of blocking this executor thread forever (the async wait_for in
@@ -151,15 +189,35 @@ def download_audio(url: str) -> Optional[str]:
                 return filename
     except Exception as e:
         logger.error(f"Failed to download audio: {e}")
+    # Nothing usable was produced — remove the directory we just created so
+    # a failed download doesn't leave an empty/partial orphan behind.
+    shutil.rmtree(tmpdir, ignore_errors=True)
     return None
 
 
+def cleanup_download(path: Optional[str]) -> None:
+    """Remove a downloaded track's temp directory (see `download_audio`).
+
+    Deletes the whole per-request `dl_*` directory rather than just the file,
+    so nothing is left behind. Only ever touches a directory whose name
+    actually starts with `dl_`, so a bad/unexpected path is a silent no-op
+    rather than a footgun.
+    """
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if os.path.basename(parent).startswith("dl_") and os.path.isdir(parent):
+        shutil.rmtree(parent, ignore_errors=True)
+
+
 def cleanup_temp_files(max_age: float = 3600) -> int:
-    """Remove orphaned dl_* temp files left by a previous crash.
+    """Remove orphaned dl_* temp files/directories left by a previous crash.
 
     Downloads are normally deleted in the play `after` callback, but a crash
     mid-playback leaks them in the temp dir. Sweep ones older than max_age on
-    startup so they don't accumulate. Returns the number removed.
+    startup so they don't accumulate. Handles both the current per-request
+    `dl_*` directories and any pre-migration `dl_*` files. Returns the number
+    removed.
     """
     removed = 0
     tmpdir = tempfile.gettempdir()
@@ -175,7 +233,10 @@ def cleanup_temp_files(max_age: float = 3600) -> int:
         path = os.path.join(tmpdir, name)
         try:
             if now - os.path.getmtime(path) > max_age:
-                os.remove(path)
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
                 removed += 1
         except OSError:
             pass
@@ -243,6 +304,13 @@ def make_audio_source(song: Dict[str, Any], state: GuildState, seek: float = 0.0
 
 def current_elapsed(vc: discord.VoiceClient, state: GuildState) -> float:
     """Best-effort playback position (s) within the current song, seek-aware."""
+    if state.clock_paused:
+        return max(0.0, state.paused_position)
+    if state.clock_started_at is not None:
+        return max(0.0, state.clock_base +
+                   (time.monotonic() - state.clock_started_at) * state.clock_speed)
+
+    # Compatibility fallback for states created by older code/tests.
     player = getattr(vc, "_player", None)
     loops = getattr(player, "loops", 0) if player else 0
     # Each 20ms output frame covers 0.02 * speed seconds of song content (atempo
@@ -296,6 +364,11 @@ def swap_source_at(vc: discord.VoiceClient, state: GuildState, seek: float) -> N
     state.seek_position = seek
     state.loops_at_swap = getattr(player, "loops", 0) if player else 0
     state.speed_at_swap = state.speed
+    state.clock_base = seek
+    state.clock_speed = state.speed
+    state.paused_position = seek
+    state.clock_paused = was_paused
+    state.clock_started_at = None if was_paused else time.monotonic()
 
 
 def reapply_audio_settings(vc: discord.VoiceClient, state: GuildState) -> None:
