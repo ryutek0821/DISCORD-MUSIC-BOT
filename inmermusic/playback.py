@@ -1,13 +1,13 @@
 """Queue advancement, playback lifecycle, idle disconnect, and the now-playing
 progress-bar updater. Sits above audio + ui; imported by cog and bot."""
 import asyncio
-import os
+import time
 from typing import Any, Dict, Optional
 
 import discord
 
-from .audio import (current_elapsed, download_audio, make_audio_source,
-                    reapply_audio_settings)
+from .audio import (cleanup_download, current_elapsed, download_audio,
+                    make_audio_source, reapply_audio_settings)
 from .config import (DOWNLOAD_TIMEOUT, EFFECT_DEBOUNCE, IDLE_TIMEOUT,
                      NP_UPDATE_INTERVAL, logger)
 from .state import GuildState, get_state, guild_states
@@ -16,7 +16,9 @@ from .util import fmt_duration
 
 
 def cancel_idle_task(guild_id: int) -> None:
-    state = get_state(guild_id)
+    state = guild_states.get(guild_id)
+    if state is None:
+        return
     if state.idle_task:
         state.idle_task.cancel()
         state.idle_task = None
@@ -25,7 +27,11 @@ def cancel_idle_task(guild_id: int) -> None:
 async def schedule_disconnect(guild_id: int) -> None:
     try:
         await asyncio.sleep(IDLE_TIMEOUT)
-        state = get_state(guild_id)
+        # guild_states.get, never get_state: a task that outlived its guild
+        # must not resurrect a dropped GuildState just to check for idleness.
+        state = guild_states.get(guild_id)
+        if state is None:
+            return
         vc = state.voice_client
         if vc and vc.is_connected() and not vc.is_playing():
             logger.info(f"Idle timeout ({IDLE_TIMEOUT}s), disconnecting")
@@ -150,9 +156,19 @@ async def announce_now_playing(guild_id: int) -> None:
         logger.warning(f"Failed to send now playing message: {e}")
 
 
-async def notify_skip(guild_id: int, song: Dict[str, Any], reason: str) -> None:
-    """Tell the channel a queued song couldn't be played and was skipped."""
-    state = get_state(guild_id)
+async def notify_skip(guild_id: int, song: Dict[str, Any], reason: str,
+                      expected_state: Optional[GuildState] = None) -> None:
+    """Tell the channel a queued song couldn't be played and was skipped.
+
+    Uses guild_states.get() (never get_state()) and honors expected_state so
+    a callback racing a cleanup_guild_state() can't resurrect a dropped
+    GuildState just to send a skip notice.
+    """
+    state = guild_states.get(guild_id)
+    if state is None:
+        return
+    if expected_state is not None and state is not expected_state:
+        return
     vc = state.voice_client
     if not vc:
         return
@@ -164,6 +180,29 @@ async def notify_skip(guild_id: int, song: Dict[str, Any], reason: str) -> None:
             )
         except Exception as e:
             logger.warning(f"Failed to send skip notice: {e}")
+
+
+def _cleanup_late_download(fut: "asyncio.Future") -> None:
+    """Done-callback for a download future abandoned by a wait_for timeout.
+
+    asyncio.wait_for can't stop the executor thread, so the download keeps
+    running and eventually writes a file nobody will claim. Once it finishes,
+    remove its temp directory so timed-out downloads don't accumulate.
+
+    Only ever attached to a future that was wrapped in asyncio.shield() (see
+    the download call sites): wait_for cancels its argument before raising
+    TimeoutError, so without the shield the future would already be cancelled
+    here and this would fire immediately with nothing to clean up. Catches
+    BaseException because a cancelled future raises CancelledError, which is
+    not an Exception subclass, and a done-callback must never leak into the
+    event loop's exception handler.
+    """
+    try:
+        result = fut.result()
+    except BaseException:
+        return
+    if result:
+        cleanup_download(result)
 
 
 def cleanup_guild_state(guild_id: int) -> None:
@@ -183,34 +222,93 @@ def cleanup_guild_state(guild_id: int) -> None:
     guild_states.pop(guild_id, None)
 
 
-async def advance_queue(guild_id: int, finished_song: Dict[str, Any]) -> None:
+def mark_paused(state: GuildState, vc: discord.VoiceClient) -> None:
+    if not state.clock_paused:
+        state.paused_position = current_elapsed(vc, state)
+        state.clock_paused = True
+
+
+def mark_resumed(state: GuildState) -> None:
+    state.clock_base = state.paused_position
+    state.clock_speed = state.speed
+    state.clock_started_at = time.monotonic()
+    state.clock_paused = False
+
+
+async def advance_queue(guild_id: int, finished_song: Dict[str, Any],
+                        expected_state: Optional[GuildState] = None) -> None:
     """Decide what to enqueue next based on loop/skip state, then play."""
-    state = get_state(guild_id)
-    if state.skip_flag:
-        # Manual skip overrides loop: drop the finished song and move on.
-        state.skip_flag = False
-    elif state.loop_mode == "song":
-        finished_song["local_file"] = None  # temp file already cleaned up
-        state.queue.insert(0, finished_song)
-    elif state.loop_mode == "queue":
-        finished_song["local_file"] = None
-        state.queue.append(finished_song)
+    if expected_state is not None:
+        if guild_states.get(guild_id) is not expected_state:
+            return
+        state = expected_state  # avoid get_state() resurrecting a dropped guild
+    else:
+        state = get_state(guild_id)
+    async with state.lock:
+        if guild_states.get(guild_id) is not state:
+            return
+        if state.skip_flag:
+            # Manual skip overrides loop: drop the finished song and move on.
+            state.skip_flag = False
+        elif state.loop_mode == "song":
+            finished_song["local_file"] = None  # temp file already cleaned up
+            state.queue.insert(0, finished_song)
+        elif state.loop_mode == "queue":
+            finished_song["local_file"] = None
+            state.queue.append(finished_song)
     await play_next(guild_id)
 
 
 async def play_next(guild_id: int, announce: bool = True) -> None:
     state = get_state(guild_id)
-    vc = state.voice_client
+    await _play_next(guild_id, state, announce)
 
-    if not vc or not vc.is_connected():
-        return
 
-    cancel_idle_task(guild_id)
+async def _play_next(guild_id: int, state: GuildState, announce: bool = True) -> None:
+    """Pop and play the next queued song, draining the queue on failure.
 
-    while state.queue:
-        song = state.queue.pop(0)
-        state.current_song = song
-        logger.info(f"Playing: {song['title']}")
+    The lock is released while a download is in flight, so a concurrent
+    /play for the same guild doesn't block on someone else's up-to-
+    DOWNLOAD_TIMEOUT download. `state.dispatching` fills the gap that leaves:
+    it marks "a song has been popped and is being started" so a second
+    concurrent call can't also pop before the first has actually called
+    vc.play(). Every invariant that could change while unlocked is
+    re-checked after each re-acquire.
+    """
+    async with state.lock:
+        if guild_states.get(guild_id) is not state:
+            return
+        vc = state.voice_client
+        if not vc or not vc.is_connected():
+            return
+        if vc.is_playing() or vc.is_paused():
+            return
+        if state.dispatching:
+            # Another play_next call for this guild already popped a song and
+            # is downloading/starting it; let it finish instead of racing to
+            # pop a second one.
+            return
+        cancel_idle_task(guild_id)
+
+    while True:
+        async with state.lock:
+            if guild_states.get(guild_id) is not state:
+                return
+            if not state.queue:
+                # Queue drained (empty from the start, or every remaining
+                # song failed).
+                state.current_song = None
+                cancel_np_updater(state)
+                state.np_message = None
+                logger.info(f"Queue empty, scheduling disconnect in {IDLE_TIMEOUT}s")
+                cancel_idle_task(guild_id)
+                state.idle_task = asyncio.create_task(schedule_disconnect(guild_id))
+                return
+            song = state.queue.pop(0)
+            state.current_song = song
+            state.sound_used = False
+            state.dispatching = True
+            logger.info(f"Playing: {song['title']}")
 
         # Capture the running loop so the threaded `after` callback can hop back.
         loop = asyncio.get_running_loop()
@@ -218,43 +316,65 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
         def after_play(error, song=song):
             if error:
                 logger.error(f"Play error: {error}")
-            local_file = song.get("local_file")
-            if local_file and os.path.exists(local_file):
-                try:
-                    os.remove(local_file)
-                    song["local_file"] = None
-                    logger.info(f"Cleaned up temp file: {local_file}")
-                except Exception as e:
-                    logger.warning(f"Failed to remove temp file: {e}")
-            if not state.is_playing_sound:
-                asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), loop)
+            cleanup_download(song.get("local_file"))
+            song["local_file"] = None
+            if not state.is_playing_sound and guild_states.get(guild_id) is state:
+                asyncio.run_coroutine_threadsafe(
+                    advance_queue(guild_id, song, expected_state=state), loop
+                )
 
         try:
             if song.get("needs_local") and not song.get("local_file"):
+                fut = loop.run_in_executor(None, download_audio, song["url"])
                 try:
+                    # shield: wait_for cancels its argument before raising, so
+                    # without it `fut` would already be cancelled below and the
+                    # late-cleanup callback could never see the finished path.
                     local_file = await asyncio.wait_for(
-                        loop.run_in_executor(None, download_audio, song["url"]),
-                        timeout=DOWNLOAD_TIMEOUT,
+                        asyncio.shield(fut), timeout=DOWNLOAD_TIMEOUT
                     )
                 except asyncio.TimeoutError:
                     logger.error(f"Download timed out after {DOWNLOAD_TIMEOUT}s, skipping: {song['title']}")
-                    await notify_skip(guild_id, song, "読み込みタイムアウト")
+                    fut.add_done_callback(_cleanup_late_download)
+                    await notify_skip(guild_id, song, "読み込みタイムアウト", expected_state=state)
+                    state.dispatching = False
                     continue
                 if not local_file:
                     logger.error("Failed to download audio")
-                    await notify_skip(guild_id, song, "読み込み失敗")
+                    await notify_skip(guild_id, song, "読み込み失敗", expected_state=state)
+                    state.dispatching = False
                     continue
                 song["local_file"] = local_file
 
-            # A fresh FFmpeg process starts at loops=0; reset the seek bookkeeping.
-            state.seek_position = 0.0
-            state.loops_at_swap = 0
-            state.speed_at_swap = state.speed
-            source = make_audio_source(song, state, seek=0.0)
-            vc.play(source, after=after_play)
+            async with state.lock:
+                # The lock was released for the download (if any); /stop, an
+                # external VC disconnect, or another dispatcher racing us
+                # (see `dispatching` above) may have changed things since.
+                # Recheck every invariant before touching the voice client.
+                if (guild_states.get(guild_id) is not state
+                        or state.voice_client is not vc or not vc.is_connected()
+                        or vc.is_playing() or vc.is_paused()):
+                    cleanup_download(song.get("local_file"))
+                    song["local_file"] = None
+                    state.dispatching = False
+                    return
+
+                # A fresh FFmpeg process starts at loops=0; reset the seek bookkeeping.
+                state.seek_position = 0.0
+                state.loops_at_swap = 0
+                state.speed_at_swap = state.speed
+                source = make_audio_source(song, state, seek=0.0)
+                vc.play(source, after=after_play)
+                state.clock_base = 0.0
+                state.clock_speed = state.speed
+                state.clock_started_at = time.monotonic()
+                state.clock_paused = False
+                state.paused_position = 0.0
+                state.dispatching = False
         except Exception as e:
             logger.error(f"Play failed: {e}")
-            await notify_skip(guild_id, song, "再生エラー")
+            await notify_skip(guild_id, song, "再生エラー", expected_state=state)
+            state.dispatching = False
             continue
 
         # Only announce/save the Now Playing message once vc.play() succeeded,
@@ -263,18 +383,17 @@ async def play_next(guild_id: int, announce: bool = True) -> None:
             await announce_now_playing(guild_id)
         return
 
-    # Queue drained (empty from the start, or every remaining song failed).
-    state.current_song = None
-    cancel_np_updater(state)
-    state.np_message = None
-    logger.info(f"Queue empty, scheduling disconnect in {IDLE_TIMEOUT}s")
-    cancel_idle_task(guild_id)
-    state.idle_task = asyncio.create_task(schedule_disconnect(guild_id))
 
-
-async def restart_song(guild_id: int) -> None:
+async def restart_song(guild_id: int, expected_state: Optional[GuildState] = None) -> None:
     await asyncio.sleep(0.3)
-    state = get_state(guild_id)
+    # expected_state is always passed by our only callers (play_sound_effect);
+    # look the state up via guild_states.get (never get_state) so a callback
+    # racing a cleanup_guild_state() can't resurrect a dropped GuildState.
+    state = guild_states.get(guild_id)
+    if state is None:
+        return
+    if expected_state is not None and state is not expected_state:
+        return
     vc = state.voice_client
 
     song = state.current_song
@@ -296,16 +415,13 @@ async def restart_song(guild_id: int) -> None:
         if error:
             logger.error(f"Restart error: {error}")
         state.is_playing_sound = False
-        local_file = song.get("local_file")
-        if local_file and os.path.exists(local_file):
-            try:
-                os.remove(local_file)
-                song["local_file"] = None
-                logger.info(f"Cleaned up temp file: {local_file}")
-            except Exception as e:
-                logger.warning(f"Failed to remove temp file: {e}")
+        cleanup_download(song.get("local_file"))
+        song["local_file"] = None
         # The song is done (finished or skipped) — advance the queue.
-        asyncio.run_coroutine_threadsafe(advance_queue(guild_id, song), loop)
+        if guild_states.get(guild_id) is state:
+            asyncio.run_coroutine_threadsafe(
+                advance_queue(guild_id, song, expected_state=state), loop
+            )
 
     # A skip requested during the sound effect should move on, not replay the song.
     if state.skip_flag:
@@ -318,22 +434,39 @@ async def restart_song(guild_id: int) -> None:
 
     try:
         if song.get("needs_local") and not song.get("local_file"):
+            fut = loop.run_in_executor(None, download_audio, song["url"])
             try:
+                # shield: see the matching call in _play_next.
                 local_file = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(
-                        None, download_audio, song["url"]
-                    ),
-                    timeout=DOWNLOAD_TIMEOUT,
+                    asyncio.shield(fut), timeout=DOWNLOAD_TIMEOUT
                 )
             except asyncio.TimeoutError:
                 logger.error(f"Download timed out after {DOWNLOAD_TIMEOUT}s during restart: {song['title']}")
+                fut.add_done_callback(_cleanup_late_download)
+                # A failed resume is a forced skip, not a normal end-of-song:
+                # set skip_flag first so advance_queue won't reinsert this
+                # song under loop_mode="song"/"queue" and retry the same
+                # dead download forever.
                 state.is_playing_sound = False
+                state.skip_flag = True
+                await notify_skip(guild_id, song, "読み込みタイムアウト", expected_state=state)
+                await advance_queue(guild_id, song, expected_state=state)
                 return
             if not local_file:
                 logger.error("Failed to download audio for restart")
                 state.is_playing_sound = False
+                state.skip_flag = True
+                await notify_skip(guild_id, song, "読み込み失敗", expected_state=state)
+                await advance_queue(guild_id, song, expected_state=state)
                 return
             song["local_file"] = local_file
+
+        if (guild_states.get(guild_id) is not state
+                or state.voice_client is not vc or not vc.is_connected()):
+            cleanup_download(song.get("local_file"))
+            song["local_file"] = None
+            state.is_playing_sound = False
+            return
 
         # Resume from where the sound effect interrupted, keeping speed/pitch.
         state.seek_position = seek
@@ -341,9 +474,18 @@ async def restart_song(guild_id: int) -> None:
         state.speed_at_swap = state.speed
         source = make_audio_source(song, state, seek=seek)
         vc.play(source, after=finish)
+        state.is_playing_sound = False
+        state.clock_base = seek
+        state.clock_speed = state.speed
+        state.clock_started_at = time.monotonic()
+        state.clock_paused = False
+        state.paused_position = seek
     except Exception as e:
         logger.error(f"Failed to restart song: {e}")
         state.is_playing_sound = False
+        state.skip_flag = True  # forced skip: don't let advance_queue re-loop this song
+        await notify_skip(guild_id, song, "再開失敗", expected_state=state)
+        await advance_queue(guild_id, song, expected_state=state)
 
 
 def play_sound_effect(guild_id: int, sound_path: str) -> bool:
@@ -359,17 +501,23 @@ def play_sound_effect(guild_id: int, sound_path: str) -> bool:
         return False
     if state.is_playing_sound:
         return False
+    if state.sound_used:
+        return False
 
     loop = asyncio.get_running_loop()
     state.resume_position = current_elapsed(vc, state)  # resume here after the effect
     state.is_playing_sound = True
+    state.sound_used = True
     vc.stop()
 
     def after_sound(error):
         if error:
             logger.error(f"Sound effect error: {error}")
         try:
-            asyncio.run_coroutine_threadsafe(restart_song(guild_id), loop)
+            if guild_states.get(guild_id) is state:
+                asyncio.run_coroutine_threadsafe(
+                    restart_song(guild_id, expected_state=state), loop
+                )
         except Exception as e:
             logger.error(f"Failed to schedule restart: {e}")
             state.is_playing_sound = False
@@ -383,5 +531,10 @@ def play_sound_effect(guild_id: int, sound_path: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"Failed to play sound: {e}")
-        state.is_playing_sound = False
+        # The original song has already been stopped; use the same recovery
+        # path as a normally finished sound effect.
+        if guild_states.get(guild_id) is state:
+            asyncio.run_coroutine_threadsafe(
+                restart_song(guild_id, expected_state=state), loop
+            )
         return False

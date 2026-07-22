@@ -53,6 +53,8 @@ IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
 # Max seconds to wait for a single audio download before giving up, so a stalled
 # fetch can't wedge the queue. Also passed to yt-dlp as socket_timeout (capped).
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "120"))
+MAX_TRACK_DURATION = int(os.getenv("MAX_TRACK_DURATION", "14400"))
+MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))
 
 # How often (seconds) to edit the now-playing embed so the progress bar advances.
 NP_UPDATE_INTERVAL = 10

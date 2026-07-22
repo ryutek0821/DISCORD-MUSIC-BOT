@@ -1,4 +1,5 @@
 """Pure formatting/parsing helpers (no package or discord dependencies)."""
+import math
 from typing import Optional
 
 
@@ -19,11 +20,14 @@ def parse_time(value: str) -> Optional[float]:
         if ":" in value:
             parts = [float(p) for p in value.split(":")]
             if len(parts) == 2:
-                return parts[0] * 60 + parts[1]
+                result = parts[0] * 60 + parts[1]
+                return result if math.isfinite(result) else None
             if len(parts) == 3:
-                return parts[0] * 3600 + parts[1] * 60 + parts[2]
+                result = parts[0] * 3600 + parts[1] * 60 + parts[2]
+                return result if math.isfinite(result) else None
             return None
-        return float(value)
+        result = float(value)
+        return result if math.isfinite(result) else None
     except ValueError:
         return None
 
