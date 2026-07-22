@@ -188,7 +188,7 @@ class MusicCog(commands.Cog):
             if started is song:
                 embed = create_now_playing_embed(started, elapsed=0.0, state=state)
                 state.np_message = await interaction.followup.send(
-                    embed=embed, view=MusicControls()
+                    embed=embed, view=MusicControls(), wait=True
                 )
                 start_np_updater(interaction.guild.id)
             elif vc.is_playing() or vc.is_paused():

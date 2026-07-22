@@ -195,6 +195,28 @@ def test_cog_registration():
     assert names == expected, (expected - names, names - expected)
 
 
+def test_initial_now_playing_message_waits_for_response():
+    """The first /play followup must return the Message used by its updater."""
+    import ast
+    import inspect
+    import textwrap
+
+    from inmermusic.cog import MusicCog
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(MusicCog.play.callback)))
+    assignment = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Attribute) and target.attr == "np_message"
+                for target in node.targets)
+    )
+    assert isinstance(assignment.value, ast.Await)
+    call = assignment.value.value
+    wait = next((kw for kw in call.keywords if kw.arg == "wait"), None)
+    assert wait is not None and isinstance(wait.value, ast.Constant)
+    assert wait.value.value is True
+
+
 def test_move_queue_item():
     from inmermusic.state import move_queue_item
     q = ["a", "b", "c", "d"]
@@ -680,6 +702,12 @@ def test_friendly_extract_error():
         "動画が削除・非公開のため見つかりません。"
     assert f("HTTP Error 504: Connection timed out") == \
         "ネットワークエラーです。時間をおいて再試行してください。"
+    # "webpage" and "API page" contain the letters "age", but are not
+    # evidence of an age restriction.
+    assert f("Unable to download webpage: HTTP Error 500") == \
+        "ネットワークエラーです。時間をおいて再試行してください。"
+    assert f("Unable to extract API page") == \
+        "取得に失敗しました。URLやキーワードを確認してください。"
     assert f("some completely different failure") == \
         "取得に失敗しました。URLやキーワードを確認してください。"
 
