@@ -37,7 +37,8 @@ def friendly_extract_error(message: str) -> str:
     m = message.lower()
     if any(k in m for k in ("private", "login", "sign in", "members-only", "cookies")):
         return "ログインが必要な動画のため再生できません。"
-    if "age" in m or "confirm your age" in m:
+    if any(k in m for k in (
+            "age-restricted", "age restricted", "age verification", "confirm your age")):
         return "年齢制限付きの動画のため再生できません。"
     if any(k in m for k in ("geo", "not available in your country", "region")):
         return "地域制限により再生できません。"
