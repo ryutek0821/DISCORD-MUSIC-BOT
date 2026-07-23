@@ -6,6 +6,7 @@ rather than importing the value by name.
 """
 import os
 import logging
+import tempfile
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -47,13 +48,25 @@ logger = logging.getLogger("niconico-bot")
 
 COOKIE_TTL = int(os.getenv("COOKIE_TTL", "3600"))
 
+# Store downloaded audio on real disk by default instead of RAM-backed /tmp.
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/var/tmp/inmermusic")
+try:
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    with tempfile.TemporaryFile(dir=DOWNLOAD_DIR):
+        pass
+except OSError as e:
+    fallback_dir = tempfile.gettempdir()
+    logger.warning(f"Download directory {DOWNLOAD_DIR} is unavailable; "
+                   f"falling back to {fallback_dir}: {e}")
+    DOWNLOAD_DIR = fallback_dir
+
 # Idle disconnect timeout (seconds) configurable via env
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
 
 # Max seconds to wait for a single audio download before giving up, so a stalled
 # fetch can't wedge the queue. Also passed to yt-dlp as socket_timeout (capped).
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "120"))
-MAX_TRACK_DURATION = int(os.getenv("MAX_TRACK_DURATION", "14400"))
+MAX_TRACK_DURATION = int(os.getenv("MAX_TRACK_DURATION", "1800"))
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))
 
 # How often (seconds) to edit the now-playing embed so the progress bar advances.

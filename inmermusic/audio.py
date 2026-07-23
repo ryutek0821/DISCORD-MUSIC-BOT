@@ -171,7 +171,7 @@ def download_audio(url: str) -> Optional[str]:
     and remove the whole directory once the download eventually finishes —
     see `cleanup_download` and the callers in playback.py.
     """
-    tmpdir = tempfile.mkdtemp(prefix="dl_", dir=tempfile.gettempdir())
+    tmpdir = tempfile.mkdtemp(prefix="dl_", dir=config.DOWNLOAD_DIR)
     output_template = os.path.join(tmpdir, "%(id)s.%(ext)s")
 
     # socket_timeout caps individual network reads so a dead connection raises
@@ -220,7 +220,7 @@ def cleanup_temp_files(max_age: float = 3600) -> int:
     removed.
     """
     removed = 0
-    tmpdir = tempfile.gettempdir()
+    tmpdir = config.DOWNLOAD_DIR
     now = time.time()
     try:
         names = os.listdir(tmpdir)

@@ -135,12 +135,12 @@ def test_cleanup_temp_files():
             f.write("x")
     past = time.time() - 7200  # 2h old, past the 1h threshold
     os.utime(old, (past, past))
-    original = audio.tempfile.gettempdir
+    original = config.DOWNLOAD_DIR
     try:
-        audio.tempfile.gettempdir = lambda: d
+        config.DOWNLOAD_DIR = d
         removed = audio.cleanup_temp_files(max_age=3600)
     finally:
-        audio.tempfile.gettempdir = original
+        config.DOWNLOAD_DIR = original
     assert removed == 1
     assert not os.path.exists(old)       # aged dl_* removed
     assert os.path.exists(recent)        # fresh dl_* kept
@@ -148,6 +148,63 @@ def test_cleanup_temp_files():
     for p in (recent, keep):
         os.remove(p)
     os.rmdir(d)
+
+
+def test_download_and_cleanup_share_configured_directory():
+    import tempfile as _tempfile
+    import time as _time
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.output_template = opts["outtmpl"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download=True):
+            filename = self.output_template.replace("%(id)s", "track").replace(
+                "%(ext)s", "m4a")
+            with open(filename, "w") as f:
+                f.write("audio")
+            return {"id": "track", "ext": "m4a"}
+
+        def prepare_filename(self, info):
+            return self.output_template.replace("%(id)s", info["id"]).replace(
+                "%(ext)s", info["ext"])
+
+    d = _tempfile.mkdtemp()
+    original_download_dir = config.DOWNLOAD_DIR
+    original_ydl = audio.yt_dlp.YoutubeDL
+    original_cookie_file = config.COOKIE_FILE
+    config.DOWNLOAD_DIR = d
+    audio.yt_dlp.YoutubeDL = FakeYDL
+    config.COOKIE_FILE = None
+    try:
+        path = audio.download_audio("https://example.com/video")
+        assert path is not None
+        assert os.path.dirname(os.path.dirname(path)) == d
+        parent = os.path.dirname(path)
+        past = _time.time() - 7200
+        os.utime(parent, (past, past))
+        removed = audio.cleanup_temp_files(max_age=3600)
+        assert removed == 1
+        assert not os.path.exists(parent)
+    finally:
+        config.DOWNLOAD_DIR = original_download_dir
+        audio.yt_dlp.YoutubeDL = original_ydl
+        config.COOKIE_FILE = original_cookie_file
+        if os.path.isdir(d):
+            for name in os.listdir(d):
+                child = os.path.join(d, name)
+                if os.path.isdir(child):
+                    import shutil
+                    shutil.rmtree(child)
+                else:
+                    os.remove(child)
+            os.rmdir(d)
 
 
 def test_preset_integrity():
@@ -537,7 +594,7 @@ def test_restart_song_download_failure_resets_flag_and_skips_reinsert():
     original_download = playback.download_audio
     original_notify_skip = playback.notify_skip
     original_play_next = playback.play_next
-    playback.download_audio = lambda url: None  # simulates a failed download
+    playback.download_audio = lambda url, guild_id=None: None  # failed download
     playback.notify_skip = fake_notify_skip
     playback.play_next = fake_play_next
 
@@ -609,10 +666,10 @@ def test_download_audio_removes_temp_dir_on_failure():
             raise RuntimeError("boom")
 
     d = _tempfile.mkdtemp()
-    original_gettempdir = audio.tempfile.gettempdir
+    original_download_dir = config.DOWNLOAD_DIR
     original_ydl = audio.yt_dlp.YoutubeDL
     original_cookie_file = config.COOKIE_FILE
-    audio.tempfile.gettempdir = lambda: d
+    config.DOWNLOAD_DIR = d
     audio.yt_dlp.YoutubeDL = FakeYDL
     config.COOKIE_FILE = None  # avoid touching the real cookie file path
     try:
@@ -621,7 +678,7 @@ def test_download_audio_removes_temp_dir_on_failure():
         leftovers = [n for n in os.listdir(d) if n.startswith("dl_")]
         assert leftovers == []
     finally:
-        audio.tempfile.gettempdir = original_gettempdir
+        config.DOWNLOAD_DIR = original_download_dir
         audio.yt_dlp.YoutubeDL = original_ydl
         config.COOKIE_FILE = original_cookie_file
         os.rmdir(d)
@@ -644,7 +701,7 @@ def test_cleanup_late_download_removes_dir_after_timeout():
     guild_id = 900106
     made = {}
 
-    def slow_download(url):
+    def slow_download(url, guild_id=None):
         d = _tempfile.mkdtemp(prefix="dl_")
         made["dir"] = d
         path = os.path.join(d, "video.m4a")
