@@ -1,12 +1,13 @@
-"""niconico login + Netscape cookie persistence.
+"""niconico login, guild session storage, and Netscape cookie persistence.
 
 COOKIE_FILE is read via ``config.COOKIE_FILE`` so tests can monkeypatch it.
 """
 import os
+import sqlite3
 import tempfile
 import threading
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -44,14 +45,20 @@ def login_via_api() -> requests.cookies.RequestsCookieJar:
     return session.cookies
 
 
-def write_netscape_cookies(records: List[Dict[str, Any]]) -> int:
-    """Atomically write cookie records to COOKIE_FILE in Netscape format.
+def write_netscape_cookies(records: List[Dict[str, Any]],
+                           output_path: Optional[str] = None) -> int:
+    """Atomically write cookie records to a Netscape-format cookie file.
 
     Each record needs name/value plus optional domain/path/secure/expiry. Writes
     go through a temp file + os.replace (atomic on POSIX) under cookie_file_lock,
     so a concurrent yt-dlp read or another writer never sees a half-written file.
+    output_path defaults to config.COOKIE_FILE for backward compatibility.
     Returns the number of cookies written.
     """
+    target_path = output_path if output_path is not None else config.COOKIE_FILE
+    if not target_path:
+        raise ValueError("Cookie file path is not configured")
+
     lines = ["# Netscape HTTP Cookie File\n"]
     for r in records:
         domain = r.get("domain") or ".nicovideo.jp"
@@ -62,19 +69,115 @@ def write_netscape_cookies(records: List[Dict[str, Any]]) -> int:
         expiry = str(int(r["expiry"])) if r.get("expiry") else "0"
         lines.append(f"{domain}\tTRUE\t{path}\t{secure}\t{expiry}\t{r['name']}\t{r['value']}\n")
 
-    target_dir = os.path.dirname(os.path.abspath(config.COOKIE_FILE))
+    target_dir = os.path.dirname(os.path.abspath(target_path))
     with cookie_file_lock:
         fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix=".cookies_", suffix=".tmp")
         try:
             with os.fdopen(fd, "w") as f:
                 f.writelines(lines)
             os.chmod(tmp_path, 0o600)
-            os.replace(tmp_path, config.COOKIE_FILE)
+            os.replace(tmp_path, target_path)
         except Exception:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             raise
     return len(records)
+
+
+def _guild_db_path() -> str:
+    return os.path.join(config.STATE_DIR, "guilds.db")
+
+
+def _connect_guild_db() -> sqlite3.Connection:
+    os.makedirs(config.STATE_DIR, mode=0o700, exist_ok=True)
+    os.chmod(config.STATE_DIR, 0o700)
+    path = _guild_db_path()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    os.close(fd)
+    os.chmod(path, 0o600)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS guild_sessions ("
+            "guild_id INTEGER PRIMARY KEY, "
+            "user_session TEXT NOT NULL, "
+            "updated_at INTEGER NOT NULL)"
+        )
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def set_guild_session(guild_id: int, user_session: str) -> None:
+    conn = _connect_guild_db()
+    try:
+        conn.execute(
+            "INSERT INTO guild_sessions (guild_id, user_session, updated_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET "
+            "user_session = excluded.user_session, "
+            "updated_at = excluded.updated_at",
+            (guild_id, user_session, int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_guild_session(guild_id: int) -> Optional[str]:
+    try:
+        conn = _connect_guild_db()
+    except (OSError, sqlite3.Error) as e:
+        logger.warning(f"Guild session store is unavailable: {e}")
+        return None
+    try:
+        row = conn.execute(
+            "SELECT user_session FROM guild_sessions WHERE guild_id = ?",
+            (guild_id,),
+        ).fetchone()
+        return row[0] if row else None
+    except sqlite3.Error as e:
+        logger.warning(f"Failed to read guild session: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def delete_guild_session(guild_id: int) -> None:
+    conn = _connect_guild_db()
+    try:
+        conn.execute(
+            "DELETE FROM guild_sessions WHERE guild_id = ?",
+            (guild_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    cookie_path = os.path.join(config.STATE_DIR, f"cookies_{guild_id}.txt")
+    with cookie_file_lock:
+        try:
+            os.remove(cookie_path)
+        except FileNotFoundError:
+            pass
+
+
+def guild_cookie_file(guild_id: int) -> Optional[str]:
+    user_session = get_guild_session(guild_id)
+    if user_session is None:
+        return None
+    path = os.path.join(config.STATE_DIR, f"cookies_{guild_id}.txt")
+    write_netscape_cookies(
+        [{
+            "domain": ".nicovideo.jp",
+            "path": "/",
+            "secure": True,
+            "name": "user_session",
+            "value": user_session,
+        }],
+        output_path=path,
+    )
+    return path
 
 
 def save_session_cookies(cookies: requests.cookies.RequestsCookieJar) -> None:

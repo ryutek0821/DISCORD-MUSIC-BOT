@@ -107,7 +107,8 @@ class MusicCog(commands.Cog):
         loop = asyncio.get_running_loop()
         try:
             song = await asyncio.wait_for(
-                loop.run_in_executor(None, extract_audio_url, query),
+                loop.run_in_executor(
+                    None, extract_audio_url, query, interaction.guild.id),
                 timeout=60
             )
         except asyncio.TimeoutError:

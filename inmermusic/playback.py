@@ -325,7 +325,8 @@ async def _play_next(guild_id: int, state: GuildState, announce: bool = True) ->
 
         try:
             if song.get("needs_local") and not song.get("local_file"):
-                fut = loop.run_in_executor(None, download_audio, song["url"])
+                fut = loop.run_in_executor(
+                    None, download_audio, song["url"], guild_id)
                 try:
                     # shield: wait_for cancels its argument before raising, so
                     # without it `fut` would already be cancelled below and the
@@ -434,7 +435,8 @@ async def restart_song(guild_id: int, expected_state: Optional[GuildState] = Non
 
     try:
         if song.get("needs_local") and not song.get("local_file"):
-            fut = loop.run_in_executor(None, download_audio, song["url"])
+            fut = loop.run_in_executor(
+                None, download_audio, song["url"], guild_id)
             try:
                 # shield: see the matching call in _play_next.
                 local_file = await asyncio.wait_for(

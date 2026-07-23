@@ -48,6 +48,27 @@ logger = logging.getLogger("niconico-bot")
 
 COOKIE_TTL = int(os.getenv("COOKIE_TTL", "3600"))
 
+# Guild credentials must survive rsync --delete deployments, so keep them
+# outside the repository in the user's XDG data directory.
+_DEFAULT_STATE_DIR = os.path.abspath(
+    os.path.expanduser("~/.local/share/inmermusic"))
+STATE_DIR = os.path.abspath(os.path.expanduser(
+    os.getenv("STATE_DIR", _DEFAULT_STATE_DIR)))
+try:
+    repo_path = os.path.realpath(_REPO_ROOT)
+    if os.path.commonpath([repo_path, os.path.realpath(STATE_DIR)]) == repo_path:
+        logger.warning(f"State directory {STATE_DIR} is inside the repository; "
+                       f"using {_DEFAULT_STATE_DIR} instead")
+        STATE_DIR = _DEFAULT_STATE_DIR
+except ValueError:
+    pass
+try:
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+except OSError as e:
+    logger.warning(f"State directory {STATE_DIR} is unavailable; "
+                   f"guild sessions will not be persisted: {e}")
+
 # Store downloaded audio on real disk by default instead of RAM-backed /tmp.
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/var/tmp/inmermusic")
 try:

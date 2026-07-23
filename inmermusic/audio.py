@@ -14,11 +14,13 @@ from . import config
 from .config import (DOWNLOAD_TIMEOUT, EFFECT_FILTERS, MAX_TRACK_DURATION,
                      NICO_EMAIL, NICO_PASSWORD,
                      SOURCE_CLEANUP_DELAY, YT_PROXY, logger)
-from .cookies import ensure_cookie_file, refresh_nico_cookies_sync
+from .cookies import (ensure_cookie_file, get_guild_session, guild_cookie_file,
+                      refresh_nico_cookies_sync)
 from .state import GuildState
 
 
-def build_ydl_opts(url: str, **overrides: Any) -> Dict[str, Any]:
+def build_ydl_opts(url: str, guild_id: Optional[int] = None,
+                   **overrides: Any) -> Dict[str, Any]:
     """Build yt-dlp options, enabling niconico login + cookie persistence."""
     ydl_opts: Dict[str, Any] = {
         "format": "bestaudio[ext=opus]/bestaudio[ext=m4a]/bestaudio[ext=aac]/bestaudio/best",
@@ -32,8 +34,12 @@ def build_ydl_opts(url: str, **overrides: Any) -> Dict[str, Any]:
     ydl_opts.update(overrides)
 
     is_niconico = _is_niconico_url(url)
+    guild_cookie = (guild_cookie_file(guild_id)
+                    if is_niconico and guild_id is not None else None)
 
-    if config.COOKIE_FILE:
+    if guild_cookie:
+        ydl_opts["cookiefile"] = guild_cookie
+    elif config.COOKIE_FILE:
         ensure_cookie_file()
         if os.path.exists(config.COOKIE_FILE):
             ydl_opts["cookiefile"] = config.COOKIE_FILE
@@ -41,7 +47,7 @@ def build_ydl_opts(url: str, **overrides: Any) -> Dict[str, Any]:
     # Let yt-dlp perform the login itself using the current niconico flow.
     # It reuses the cached user_session cookie when present and saves fresh
     # cookies back to COOKIE_FILE on close.
-    if is_niconico and NICO_EMAIL and NICO_PASSWORD:
+    if is_niconico and not guild_cookie and NICO_EMAIL and NICO_PASSWORD:
         ydl_opts["username"] = NICO_EMAIL
         ydl_opts["password"] = NICO_PASSWORD
 
@@ -78,13 +84,14 @@ def validate_query(query: str) -> None:
         raise ValueError("YouTubeまたはニコニコ動画のURLのみ利用できます")
 
 
-def extract_audio_url(url: str) -> Dict[str, Any]:
+def extract_audio_url(url: str, guild_id: Optional[int] = None) -> Dict[str, Any]:
     """Extract audio stream URL or download for niconico."""
     validate_query(url)
-    if _is_niconico_url(url):
+    if (_is_niconico_url(url)
+            and (guild_id is None or get_guild_session(guild_id) is None)):
         refresh_nico_cookies_sync()
 
-    ydl_opts = build_ydl_opts(url, socket_timeout=10)
+    ydl_opts = build_ydl_opts(url, guild_id=guild_id, socket_timeout=10)
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -159,7 +166,7 @@ def extract_audio_url(url: str) -> Dict[str, Any]:
         raise
 
 
-def download_audio(url: str) -> Optional[str]:
+def download_audio(url: str, guild_id: Optional[int] = None) -> Optional[str]:
     """Download audio to a fresh per-request temp directory and return the path.
 
     Used for niconico and YouTube; for YouTube the request is routed through
@@ -177,7 +184,7 @@ def download_audio(url: str) -> Optional[str]:
     # socket_timeout caps individual network reads so a dead connection raises
     # instead of blocking this executor thread forever (the async wait_for in
     # the callers only abandons the await, it can't kill the thread).
-    ydl_opts = build_ydl_opts(url, outtmpl=output_template,
+    ydl_opts = build_ydl_opts(url, guild_id=guild_id, outtmpl=output_template,
                               socket_timeout=min(30, DOWNLOAD_TIMEOUT))
 
     try:

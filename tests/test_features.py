@@ -123,6 +123,105 @@ def test_write_netscape_cookies():
             os.remove(path)
 
 
+def test_guild_session_round_trip():
+    import shutil
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    original = config.STATE_DIR
+    config.STATE_DIR = d
+    try:
+        assert cookies.get_guild_session(12345) is None
+        cookies.set_guild_session(12345, "session-value")
+        assert cookies.get_guild_session(12345) == "session-value"
+        cookies.delete_guild_session(12345)
+        assert cookies.get_guild_session(12345) is None
+        assert cookies.guild_cookie_file(12345) is None
+        assert (os.stat(os.path.join(d, "guilds.db")).st_mode & 0o777) == 0o600
+    finally:
+        config.STATE_DIR = original
+        shutil.rmtree(d)
+
+
+def test_guild_cookie_file_format_and_permissions():
+    import shutil
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    original = config.STATE_DIR
+    config.STATE_DIR = d
+    try:
+        cookies.set_guild_session(23456, "guild-session")
+        path = cookies.guild_cookie_file(23456)
+        assert path == os.path.join(d, "cookies_23456.txt")
+        with open(path) as f:
+            content = f.read()
+        rows = [ln.split("\t") for ln in content.splitlines()
+                if ln and not ln.startswith("#")]
+        assert rows == [[".nicovideo.jp", "TRUE", "/", "TRUE", "0",
+                         "user_session", "guild-session"]]
+        assert (os.stat(path).st_mode & 0o777) == 0o600
+    finally:
+        config.STATE_DIR = original
+        shutil.rmtree(d)
+
+
+def test_unregistered_guild_uses_global_nico_credentials():
+    import shutil
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    original_cookie_file = config.COOKIE_FILE
+    original_email = audio.NICO_EMAIL
+    original_password = audio.NICO_PASSWORD
+    config.STATE_DIR = d
+    config.COOKIE_FILE = os.path.join(d, "global-cookies.txt")
+    audio.NICO_EMAIL = "global@example.com"
+    audio.NICO_PASSWORD = "global-password"
+    try:
+        cookies.set_guild_session(34566, "another-guild-session")
+        opts = audio.build_ydl_opts(
+            "https://www.nicovideo.jp/watch/sm9", guild_id=34567)
+        assert opts["cookiefile"] == config.COOKIE_FILE
+        assert opts["username"] == "global@example.com"
+        assert opts["password"] == "global-password"
+    finally:
+        config.STATE_DIR = original_state_dir
+        config.COOKIE_FILE = original_cookie_file
+        audio.NICO_EMAIL = original_email
+        audio.NICO_PASSWORD = original_password
+        shutil.rmtree(d)
+
+
+def test_registered_guild_omits_nico_username_and_password():
+    import shutil
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    original_cookie_file = config.COOKIE_FILE
+    original_email = audio.NICO_EMAIL
+    original_password = audio.NICO_PASSWORD
+    config.STATE_DIR = d
+    config.COOKIE_FILE = os.path.join(d, "global-cookies.txt")
+    audio.NICO_EMAIL = "global@example.com"
+    audio.NICO_PASSWORD = "global-password"
+    try:
+        cookies.set_guild_session(45678, "private-session")
+        opts = audio.build_ydl_opts(
+            "https://www.nicovideo.jp/watch/sm9", guild_id=45678)
+        assert opts["cookiefile"] == os.path.join(d, "cookies_45678.txt")
+        assert "username" not in opts
+        assert "password" not in opts
+    finally:
+        config.STATE_DIR = original_state_dir
+        config.COOKIE_FILE = original_cookie_file
+        audio.NICO_EMAIL = original_email
+        audio.NICO_PASSWORD = original_password
+        shutil.rmtree(d)
+
+
 def test_cleanup_temp_files():
     import tempfile
     import time
