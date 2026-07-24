@@ -246,6 +246,24 @@ def cancel_prefetch(state: GuildState) -> None:
         task.cancel()
 
 
+def _discard_stale_prefetch_files(
+    state: GuildState, keep: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Keep at most one downloaded queue-head file for this guild.
+
+    A completed prefetch no longer has a live task. If the queue is then
+    shuffled or moved, simply retargeting the task can otherwise leave the
+    old head's file cached while downloading another one.
+    """
+    for queued_song in state.queue:
+        if queued_song is keep:
+            continue
+        path = queued_song.get("local_file")
+        if path:
+            cleanup_download(path)
+            queued_song["local_file"] = None
+
+
 def start_prefetch(guild_id: int) -> None:
     """Download at most the next queued track while the current one plays."""
     state = guild_states.get(guild_id)
@@ -254,6 +272,7 @@ def start_prefetch(guild_id: int) -> None:
             cancel_prefetch(state)
         return
     song = state.queue[0]
+    _discard_stale_prefetch_files(state, keep=song)
     if not song.get("needs_local") or song.get("local_file"):
         cancel_prefetch(state)
         return
@@ -275,11 +294,17 @@ def start_prefetch(guild_id: int) -> None:
                 logger.warning(f"Next-track prefetch failed: {e}")
                 return
             path, _ = _download_parts(result)
+            try:
+                file_size = os.path.getsize(path) if path else 0
+            except OSError:
+                cleanup_download(path)
+                return
             active = guild_states.get(guild_id)
             if (not path or active is not state
                     or (not any(item is target for item in state.queue)
                         and state.current_song is not target)
-                    or (os.path.getsize(path) if os.path.exists(path) else 0) > PREFETCH_MAX_BYTES):
+                    or not os.path.isfile(path)
+                    or file_size > PREFETCH_MAX_BYTES):
                 cleanup_download(path)
                 return
             target["local_file"] = path

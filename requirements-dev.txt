@@ -1,1 +1,2 @@
+# Test-only dependencies. Keep these off the Raspberry Pi runtime image.
 pytest>=9.1.1,<10
