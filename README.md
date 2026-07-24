@@ -22,7 +22,7 @@ Discord でニコニコ動画・YouTube を再生できる Music Bot。
 |----------|------|
 | `/play <URL/キーワード>` | 曲を再生（プレイリストURLは自動判定して一括追加） |
 | `/playlist add <URL> [件数]` | プレイリストを重複除外して一括追加 |
-| `/playlist save/load/list/delete` | 現在のキューを名前付きで保存・管理 |
+| `/playlist save/load/list/delete` | 現在のキューをサーバー共有の名前付きリストとして保存・管理 |
 | `/skip` | 現在の曲をスキップ |
 | `/queue` | キューを10件ずつページ表示、各曲の開始ETAも表示 |
 | `/previous` / `/replay` | 前の曲へ戻る／現在曲を先頭から再生 |

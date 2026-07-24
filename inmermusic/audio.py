@@ -190,6 +190,34 @@ def _canonical_url(info: Dict[str, Any], fallback: str) -> str:
     return fallback
 
 
+def _flat_entry_url(info: Dict[str, Any], source_url: str) -> Optional[str]:
+    """Return a concrete media URL for a flat search/playlist entry.
+
+    Flat yt-dlp entries occasionally contain only an extractor-specific ID.
+    Never fall back to the search or playlist URL itself: doing that can make
+    a malformed row replay the first search result or the wrong playlist item.
+    """
+    for key in ("webpage_url", "url"):
+        value = info.get(key)
+        if isinstance(value, str) and value.startswith(("http://", "https://")):
+            return value
+    video_id = info.get("id")
+    if not video_id:
+        return None
+    extractor = (
+        f"{info.get('extractor_key', '')} {info.get('extractor', '')}"
+    ).lower()
+    if "nico" in extractor or _is_niconico_url(source_url):
+        return f"https://www.nicovideo.jp/watch/{video_id}"
+    if (
+        "youtube" in extractor
+        or source_url.startswith("ytsearch")
+        or "youtu" in (urlparse(source_url).hostname or "")
+    ):
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return None
+
+
 def _song_from_info(info: Dict[str, Any], fallback_url: str,
                     *, require_audio: bool = False) -> Dict[str, Any]:
     audio_url, selected_format = _select_audio_format(info)
@@ -218,6 +246,7 @@ def _song_from_info(info: Dict[str, Any], fallback_url: str,
         "title": info.get("title") or "Unknown",
         "duration": duration,
         "thumbnail": info.get("thumbnail", ""),
+        "uploader": info.get("uploader") or info.get("channel") or "",
         "is_niconico": is_niconico,
         "needs_local": is_niconico or is_youtube,
         "local_file": None,
@@ -270,7 +299,7 @@ def search_candidates(query: str, guild_id: Optional[int] = None,
     validate_query(query)
     if "://" in query:
         return [extract_audio_url(query, guild_id)]
-    count = max(1, min(10, int(limit)))
+    count = max(1, min(25, int(limit)))
     search_url = f"ytsearch{count}:{query.strip()}"
     try:
         info = _extract_info_with_failover(
@@ -281,9 +310,11 @@ def search_candidates(query: str, guild_id: Optional[int] = None,
         for entry in entries[:count]:
             if not isinstance(entry, dict):
                 continue
+            entry_url = _flat_entry_url(entry, search_url)
+            if entry_url is None:
+                continue
             try:
-                songs.append(
-                    _song_from_info(entry, _canonical_url(entry, search_url)))
+                songs.append(_song_from_info(entry, entry_url))
             except ValueError:
                 continue
         return songs
@@ -299,17 +330,28 @@ def extract_playlist(url: str, guild_id: Optional[int] = None,
     if "://" not in url:
         raise ValueError("プレイリストURLを指定してください")
     count = max(1, min(MAX_PLAYLIST_SIZE, int(limit)))
+    is_niconico = _is_niconico_url(url)
+    guild_cookie = (
+        guild_cookie_file(guild_id)
+        if is_niconico and guild_id is not None else None
+    )
+    if is_niconico and not guild_cookie:
+        refresh_nico_cookies_sync()
     try:
         info = _extract_info_with_failover(
             url, guild_id, noplaylist=False, extract_flat="in_playlist",
-            playlistend=count, socket_timeout=10)
+            playlistend=count, socket_timeout=10,
+            _guild_cookie=guild_cookie)
         entries = info.get("entries", []) if isinstance(info, dict) else []
         songs: List[Dict[str, Any]] = []
         for entry in entries[:count]:
             if not isinstance(entry, dict):
                 continue
+            entry_url = _flat_entry_url(entry, url)
+            if entry_url is None:
+                continue
             try:
-                songs.append(_song_from_info(entry, _canonical_url(entry, url)))
+                songs.append(_song_from_info(entry, entry_url))
             except ValueError:
                 continue
         return songs
