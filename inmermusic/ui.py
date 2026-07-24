@@ -78,6 +78,39 @@ def create_queued_embed(song: Dict[str, Any], position: int) -> discord.Embed:
     return embed
 
 
+def create_queue_embed(state: GuildState, *, page: int = 0, page_size: int = 10,
+                       current_remaining: float = 0.0) -> discord.Embed:
+    """Render one queue page with an estimated start time for each track."""
+    total = len(state.queue)
+    page_count = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, page_count - 1))
+    start = page * page_size
+    end = min(total, start + page_size)
+    eta = max(0.0, current_remaining)
+    for song in state.queue[:start]:
+        eta += (song.get("duration") or 0) / max(0.01, state.speed)
+    lines = []
+    for index, song in enumerate(state.queue[start:end], start=start + 1):
+        eta_label = f"・約{fmt_duration(eta)}後" if eta > 0 else ""
+        requester = song.get("requester", "不明")
+        lines.append(
+            f"{index}. **[{song['title']}]({song['url']})** "
+            f"(by {requester}{eta_label})"
+        )
+        eta += (song.get("duration") or 0) / max(0.01, state.speed)
+    embed = discord.Embed(
+        title=f"キュー（{total}曲）",
+        description="\n".join(lines) or "キューは空です。",
+        color=0x00ff00,
+    )
+    total_duration = sum((song.get("duration") or 0) for song in state.queue)
+    footer = f"ページ {page + 1}/{page_count}"
+    if total_duration:
+        footer += f"・合計 {fmt_duration(total_duration / max(0.01, state.speed))}"
+    embed.set_footer(text=footer)
+    return embed
+
+
 def _preset_description(preset: Dict[str, Any]) -> Optional[str]:
     """Short '1.25x / +3半音' hint from a preset's speed/pitch, or None."""
     parts = []
@@ -122,6 +155,16 @@ class MusicControls(discord.ui.View):
                 "現在再生中の曲はありません。", ephemeral=True
             )
             return False
+        state = guild_states[interaction.guild.id]
+        message = getattr(interaction, "message", None)
+        current_message = state.np_message
+        if (current_message is None or message is None
+                or getattr(message, "id", None) != getattr(current_message, "id", None)):
+            await interaction.response.send_message(
+                "この操作パネルは古くなっています。最新の再生パネルを使用してください。",
+                ephemeral=True,
+            )
+            return False
         user_voice = getattr(interaction.user, "voice", None)
         if vc and vc.channel and (not user_voice or user_voice.channel != vc.channel):
             await interaction.response.send_message(
@@ -156,16 +199,14 @@ class MusicControls(discord.ui.View):
         await interaction.response.defer()  # 無言で承認（ポップアップなし）
         from . import playback
         playback.cancel_idle_task(interaction.guild.id)
+        state = guild_states.get(interaction.guild.id)
+        if state:
+            await playback.retire_now_playing(state)
         vc = interaction.guild.voice_client
         if vc:
             vc.stop()
             await vc.disconnect()
-        state = guild_states.get(interaction.guild.id)
-        if state:
-            playback.cancel_np_updater(state)
-            playback.cancel_reapply(state)
-        if interaction.guild.id in guild_states:
-            del guild_states[interaction.guild.id]
+        playback.cleanup_guild_state(interaction.guild.id)
 
     @discord.ui.button(emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="music:loop")
     async def loop(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -174,6 +215,8 @@ class MusicControls(discord.ui.View):
         state = get_state(interaction.guild.id)
         order = {"off": "song", "song": "queue", "queue": "off"}
         state.loop_mode = order.get(state.loop_mode, "off")
+        from . import persistence
+        persistence.update_settings(interaction.guild.id, loop_mode=state.loop_mode)
         await playback.refresh_now_playing(interaction.guild.id)
 
     @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, custom_id="music:shuffle")
@@ -182,6 +225,9 @@ class MusicControls(discord.ui.View):
         state = get_state(interaction.guild.id)
         if len(state.queue) >= 2:
             random.shuffle(state.queue)
+            from . import playback
+            playback.persist_queue(state)
+            playback.start_prefetch(interaction.guild.id)
 
     async def _apply_speed_pitch(self, interaction: discord.Interaction, *,
                                  speed: Optional[float] = None,
@@ -258,3 +304,65 @@ class MusicControls(discord.ui.View):
     )
     async def preset_select(self, interaction: discord.Interaction, select: discord.ui.Select):
         await self._apply_preset(interaction, select.values[0])
+
+
+class QueuePaginationView(discord.ui.View):
+    """Requester-scoped, live queue pagination."""
+
+    def __init__(self, guild_id: int, requester_id: int, page_count: int):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.requester_id = requester_id
+        self.page = 0
+        self.page_count = max(1, page_count)
+        self.message: Optional[discord.Message] = None
+        self._sync_buttons()
+
+    def _sync_buttons(self) -> None:
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.page_count - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "このページ送りはコマンド実行者のみ操作できます。", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+    async def _render(self, interaction: discord.Interaction) -> None:
+        from .audio import current_elapsed
+        state = get_state(self.guild_id)
+        self.page_count = max(1, (len(state.queue) + 9) // 10)
+        self.page = max(0, min(self.page, self.page_count - 1))
+        vc = interaction.guild.voice_client if interaction.guild else None
+        remaining = 0.0
+        if vc and state.current_song and (vc.is_playing() or vc.is_paused()):
+            duration = state.current_song.get("duration") or 0
+            if duration:
+                remaining = max(0.0, duration - current_elapsed(vc, state)) / max(
+                    0.01, state.speed)
+        self._sync_buttons()
+        await interaction.response.edit_message(
+            embed=create_queue_embed(
+                state, page=self.page, current_remaining=remaining),
+            view=self,
+        )
+
+    @discord.ui.button(label="前へ", emoji="◀️", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        await self._render(interaction)
+
+    @discord.ui.button(label="次へ", emoji="▶️", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        await self._render(interaction)
