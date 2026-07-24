@@ -9,3 +9,6 @@ cookies.txt
 .claude/
 .ruff_cache/
 .DS_Store
+# ローカル作業用ディレクトリ（エージェント設定・作業メモ）
+cao-profiles/
+docs/
