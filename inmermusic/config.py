@@ -23,6 +23,14 @@ CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 # googlevideo media URLs are IP-locked to the extractor, so downloads must use
 # the same proxy; that's why YouTube is fetched to a local file like niconico.
 YT_PROXY = os.getenv("YT_PROXY")
+# Comma-separated failover list. Keep YT_PROXY as a backward-compatible
+# single-proxy fallback.
+YT_PROXIES = [
+    value.strip() for value in os.getenv("YT_PROXIES", "").split(",")
+    if value.strip()
+]
+if not YT_PROXIES and YT_PROXY:
+    YT_PROXIES = [YT_PROXY]
 
 # sounds/ lives at the repository root (one level above this package).
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -48,6 +56,27 @@ logger = logging.getLogger("niconico-bot")
 
 COOKIE_TTL = int(os.getenv("COOKIE_TTL", "3600"))
 
+# Guild credentials must survive rsync --delete deployments, so keep them
+# outside the repository in the user's XDG data directory.
+_DEFAULT_STATE_DIR = os.path.abspath(
+    os.path.expanduser("~/.local/share/inmermusic"))
+STATE_DIR = os.path.abspath(os.path.expanduser(
+    os.getenv("STATE_DIR", _DEFAULT_STATE_DIR)))
+try:
+    repo_path = os.path.realpath(_REPO_ROOT)
+    if os.path.commonpath([repo_path, os.path.realpath(STATE_DIR)]) == repo_path:
+        logger.warning(f"State directory {STATE_DIR} is inside the repository; "
+                       f"using {_DEFAULT_STATE_DIR} instead")
+        STATE_DIR = _DEFAULT_STATE_DIR
+except ValueError:
+    pass
+try:
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+except OSError as e:
+    logger.warning(f"State directory {STATE_DIR} is unavailable; "
+                   f"guild sessions will not be persisted: {e}")
+
 # Store downloaded audio on real disk by default instead of RAM-backed /tmp.
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/var/tmp/inmermusic")
 try:
@@ -68,6 +97,12 @@ IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "120"))
 MAX_TRACK_DURATION = int(os.getenv("MAX_TRACK_DURATION", "1800"))
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))
+MAX_PLAYLIST_NAME_LEN = 50
+MAX_PLAYLISTS_PER_GUILD = int(os.getenv("MAX_PLAYLISTS_PER_GUILD", "25"))
+MAX_PLAYLIST_SIZE = int(os.getenv("MAX_PLAYLIST_SIZE", "50"))
+# Prefetch is deliberately bounded to one queued track per guild. Reject an
+# unexpectedly large file instead of allowing a single guild to fill the disk.
+PREFETCH_MAX_BYTES = int(os.getenv("PREFETCH_MAX_BYTES", str(256 * 1024 * 1024)))
 
 # How often (seconds) to edit the now-playing embed so the progress bar advances.
 NP_UPDATE_INTERVAL = 10
