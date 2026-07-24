@@ -60,14 +60,19 @@ class SearchResultView(discord.ui.View):
         self.candidates = candidates
         self.requester_id = requester_id
         self.message = None
-        options = [
-            discord.SelectOption(
-                label=song.get("title", "Unknown")[:100],
+        options = []
+        for index, song in enumerate(candidates):
+            details = []
+            if song.get("uploader"):
+                details.append(str(song["uploader"]))
+            if song.get("duration"):
+                details.append(fmt_duration(song["duration"]))
+            description = "・".join(details)[:100] or None
+            options.append(discord.SelectOption(
+                label=str(song.get("title") or "Unknown")[:100],
                 value=str(index),
-                description=fmt_duration(song.get("duration") or 0)[:100],
-            )
-            for index, song in enumerate(candidates)
-        ]
+                description=description,
+            ))
         self.selector = discord.ui.Select(
             placeholder="再生する曲を選択", options=options,
             min_values=1, max_values=1,

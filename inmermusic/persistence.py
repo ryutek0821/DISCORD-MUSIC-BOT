@@ -12,7 +12,7 @@ from .config import IDLE_TIMEOUT, logger
 _db_lock = threading.RLock()
 _SONG_FIELDS = {
     "url", "title", "duration", "thumbnail", "is_niconico", "needs_local",
-    "text_channel_id", "requester", "requester_id",
+    "uploader", "text_channel_id", "requester", "requester_id",
 }
 
 

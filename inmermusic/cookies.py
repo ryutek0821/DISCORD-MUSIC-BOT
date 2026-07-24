@@ -110,8 +110,10 @@ def _connect_guild_db() -> sqlite3.Connection:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
     os.close(fd)
     os.chmod(path, 0o600)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=10)
     try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS guild_sessions ("
             "guild_id INTEGER PRIMARY KEY, "
@@ -142,11 +144,15 @@ def set_guild_session(guild_id: int, user_session: str) -> None:
             conn.close()
 
 
-def get_guild_session(guild_id: int) -> Optional[str]:
+def get_guild_session(
+    guild_id: int, *, suppress_errors: bool = True,
+) -> Optional[str]:
     with _guild_session_lock(guild_id):
         try:
             conn = _connect_guild_db()
         except (OSError, sqlite3.Error) as e:
+            if not suppress_errors:
+                raise
             logger.warning(f"Guild session store is unavailable: {e}")
             return None
         try:
@@ -156,17 +162,23 @@ def get_guild_session(guild_id: int) -> Optional[str]:
             ).fetchone()
             return row[0] if row else None
         except sqlite3.Error as e:
+            if not suppress_errors:
+                raise
             logger.warning(f"Failed to read guild session: {e}")
             return None
         finally:
             conn.close()
 
 
-def list_guild_sessions() -> List[Dict[str, int]]:
+def list_guild_sessions(
+    *, suppress_errors: bool = True,
+) -> List[Dict[str, int]]:
     """List non-secret guild session metadata for the local admin CLI."""
     try:
         conn = _connect_guild_db()
     except (OSError, sqlite3.Error) as e:
+        if not suppress_errors:
+            raise
         logger.warning(f"Guild session store is unavailable: {e}")
         return []
     try:
@@ -178,26 +190,34 @@ def list_guild_sessions() -> List[Dict[str, int]]:
             for guild_id, updated_at in rows
         ]
     except sqlite3.Error as e:
+        if not suppress_errors:
+            raise
         logger.warning(f"Failed to list guild sessions: {e}")
         return []
     finally:
         conn.close()
 
 
-def delete_guild_session(guild_id: int) -> None:
+def delete_guild_session(
+    guild_id: int, *, suppress_errors: bool = True,
+) -> bool:
     """Best-effort cleanup that never breaks a guild teardown path."""
+    deleted = False
     with _guild_session_lock(guild_id):
         try:
             conn = _connect_guild_db()
             try:
-                conn.execute(
+                cursor = conn.execute(
                     "DELETE FROM guild_sessions WHERE guild_id = ?",
                     (guild_id,),
                 )
+                deleted = cursor.rowcount > 0
                 conn.commit()
             finally:
                 conn.close()
         except Exception as e:
+            if not suppress_errors:
+                raise
             logger.warning(f"Failed to delete guild session from store: {e}")
 
         try:
@@ -211,7 +231,10 @@ def delete_guild_session(guild_id: int) -> None:
                 except FileNotFoundError:
                     pass
         except Exception as e:
+            if not suppress_errors:
+                raise
             logger.warning(f"Failed to delete guild cookie file: {e}")
+    return deleted
 
 
 def guild_cookie_file(guild_id: int) -> Optional[str]:
