@@ -23,6 +23,14 @@ CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 # googlevideo media URLs are IP-locked to the extractor, so downloads must use
 # the same proxy; that's why YouTube is fetched to a local file like niconico.
 YT_PROXY = os.getenv("YT_PROXY")
+# Comma-separated failover list. Keep YT_PROXY as a backward-compatible
+# single-proxy fallback.
+YT_PROXIES = [
+    value.strip() for value in os.getenv("YT_PROXIES", "").split(",")
+    if value.strip()
+]
+if not YT_PROXIES and YT_PROXY:
+    YT_PROXIES = [YT_PROXY]
 
 # sounds/ lives at the repository root (one level above this package).
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -89,6 +97,12 @@ IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "120"))
 MAX_TRACK_DURATION = int(os.getenv("MAX_TRACK_DURATION", "1800"))
 MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))
+MAX_PLAYLIST_NAME_LEN = 50
+MAX_PLAYLISTS_PER_GUILD = int(os.getenv("MAX_PLAYLISTS_PER_GUILD", "25"))
+MAX_PLAYLIST_SIZE = int(os.getenv("MAX_PLAYLIST_SIZE", "50"))
+# Prefetch is deliberately bounded to one queued track per guild. Reject an
+# unexpectedly large file instead of allowing a single guild to fill the disk.
+PREFETCH_MAX_BYTES = int(os.getenv("PREFETCH_MAX_BYTES", str(256 * 1024 * 1024)))
 
 # How often (seconds) to edit the now-playing embed so the progress bar advances.
 NP_UPDATE_INTERVAL = 10

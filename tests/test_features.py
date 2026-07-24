@@ -74,6 +74,14 @@ def test_validate_media_query_allowlist():
             pass
         else:
             raise AssertionError(f"query unexpectedly accepted: {query}")
+    assert audio.is_playlist_url(
+        "https://www.youtube.com/playlist?list=PL123")
+    assert audio.is_playlist_url(
+        "https://www.nicovideo.jp/user/1/mylist/2")
+    assert not audio.is_playlist_url(
+        "https://www.youtube.com/watch?v=abc&list=PL123")
+    assert not audio.is_playlist_url(
+        "https://www.youtube.com/playlist?list=RDMM")
 
 
 def test_fmt_duration():
@@ -143,9 +151,53 @@ def test_guild_session_round_trip():
         shutil.rmtree(d)
 
 
+def test_guild_session_store_error_policy():
+    import shutil
+    import sqlite3
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    original_connect = cookies._connect_guild_db
+    original_warning = cookies.logger.warning
+    config.STATE_DIR = d
+    cookie_path = os.path.join(d, "cookies_12346.txt")
+    with open(cookie_path, "w") as f:
+        f.write("stale")
+    warnings = []
+
+    def unavailable_store():
+        raise sqlite3.OperationalError("store unavailable")
+
+    cookies._connect_guild_db = unavailable_store
+    cookies.logger.warning = warnings.append
+    try:
+        delete_error = None
+        try:
+            cookies.delete_guild_session(12346)
+        except Exception as e:
+            delete_error = e
+        assert delete_error is None
+        assert not os.path.exists(cookie_path)
+        assert any("store unavailable" in message for message in warnings)
+
+        set_error = None
+        try:
+            cookies.set_guild_session(12346, "new-session")
+        except sqlite3.OperationalError as e:
+            set_error = e
+        assert set_error is not None
+    finally:
+        cookies.logger.warning = original_warning
+        cookies._connect_guild_db = original_connect
+        config.STATE_DIR = original_state_dir
+        shutil.rmtree(d)
+
+
 def test_guild_cookie_file_format_and_permissions():
     import shutil
     import tempfile
+    import time
 
     d = tempfile.mkdtemp()
     original = config.STATE_DIR
@@ -158,11 +210,74 @@ def test_guild_cookie_file_format_and_permissions():
             content = f.read()
         rows = [ln.split("\t") for ln in content.splitlines()
                 if ln and not ln.startswith("#")]
-        assert rows == [[".nicovideo.jp", "TRUE", "/", "TRUE", "0",
-                         "user_session", "guild-session"]]
+        assert rows[0][:4] == [".nicovideo.jp", "TRUE", "/", "TRUE"]
+        assert int(rows[0][4]) > int(time.time())
+        assert rows[0][5:] == ["user_session", "guild-session"]
         assert (os.stat(path).st_mode & 0o777) == 0o600
     finally:
         config.STATE_DIR = original
+        shutil.rmtree(d)
+
+
+def test_guild_cookie_file_is_loaded_and_sent_by_cookiejar():
+    import http.cookiejar
+    import shutil
+    import tempfile
+    import urllib.request
+
+    d = tempfile.mkdtemp()
+    original = config.STATE_DIR
+    config.STATE_DIR = d
+    try:
+        cookies.set_guild_session(23457, "guild-session")
+        path = cookies.guild_cookie_file(23457)
+        jar = http.cookiejar.MozillaCookieJar()
+        jar.load(path)
+        request = urllib.request.Request(
+            "https://www.nicovideo.jp/watch/sm9")
+        jar.add_cookie_header(request)
+        assert request.get_header("Cookie") == \
+            "user_session=guild-session"
+    finally:
+        config.STATE_DIR = original
+        shutil.rmtree(d)
+
+
+def test_guild_cookie_file_writes_only_when_session_changes():
+    import concurrent.futures
+    import shutil
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    original_writer = cookies.write_netscape_cookies
+    config.STATE_DIR = d
+    writes = []
+
+    def counting_writer(records, output_path=None):
+        writes.append(output_path)
+        return original_writer(records, output_path=output_path)
+
+    cookies.write_netscape_cookies = counting_writer
+    try:
+        cookies.set_guild_session(23458, "session-a")
+        cookies.set_guild_session(23459, "session-b")
+        guild_ids = [23458, 23459] * 8
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(cookies.guild_cookie_file, guild_ids))
+        first_path = os.path.join(d, "cookies_23458.txt")
+        second_path = os.path.join(d, "cookies_23459.txt")
+        assert writes.count(first_path) == 1
+        assert writes.count(second_path) == 1
+
+        cookies.set_guild_session(23458, "session-a-updated")
+        cookies.guild_cookie_file(23458)
+        assert writes.count(first_path) == 2
+        with open(first_path) as f:
+            assert "user_session\tsession-a-updated" in f.read()
+    finally:
+        cookies.write_netscape_cookies = original_writer
+        config.STATE_DIR = original_state_dir
         shutil.rmtree(d)
 
 
@@ -219,6 +334,57 @@ def test_registered_guild_omits_nico_username_and_password():
         config.COOKIE_FILE = original_cookie_file
         audio.NICO_EMAIL = original_email
         audio.NICO_PASSWORD = original_password
+        shutil.rmtree(d)
+
+
+def test_extract_reads_guild_session_once():
+    import shutil
+    import tempfile
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def extract_info(self, url, download):
+            return {
+                "formats": [{
+                    "acodec": "opus",
+                    "vcodec": "none",
+                    "url": "https://audio.example/track.opus",
+                }],
+                "title": "test",
+                "duration": 60,
+                "webpage_url": url,
+            }
+
+    d = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    original_connect = cookies._connect_guild_db
+    original_ydl = audio.yt_dlp.YoutubeDL
+    reads = []
+
+    def counting_connect():
+        reads.append(True)
+        return original_connect()
+
+    config.STATE_DIR = d
+    cookies.set_guild_session(45679, "private-session")
+    cookies._connect_guild_db = counting_connect
+    audio.yt_dlp.YoutubeDL = FakeYDL
+    try:
+        audio.extract_audio_url(
+            "https://www.nicovideo.jp/watch/sm9", guild_id=45679)
+        assert reads == [True]
+    finally:
+        audio.yt_dlp.YoutubeDL = original_ydl
+        cookies._connect_guild_db = original_connect
+        config.STATE_DIR = original_state_dir
         shutil.rmtree(d)
 
 
@@ -282,8 +448,10 @@ def test_download_and_cleanup_share_configured_directory():
     audio.yt_dlp.YoutubeDL = FakeYDL
     config.COOKIE_FILE = None
     try:
-        path = audio.download_audio("https://example.com/video")
+        result = audio.download_audio("https://example.com/video")
+        path = result.path
         assert path is not None
+        assert result.error is None
         assert os.path.dirname(os.path.dirname(path)) == d
         parent = os.path.dirname(path)
         past = _time.time() - 7200
@@ -342,13 +510,21 @@ def test_cog_registration():
     # present (CI can't start the bot, so this guards the cog refactor).
     from inmermusic.bot import bot
     from inmermusic.cog import MusicCog
-    names = {c.name for c in MusicCog(bot).get_app_commands()}
+    commands = MusicCog(bot).get_app_commands()
+    names = {c.name for c in commands}
     expected = {
         "play", "skip", "queue", "loop", "shuffle", "speed", "pitch", "seek",
         "volume", "preset", "remove", "move", "clear", "join", "leave", "help",
         "stop", "pause", "resume", "nowplaying", "na-", "sound", "refresh",
+        "playlist", "history", "historyplay", "previous", "replay",
+        "favorite", "favorites",
+        "playfavorite", "unfavorite", "settings",
     }
     assert names == expected, (expected - names, names - expected)
+    playlist = next(command for command in commands if command.name == "playlist")
+    assert {command.name for command in playlist.commands} == {
+        "add", "save", "load", "list", "delete",
+    }
 
 
 def test_initial_now_playing_message_waits_for_response():
@@ -359,7 +535,7 @@ def test_initial_now_playing_message_waits_for_response():
 
     from inmermusic.cog import MusicCog
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(MusicCog.play.callback)))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(MusicCog._enqueue_songs)))
     assignment = next(
         node for node in ast.walk(tree)
         if isinstance(node, ast.Assign)
@@ -773,7 +949,8 @@ def test_download_audio_removes_temp_dir_on_failure():
     config.COOKIE_FILE = None  # avoid touching the real cookie file path
     try:
         result = audio.download_audio("https://example.com/video")
-        assert result is None
+        assert result.path is None
+        assert result.error == "boom"
         leftovers = [n for n in os.listdir(d) if n.startswith("dl_")]
         assert leftovers == []
     finally:
@@ -866,6 +1043,306 @@ def test_friendly_extract_error():
         "取得に失敗しました。URLやキーワードを確認してください。"
     assert f("some completely different failure") == \
         "取得に失敗しました。URLやキーワードを確認してください。"
+    assert util.short_extract_error("Private video. Sign in") == "ログインが必要"
+    assert util.short_extract_error("Connection timed out") == "ネットワークエラー"
+
+
+def test_music_persistence_round_trip():
+    import shutil
+    import tempfile
+    from inmermusic import persistence
+
+    directory = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    config.STATE_DIR = directory
+    song = {
+        "url": "https://www.youtube.com/watch?v=persist",
+        "title": "persist me",
+        "duration": 123,
+        "thumbnail": "https://example.com/x.jpg",
+        "requester": "tester",
+        "requester_id": 42,
+        "needs_local": True,
+        "local_file": "/tmp/secret-runtime-file",
+        "audio_url": "https://signed.example/audio",
+    }
+    try:
+        assert persistence.save_queue(7001, [song])
+        restored = persistence.load_queue(7001)
+        assert len(restored) == 1
+        assert restored[0]["title"] == "persist me"
+        assert restored[0]["local_file"] is None
+        assert "audio_url" not in restored[0]
+
+        assert persistence.record_history(7001, song)
+        assert persistence.load_history(7001, 1)[0]["url"] == song["url"]
+        assert persistence.pop_history(7001)["url"] == song["url"]
+        assert persistence.load_history(7001) == []
+
+        assert persistence.save_named_playlist(7001, "Favorites", [song], 42)
+        assert persistence.count_named_playlists(7001) == 1
+        assert persistence.load_named_playlist(7001, "favorites")[0]["title"] == \
+            "persist me"
+        playlists = persistence.list_named_playlists(7001)
+        assert playlists[0]["name"] == "Favorites"
+        assert playlists[0]["song_count"] == 1
+        assert persistence.delete_named_playlist(7001, "FAVORITES")
+        assert persistence.count_named_playlists(7001) == 0
+
+        assert persistence.add_favorite(7001, 42, song)
+        assert persistence.add_favorite(7001, 42, song)  # idempotent upsert
+        assert len(persistence.load_favorites(7001, 42)) == 1
+        assert persistence.remove_favorite(7001, 42, 1)["url"] == song["url"]
+
+        settings = persistence.update_settings(
+            7001, default_volume=140, idle_timeout=75, loop_mode="queue")
+        assert settings == {
+            "default_volume": 140, "idle_timeout": 75, "loop_mode": "queue"}
+    finally:
+        config.STATE_DIR = original_state_dir
+        shutil.rmtree(directory)
+
+
+def test_proxy_failover_and_redaction():
+    class FakeYDL:
+        attempts = []
+
+        def __init__(self, opts):
+            self.opts = opts
+            self.attempts.append(opts.get("proxy"))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download=False):
+            if len(self.attempts) == 1:
+                raise RuntimeError("HTTP Error 429 via http://user:secret@one")
+            return {
+                "formats": [{
+                    "acodec": "opus", "vcodec": "none",
+                    "url": "https://audio.example/track.opus",
+                }],
+                "extractor_key": "Youtube",
+                "webpage_url": url,
+                "title": "fallback success",
+                "duration": 60,
+            }
+
+    original_ydl = audio.yt_dlp.YoutubeDL
+    original_proxies = config.YT_PROXIES
+    original_proxy = config.YT_PROXY
+    original_cookie = config.COOKIE_FILE
+    original_preferred = audio._preferred_proxy
+    config.YT_PROXIES = [
+        "http://user:secret@one", "http://user:secret@two"]
+    config.YT_PROXY = None
+    config.COOKIE_FILE = None
+    audio._preferred_proxy = None
+    audio.yt_dlp.YoutubeDL = FakeYDL
+    try:
+        song = audio.extract_audio_url(
+            "https://www.youtube.com/watch?v=proxy-test")
+        assert song["title"] == "fallback success"
+        assert FakeYDL.attempts == config.YT_PROXIES
+        redacted = audio._redact_error(
+            "failed http://user:secret@one and http://name:pass@example")
+        assert "secret" not in redacted and "pass@" not in redacted
+    finally:
+        audio.yt_dlp.YoutubeDL = original_ydl
+        config.YT_PROXIES = original_proxies
+        config.YT_PROXY = original_proxy
+        config.COOKIE_FILE = original_cookie
+        audio._preferred_proxy = original_preferred
+
+
+def test_search_and_playlist_flat_entries():
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {
+                "entries": [
+                    {
+                        "id": "one", "title": "first", "duration": 60,
+                        "extractor_key": "Youtube",
+                    },
+                    {
+                        "id": "too-long", "title": "long",
+                        "duration": config.MAX_TRACK_DURATION + 1,
+                        "extractor_key": "Youtube",
+                    },
+                ]
+            }
+
+    original_ydl = audio.yt_dlp.YoutubeDL
+    original_proxies = config.YT_PROXIES
+    original_proxy = config.YT_PROXY
+    audio.yt_dlp.YoutubeDL = FakeYDL
+    config.YT_PROXIES = []
+    config.YT_PROXY = None
+    try:
+        choices = audio.search_candidates("query", limit=5)
+        assert choices[0]["url"] == "https://www.youtube.com/watch?v=one"
+        songs = audio.extract_playlist(
+            "https://www.youtube.com/playlist?list=test", limit=5)
+        assert [song["title"] for song in songs] == ["first"]
+    finally:
+        audio.yt_dlp.YoutubeDL = original_ydl
+        config.YT_PROXIES = original_proxies
+        config.YT_PROXY = original_proxy
+
+
+def test_failed_playback_never_reenters_loop():
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900108
+    original_play_next = playback.play_next
+
+    async def fake_play_next(gid, announce=True):
+        return None
+
+    playback.play_next = fake_play_next
+    try:
+        state = get_state(guild_id)
+        state.loop_mode = "song"
+        state.current_song = {"title": "broken"}
+        state.queue = []
+        asyncio.run(playback.advance_queue(
+            guild_id, state.current_song, expected_state=state, failed=True))
+        assert state.queue == []
+        assert state.current_song is None
+    finally:
+        playback.play_next = original_play_next
+        guild_states.pop(guild_id, None)
+
+
+def test_queue_embed_pagination_and_eta():
+    from inmermusic.state import GuildState
+
+    state = GuildState()
+    state.queue = [
+        {
+            "title": f"song-{index}",
+            "url": f"https://example.com/{index}",
+            "duration": 60,
+            "requester": "tester",
+        }
+        for index in range(12)
+    ]
+    embed = ui.create_queue_embed(
+        state, page=1, page_size=10, current_remaining=30)
+    assert "song-10" in embed.description
+    assert "song-0" not in embed.description
+    assert embed.footer.text.startswith("ページ 2/2")
+
+
+def test_next_track_prefetch_is_bounded_and_reusable():
+    import shutil
+    import tempfile
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900109
+    root = tempfile.mkdtemp()
+    made = os.path.join(root, "dl_prefetch")
+    os.mkdir(made)
+    path = os.path.join(made, "track.m4a")
+    with open(path, "w") as handle:
+        handle.write("audio")
+
+    original_download = playback.download_audio
+    playback.download_audio = lambda url, guild_id=None: path
+
+    async def scenario():
+        state = get_state(guild_id)
+        song = {
+            "title": "next", "url": "https://www.youtube.com/watch?v=next",
+            "needs_local": True, "local_file": None,
+        }
+        state.queue = [song]
+        playback.start_prefetch(guild_id)
+        task = state.prefetch_task
+        assert task is not None
+        await task
+        assert song["local_file"] == path
+        assert state.prefetch_task is None
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        playback.download_audio = original_download
+        guild_states.pop(guild_id, None)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_stale_music_panel_is_rejected():
+    from types import SimpleNamespace
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900110
+    replies = []
+
+    class Response:
+        async def send_message(self, message, **kwargs):
+            replies.append((message, kwargs))
+
+    async def scenario():
+        state = get_state(guild_id)
+        voice_client = object()
+        state.voice_client = voice_client
+        state.np_message = SimpleNamespace(id=100)
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=guild_id, voice_client=voice_client),
+            message=SimpleNamespace(id=99),
+            response=Response(),
+            user=SimpleNamespace(voice=None),
+        )
+        allowed = await ui.MusicControls().interaction_check(interaction)
+        assert allowed is False
+        assert "古く" in replies[0][0]
+        assert replies[0][1]["ephemeral"] is True
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        guild_states.pop(guild_id, None)
+
+
+def test_nico_cli_never_prints_session_secret():
+    import contextlib
+    import io
+    import shutil
+    import tempfile
+    from inmermusic import nico_cli
+
+    directory = tempfile.mkdtemp()
+    session_file = os.path.join(directory, "session.txt")
+    secret = "user_session_sensitive_value"
+    with open(session_file, "w") as handle:
+        handle.write(secret)
+    original_state_dir = config.STATE_DIR
+    config.STATE_DIR = directory
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            assert nico_cli.main(
+                ["set", "8001", "--session-file", session_file]) == 0
+            assert nico_cli.main(["status", "8001"]) == 0
+            assert nico_cli.main(["list"]) == 0
+        assert secret not in output.getvalue()
+        assert "8001" in output.getvalue()
+    finally:
+        config.STATE_DIR = original_state_dir
+        shutil.rmtree(directory)
 
 
 if __name__ == "__main__":

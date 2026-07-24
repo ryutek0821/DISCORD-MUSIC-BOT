@@ -32,18 +32,41 @@ def parse_time(value: str) -> Optional[float]:
         return None
 
 
-def friendly_extract_error(message: str) -> str:
-    """Map a yt-dlp/extraction error string to a short Japanese explanation."""
+def _extract_error_kind(message: str) -> str:
     m = message.lower()
     if any(k in m for k in ("private", "login", "sign in", "members-only", "cookies")):
-        return "ログインが必要な動画のため再生できません。"
+        return "login"
     if any(k in m for k in (
             "age-restricted", "age restricted", "age verification", "confirm your age")):
-        return "年齢制限付きの動画のため再生できません。"
+        return "age"
     if any(k in m for k in ("geo", "not available in your country", "region")):
-        return "地域制限により再生できません。"
+        return "geo"
     if any(k in m for k in ("unavailable", "removed", "deleted", "does not exist", "not found")):
-        return "動画が削除・非公開のため見つかりません。"
+        return "missing"
     if any(k in m for k in ("timed out", "timeout", "connection", "unable to download", "network")):
-        return "ネットワークエラーです。時間をおいて再試行してください。"
-    return "取得に失敗しました。URLやキーワードを確認してください。"
+        return "network"
+    return "unknown"
+
+
+def friendly_extract_error(message: str) -> str:
+    """Map a yt-dlp/extraction error string to a Japanese explanation."""
+    return {
+        "login": "ログインが必要な動画のため再生できません。",
+        "age": "年齢制限付きの動画のため再生できません。",
+        "geo": "地域制限により再生できません。",
+        "missing": "動画が削除・非公開のため見つかりません。",
+        "network": "ネットワークエラーです。時間をおいて再試行してください。",
+        "unknown": "取得に失敗しました。URLやキーワードを確認してください。",
+    }[_extract_error_kind(message)]
+
+
+def short_extract_error(message: str) -> str:
+    """Return a compact failure reason suitable for a skip notification."""
+    return {
+        "login": "ログインが必要",
+        "age": "年齢制限",
+        "geo": "地域制限",
+        "missing": "動画が削除・非公開",
+        "network": "ネットワークエラー",
+        "unknown": "取得失敗",
+    }[_extract_error_kind(message)]

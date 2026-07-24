@@ -1,25 +1,76 @@
 """Audio extraction/download (yt-dlp) and FFmpeg source building/seeking."""
 import asyncio
 import os
+import re
 import shutil
 import tempfile
+import threading
 import time
-from urllib.parse import urlparse
-from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import discord
 import yt_dlp
 
 from . import config
-from .config import (DOWNLOAD_TIMEOUT, EFFECT_FILTERS, MAX_TRACK_DURATION,
-                     NICO_EMAIL, NICO_PASSWORD,
-                     SOURCE_CLEANUP_DELAY, YT_PROXY, logger)
-from .cookies import (ensure_cookie_file, get_guild_session, guild_cookie_file,
+from .config import (DOWNLOAD_TIMEOUT, EFFECT_FILTERS, MAX_PLAYLIST_SIZE,
+                     MAX_TRACK_DURATION, NICO_EMAIL, NICO_PASSWORD,
+                     SOURCE_CLEANUP_DELAY, logger)
+from .cookies import (ensure_cookie_file, guild_cookie_file,
                       refresh_nico_cookies_sync)
 from .state import GuildState
 
+_GUILD_COOKIE_UNSET = object()
+_PROXY_UNSET = object()
+_proxy_lock = threading.Lock()
+_preferred_proxy: Optional[str] = None
+
+
+def _proxy_candidates(url: str) -> List[Optional[str]]:
+    if _is_niconico_url(url):
+        return [None]
+    configured = list(config.YT_PROXIES)
+    # Tests and long-running processes may update the legacy value after
+    # import, so retain dynamic backward compatibility.
+    if not configured and config.YT_PROXY:
+        configured = [config.YT_PROXY]
+    if not configured:
+        return [None]
+    with _proxy_lock:
+        preferred = _preferred_proxy
+    if preferred in configured:
+        configured.remove(preferred)
+        configured.insert(0, preferred)
+    return configured
+
+
+def _mark_proxy_success(proxy: Optional[str]) -> None:
+    if proxy is None:
+        return
+    global _preferred_proxy
+    with _proxy_lock:
+        _preferred_proxy = proxy
+
+
+def _redact_error(error: Any) -> str:
+    text = str(error)
+    for proxy in set(config.YT_PROXIES + ([config.YT_PROXY] if config.YT_PROXY else [])):
+        text = text.replace(proxy, "<proxy>")
+    return re.sub(r"(https?://)[^/@\s]+@", r"\1***@", text)
+
+
+def _proxy_retryable(error: Any) -> bool:
+    text = str(error).lower()
+    return any(token in text for token in (
+        "403", "429", "timed out", "timeout", "connection reset",
+        "connection refused", "unable to download", "sign in to confirm",
+        "bot", "temporarily unavailable",
+    ))
+
 
 def build_ydl_opts(url: str, guild_id: Optional[int] = None,
+                   _guild_cookie: Any = _GUILD_COOKIE_UNSET,
+                   _proxy: Any = _PROXY_UNSET,
                    **overrides: Any) -> Dict[str, Any]:
     """Build yt-dlp options, enabling niconico login + cookie persistence."""
     ydl_opts: Dict[str, Any] = {
@@ -34,12 +85,15 @@ def build_ydl_opts(url: str, guild_id: Optional[int] = None,
     ydl_opts.update(overrides)
 
     is_niconico = _is_niconico_url(url)
-    guild_cookie = (guild_cookie_file(guild_id)
-                    if is_niconico and guild_id is not None else None)
+    if _guild_cookie is _GUILD_COOKIE_UNSET:
+        guild_cookie = (guild_cookie_file(guild_id)
+                        if is_niconico and guild_id is not None else None)
+    else:
+        guild_cookie = _guild_cookie
 
     if guild_cookie:
         ydl_opts["cookiefile"] = guild_cookie
-    elif config.COOKIE_FILE:
+    elif is_niconico and config.COOKIE_FILE:
         ensure_cookie_file()
         if os.path.exists(config.COOKIE_FILE):
             ydl_opts["cookiefile"] = config.COOKIE_FILE
@@ -51,10 +105,13 @@ def build_ydl_opts(url: str, guild_id: Optional[int] = None,
         ydl_opts["username"] = NICO_EMAIL
         ydl_opts["password"] = NICO_PASSWORD
 
-    # Send YouTube (and other non-niconico) requests through the residential
-    # proxy to dodge bot detection / 429 on the VPS datacenter IP.
-    if not is_niconico and YT_PROXY and "proxy" not in ydl_opts:
-        ydl_opts["proxy"] = YT_PROXY
+    # Send YouTube (and other non-niconico) requests through the selected
+    # residential proxy. Callers performing retries pass an explicit proxy;
+    # ordinary callers retain the legacy "first configured proxy" behavior.
+    if not is_niconico and "proxy" not in ydl_opts:
+        proxy = _proxy_candidates(url)[0] if _proxy is _PROXY_UNSET else _proxy
+        if proxy:
+            ydl_opts["proxy"] = proxy
 
     return ydl_opts
 
@@ -62,6 +119,25 @@ def build_ydl_opts(url: str, guild_id: Optional[int] = None,
 def _is_niconico_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower().rstrip(".")
     return host == "nicovideo.jp" or host.endswith(".nicovideo.jp") or host == "nico.ms"
+
+
+def is_playlist_url(url: str) -> bool:
+    """Return whether a supported URL clearly represents a whole playlist."""
+    parsed = urlparse(url)
+    path = parsed.path or ""
+    query = parse_qs(parsed.query)
+    list_values = query.get("list")
+    if list_values:
+        # A copied watch URL still represents the selected video. YouTube
+        # radio/mix IDs (RD...) are open-ended and are intentionally skipped.
+        if list_values[0].startswith("RD"):
+            return False
+        if "v" not in query:
+            return True
+    if path == "/playlist" or path.startswith("/playlist/"):
+        return True
+    return _is_niconico_url(url) and (
+        "/mylist/" in path or "/series/" in path)
 
 
 def validate_query(query: str) -> None:
@@ -84,90 +160,173 @@ def validate_query(query: str) -> None:
         raise ValueError("YouTubeまたはニコニコ動画のURLのみ利用できます")
 
 
+def _select_audio_format(info: Dict[str, Any]) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+    formats = info.get("formats", [])
+    for codec in ("opus", "aac", "m4a"):
+        for item in formats:
+            if item.get("acodec") != "none" and item.get("vcodec") == "none":
+                if codec in (item.get("acodec", "") or item.get("ext", "")):
+                    return item.get("url"), item
+    for item in formats:
+        if item.get("acodec") != "none" and item.get("vcodec") == "none":
+            return item.get("url"), item
+    for item in formats:
+        if item.get("url"):
+            return item.get("url"), item
+    return None, None
+
+
+def _canonical_url(info: Dict[str, Any], fallback: str) -> str:
+    webpage_url = info.get("webpage_url") or info.get("original_url")
+    if webpage_url:
+        return webpage_url
+    extractor = (info.get("extractor_key") or info.get("extractor") or "").lower()
+    video_id = info.get("id")
+    raw_url = info.get("url")
+    if video_id and ("youtube" in extractor or "youtu" in fallback):
+        return f"https://www.youtube.com/watch?v={video_id}"
+    if isinstance(raw_url, str) and raw_url.startswith(("http://", "https://")):
+        return raw_url
+    return fallback
+
+
+def _song_from_info(info: Dict[str, Any], fallback_url: str,
+                    *, require_audio: bool = False) -> Dict[str, Any]:
+    audio_url, selected_format = _select_audio_format(info)
+    if require_audio and not audio_url:
+        raise ValueError("No audio URL found in extracted info")
+    if selected_format:
+        logger.info(
+            "Selected audio format: %s (%skbps, %sHz)",
+            selected_format.get("acodec", "unknown"),
+            selected_format.get("abr", "unknown"),
+            selected_format.get("asr", "unknown"),
+        )
+    webpage_url = _canonical_url(info, fallback_url)
+    extractor = (info.get("extractor_key") or info.get("extractor") or "")
+    is_niconico = _is_niconico_url(webpage_url)
+    is_youtube = "youtube" in extractor.lower() or "youtube.com" in webpage_url
+    try:
+        duration = float(info.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    if duration and duration > MAX_TRACK_DURATION:
+        raise ValueError("動画が長すぎます")
+    return {
+        "url": webpage_url,
+        "audio_url": audio_url,
+        "title": info.get("title") or "Unknown",
+        "duration": duration,
+        "thumbnail": info.get("thumbnail", ""),
+        "is_niconico": is_niconico,
+        "needs_local": is_niconico or is_youtube,
+        "local_file": None,
+    }
+
+
+def _extract_info_with_failover(url: str, guild_id: Optional[int],
+                                **overrides: Any) -> Dict[str, Any]:
+    last_error: Optional[Exception] = None
+    proxies = _proxy_candidates(url)
+    for index, proxy in enumerate(proxies):
+        try:
+            opts = build_ydl_opts(url, guild_id=guild_id, _proxy=proxy, **overrides)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            _mark_proxy_success(proxy)
+            return info
+        except Exception as e:
+            last_error = e
+            if index + 1 >= len(proxies) or not _proxy_retryable(e):
+                break
+            logger.warning("Media extraction failed via proxy #%d; trying next proxy", index + 1)
+    assert last_error is not None
+    raise last_error
+
+
 def extract_audio_url(url: str, guild_id: Optional[int] = None) -> Dict[str, Any]:
-    """Extract audio stream URL or download for niconico."""
+    """Extract one playable track, with YouTube proxy failover."""
     validate_query(url)
-    if (_is_niconico_url(url)
-            and (guild_id is None or get_guild_session(guild_id) is None)):
+    is_niconico = _is_niconico_url(url)
+    guild_cookie = (guild_cookie_file(guild_id)
+                    if is_niconico and guild_id is not None else None)
+    if is_niconico and not guild_cookie:
         refresh_nico_cookies_sync()
 
-    ydl_opts = build_ydl_opts(url, guild_id=guild_id, socket_timeout=10)
-
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if isinstance(info, dict) and "entries" in info and info["entries"]:
-                info = info["entries"][0]
-
-            formats = info.get("formats", [])
-            audio_url = None
-            selected_format = None
-
-            for codec in ["opus", "aac", "m4a"]:
-                for f in formats:
-                    if f.get("acodec") != "none" and f.get("vcodec") == "none":
-                        if codec in (f.get("acodec", "") or f.get("ext", "")):
-                            audio_url = f.get("url")
-                            selected_format = f
-                            break
-                if audio_url:
-                    break
-
-            if not audio_url:
-                for f in formats:
-                    if f.get("acodec") != "none" and f.get("vcodec") == "none":
-                        audio_url = f.get("url")
-                        selected_format = f
-                        break
-
-            if not audio_url:
-                for f in formats:
-                    if f.get("url"):
-                        audio_url = f.get("url")
-                        selected_format = f
-                        break
-
-            if not audio_url:
-                raise ValueError("No audio URL found in extracted info")
-
-            if selected_format:
-                logger.info(f"Selected audio format: {selected_format.get('acodec', 'unknown')} "
-                          f"({selected_format.get('abr', 'unknown')}kbps, "
-                          f"{selected_format.get('asr', 'unknown')}Hz)")
-
-            # A bare keyword resolves to a YouTube video via default_search, so
-            # detect YouTube from the resolved info rather than the input string.
-            extractor = (info.get("extractor_key") or info.get("extractor") or "")
-            webpage_url = info.get("webpage_url") or url
-            is_niconico = _is_niconico_url(webpage_url)
-            is_youtube = "youtube" in extractor.lower() or "youtube.com" in webpage_url
-
-            duration = info.get("duration") or 0
-            if duration and duration > MAX_TRACK_DURATION:
-                raise ValueError("動画が長すぎます")
-
-            # YouTube media URLs are IP-locked to the proxy used for extraction,
-            # so they can't be streamed directly from the VPS. Fetch them to a
-            # local file (through the proxy) at play time, like niconico.
-            return {
-                # Use the concrete video URL so the lazy download re-extracts the
-                # exact video (and routes through the proxy via build_ydl_opts).
-                "url": webpage_url if is_youtube else url,
-                "audio_url": audio_url,
-                "title": info.get("title", "Unknown"),
-                "duration": duration,
-                "thumbnail": info.get("thumbnail", ""),
-                "is_niconico": is_niconico,
-                "needs_local": is_niconico or is_youtube,
-                "local_file": None,
-            }
+        info = _extract_info_with_failover(
+            url, guild_id, _guild_cookie=guild_cookie, socket_timeout=10)
+        if isinstance(info, dict) and info.get("entries"):
+            info = info["entries"][0]
+        return _song_from_info(info, url, require_audio=True)
     except Exception as e:
-        logger.error(f"Failed to extract audio URL: {e}")
+        logger.error(f"Failed to extract audio URL: {_redact_error(e)}")
         raise
 
 
-def download_audio(url: str, guild_id: Optional[int] = None) -> Optional[str]:
-    """Download audio to a fresh per-request temp directory and return the path.
+def search_candidates(query: str, guild_id: Optional[int] = None,
+                      limit: int = 5) -> List[Dict[str, Any]]:
+    """Return lightweight YouTube search choices without downloading audio."""
+    validate_query(query)
+    if "://" in query:
+        return [extract_audio_url(query, guild_id)]
+    count = max(1, min(10, int(limit)))
+    search_url = f"ytsearch{count}:{query.strip()}"
+    try:
+        info = _extract_info_with_failover(
+            search_url, guild_id, noplaylist=False, extract_flat="in_playlist",
+            playlistend=count, socket_timeout=10)
+        entries = info.get("entries", []) if isinstance(info, dict) else []
+        songs: List[Dict[str, Any]] = []
+        for entry in entries[:count]:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                songs.append(
+                    _song_from_info(entry, _canonical_url(entry, search_url)))
+            except ValueError:
+                continue
+        return songs
+    except Exception as e:
+        logger.error(f"Failed to search media: {_redact_error(e)}")
+        raise
+
+
+def extract_playlist(url: str, guild_id: Optional[int] = None,
+                     limit: int = MAX_PLAYLIST_SIZE) -> List[Dict[str, Any]]:
+    """Extract a bounded playlist as lightweight, lazily-downloaded songs."""
+    validate_query(url)
+    if "://" not in url:
+        raise ValueError("プレイリストURLを指定してください")
+    count = max(1, min(MAX_PLAYLIST_SIZE, int(limit)))
+    try:
+        info = _extract_info_with_failover(
+            url, guild_id, noplaylist=False, extract_flat="in_playlist",
+            playlistend=count, socket_timeout=10)
+        entries = info.get("entries", []) if isinstance(info, dict) else []
+        songs: List[Dict[str, Any]] = []
+        for entry in entries[:count]:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                songs.append(_song_from_info(entry, _canonical_url(entry, url)))
+            except ValueError:
+                continue
+        return songs
+    except Exception as e:
+        logger.error(f"Failed to extract playlist: {_redact_error(e)}")
+        raise
+
+
+class DownloadResult(NamedTuple):
+    """Outcome of a download, including a safe user-facing failure source."""
+
+    path: Optional[str]
+    error: Optional[str] = None
+
+
+def download_audio(url: str, guild_id: Optional[int] = None) -> DownloadResult:
+    """Download audio to a fresh per-request temp directory.
 
     Used for niconico and YouTube; for YouTube the request is routed through
     the residential proxy (via build_ydl_opts) so the IP-locked media URL is
@@ -178,28 +337,31 @@ def download_audio(url: str, guild_id: Optional[int] = None) -> Optional[str]:
     and remove the whole directory once the download eventually finishes —
     see `cleanup_download` and the callers in playback.py.
     """
-    tmpdir = tempfile.mkdtemp(prefix="dl_", dir=config.DOWNLOAD_DIR)
-    output_template = os.path.join(tmpdir, "%(id)s.%(ext)s")
-
-    # socket_timeout caps individual network reads so a dead connection raises
-    # instead of blocking this executor thread forever (the async wait_for in
-    # the callers only abandons the await, it can't kill the thread).
-    ydl_opts = build_ydl_opts(url, guild_id=guild_id, outtmpl=output_template,
-                              socket_timeout=min(30, DOWNLOAD_TIMEOUT))
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if os.path.exists(filename):
-                logger.info(f"Downloaded audio: {filename}")
-                return filename
-    except Exception as e:
-        logger.error(f"Failed to download audio: {e}")
-    # Nothing usable was produced — remove the directory we just created so
-    # a failed download doesn't leave an empty/partial orphan behind.
-    shutil.rmtree(tmpdir, ignore_errors=True)
-    return None
+    proxies = _proxy_candidates(url)
+    for index, proxy in enumerate(proxies):
+        tmpdir = tempfile.mkdtemp(prefix="dl_", dir=config.DOWNLOAD_DIR)
+        output_template = os.path.join(tmpdir, "%(id)s.%(ext)s")
+        ydl_opts = build_ydl_opts(
+            url, guild_id=guild_id, _proxy=proxy, outtmpl=output_template,
+            socket_timeout=min(30, DOWNLOAD_TIMEOUT))
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                if os.path.exists(filename):
+                    _mark_proxy_success(proxy)
+                    logger.info(f"Downloaded audio: {filename}")
+                    return DownloadResult(filename)
+        except Exception as e:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            if index + 1 < len(proxies) and _proxy_retryable(e):
+                logger.warning("Audio download failed via proxy #%d; trying next proxy", index + 1)
+                continue
+            safe_error = _redact_error(e)
+            logger.error(f"Failed to download audio: {safe_error}")
+            return DownloadResult(None, safe_error)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    return DownloadResult(None, "downloaded file missing")
 
 
 def cleanup_download(path: Optional[str]) -> None:

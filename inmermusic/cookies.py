@@ -21,6 +21,12 @@ last_cookie_refresh = 0
 # guards the atomic file write so a concurrent yt-dlp read never sees a partial.
 cookie_refresh_lock = threading.Lock()
 cookie_file_lock = threading.Lock()
+# Per-guild RLocks keep one guild's DB value and generated file in sync without
+# blocking other guilds. The short-lived cache lock only protects its mapping.
+guild_session_locks_lock = threading.Lock()
+guild_session_locks = {}
+guild_cookie_cache_lock = threading.Lock()
+guild_cookie_cache: Dict[int, tuple[str, str]] = {}
 
 NICO_LOGIN_BASE = "https://account.nicovideo.jp"
 
@@ -88,6 +94,15 @@ def _guild_db_path() -> str:
     return os.path.join(config.STATE_DIR, "guilds.db")
 
 
+def _guild_session_lock(guild_id: int):
+    with guild_session_locks_lock:
+        lock = guild_session_locks.get(guild_id)
+        if lock is None:
+            lock = threading.RLock()
+            guild_session_locks[guild_id] = lock
+        return lock
+
+
 def _connect_guild_db() -> sqlite3.Connection:
     os.makedirs(config.STATE_DIR, mode=0o700, exist_ok=True)
     os.chmod(config.STATE_DIR, 0o700)
@@ -110,74 +125,120 @@ def _connect_guild_db() -> sqlite3.Connection:
 
 
 def set_guild_session(guild_id: int, user_session: str) -> None:
-    conn = _connect_guild_db()
-    try:
-        conn.execute(
-            "INSERT INTO guild_sessions (guild_id, user_session, updated_at) "
-            "VALUES (?, ?, ?) "
-            "ON CONFLICT(guild_id) DO UPDATE SET "
-            "user_session = excluded.user_session, "
-            "updated_at = excluded.updated_at",
-            (guild_id, user_session, int(time.time())),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    """Persist a guild session, propagating errors so the UI can report them."""
+    with _guild_session_lock(guild_id):
+        conn = _connect_guild_db()
+        try:
+            conn.execute(
+                "INSERT INTO guild_sessions (guild_id, user_session, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(guild_id) DO UPDATE SET "
+                "user_session = excluded.user_session, "
+                "updated_at = excluded.updated_at",
+                (guild_id, user_session, int(time.time())),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def get_guild_session(guild_id: int) -> Optional[str]:
+    with _guild_session_lock(guild_id):
+        try:
+            conn = _connect_guild_db()
+        except (OSError, sqlite3.Error) as e:
+            logger.warning(f"Guild session store is unavailable: {e}")
+            return None
+        try:
+            row = conn.execute(
+                "SELECT user_session FROM guild_sessions WHERE guild_id = ?",
+                (guild_id,),
+            ).fetchone()
+            return row[0] if row else None
+        except sqlite3.Error as e:
+            logger.warning(f"Failed to read guild session: {e}")
+            return None
+        finally:
+            conn.close()
+
+
+def list_guild_sessions() -> List[Dict[str, int]]:
+    """List non-secret guild session metadata for the local admin CLI."""
     try:
         conn = _connect_guild_db()
     except (OSError, sqlite3.Error) as e:
         logger.warning(f"Guild session store is unavailable: {e}")
-        return None
+        return []
     try:
-        row = conn.execute(
-            "SELECT user_session FROM guild_sessions WHERE guild_id = ?",
-            (guild_id,),
-        ).fetchone()
-        return row[0] if row else None
+        rows = conn.execute(
+            "SELECT guild_id, updated_at FROM guild_sessions ORDER BY guild_id"
+        ).fetchall()
+        return [
+            {"guild_id": int(guild_id), "updated_at": int(updated_at)}
+            for guild_id, updated_at in rows
+        ]
     except sqlite3.Error as e:
-        logger.warning(f"Failed to read guild session: {e}")
-        return None
+        logger.warning(f"Failed to list guild sessions: {e}")
+        return []
     finally:
         conn.close()
 
 
 def delete_guild_session(guild_id: int) -> None:
-    conn = _connect_guild_db()
-    try:
-        conn.execute(
-            "DELETE FROM guild_sessions WHERE guild_id = ?",
-            (guild_id,),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    cookie_path = os.path.join(config.STATE_DIR, f"cookies_{guild_id}.txt")
-    with cookie_file_lock:
+    """Best-effort cleanup that never breaks a guild teardown path."""
+    with _guild_session_lock(guild_id):
         try:
-            os.remove(cookie_path)
-        except FileNotFoundError:
-            pass
+            conn = _connect_guild_db()
+            try:
+                conn.execute(
+                    "DELETE FROM guild_sessions WHERE guild_id = ?",
+                    (guild_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning(f"Failed to delete guild session from store: {e}")
+
+        try:
+            cookie_path = os.path.join(
+                config.STATE_DIR, f"cookies_{guild_id}.txt")
+            with guild_cookie_cache_lock:
+                guild_cookie_cache.pop(guild_id, None)
+            with cookie_file_lock:
+                try:
+                    os.remove(cookie_path)
+                except FileNotFoundError:
+                    pass
+        except Exception as e:
+            logger.warning(f"Failed to delete guild cookie file: {e}")
 
 
 def guild_cookie_file(guild_id: int) -> Optional[str]:
-    user_session = get_guild_session(guild_id)
-    if user_session is None:
-        return None
-    path = os.path.join(config.STATE_DIR, f"cookies_{guild_id}.txt")
-    write_netscape_cookies(
-        [{
-            "domain": ".nicovideo.jp",
-            "path": "/",
-            "secure": True,
-            "name": "user_session",
-            "value": user_session,
-        }],
-        output_path=path,
-    )
-    return path
+    with _guild_session_lock(guild_id):
+        user_session = get_guild_session(guild_id)
+        if user_session is None:
+            return None
+        path = os.path.join(config.STATE_DIR, f"cookies_{guild_id}.txt")
+        cache_value = (path, user_session)
+        with guild_cookie_cache_lock:
+            cached = guild_cookie_cache.get(guild_id)
+        if cached == cache_value and os.path.exists(path):
+            return path
+        write_netscape_cookies(
+            [{
+                "domain": ".nicovideo.jp",
+                "path": "/",
+                "secure": True,
+                "expiry": int(time.time()) + 180 * 24 * 60 * 60,
+                "name": "user_session",
+                "value": user_session,
+            }],
+            output_path=path,
+        )
+        with guild_cookie_cache_lock:
+            guild_cookie_cache[guild_id] = cache_value
+        return path
 
 
 def save_session_cookies(cookies: requests.cookies.RequestsCookieJar) -> None:
