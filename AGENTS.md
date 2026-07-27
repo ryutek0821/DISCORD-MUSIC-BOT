@@ -53,3 +53,13 @@ Package `inmermusic/` with the following modules:
 - `auto-merge.yml`: squash-merges PRs when CI passes
 - `deploy-on-push.yml`: rsync + systemctl restart to RYU-RASPBERRYPI via Tailscale SSH
 - `version-tag.yml`: tags master commits with a version number
+
+## エージェント運用ルール
+
+`auto-merge.yml` + `deploy-on-push.yml` により、**PR を1本出すと人のレビューを経ずに本番 Bot が
+差し替わる**（CI通過 → 自動 squash マージ → RYU-RASPBERRYPI へ rsync → `niconico-bot` 再起動）。
+
+そのため Claude Code / Codex はこのリポジトリで PR を直接作らない。変更が必要だと判断したら
+`.github/ISSUE_TEMPLATE/agent-proposal.yml` の形式で issue を起票し、そこで止まる
+（実装・ブランチ作成・PR は人が明示的に指示してから）。
+詳細は `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` の「GitHub 運用方針」を参照。

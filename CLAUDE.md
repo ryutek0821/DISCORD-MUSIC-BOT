@@ -64,3 +64,13 @@ Package `inmermusic/`, layered bottom-up (each module's docstring states what it
 - `version-tag.yml` — tags `master` commits with a version number.
 
 Because deploy runs automatically on every push to `master`, treat pushes to `master` as a production deploy trigger, not just a merge.
+
+## エージェント運用ルール
+
+`auto-merge.yml` + `deploy-on-push.yml` により、**PR を1本出すと人のレビューを経ずに本番 Bot が
+差し替わる**（CI通過 → 自動 squash マージ → RYU-RASPBERRYPI へ rsync → `niconico-bot` 再起動）。
+
+そのため Claude Code / Codex はこのリポジトリで PR を直接作らない。変更が必要だと判断したら
+`.github/ISSUE_TEMPLATE/agent-proposal.yml` の形式で issue を起票し、そこで止まる
+（実装・ブランチ作成・PR は人が明示的に指示してから）。
+詳細は `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` の「GitHub 運用方針」を参照。

@@ -1,0 +1,54 @@
+name: エージェント提案
+description: Claude Code / Codex が発見した課題・改善提案（実装着手前の起票用）
+title: "[提案] "
+labels: ["agent-proposal"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        エージェントはこの issue を起票した時点で作業を止めること。
+        実装・ブランチ作成・PR 作成に進むのは、人が明示的に指示してから。
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景 / 現状の問題
+      description: 何が問題か。該当箇所は `ファイル:行` の形で示す。
+      placeholder: |
+        例: src/playback.py:120 で失敗時に continue せず return しているため、
+        1曲でも落ちるとキューが止まる。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案する変更
+      description: どう直すか。代替案がある場合は理由とあわせて書く。
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: 影響範囲
+      description: 変更が波及する範囲。**デプロイ・サービス再起動が発生するか**を必ず明記する。
+      placeholder: |
+        例: master への push で deploy-on-push が走り、
+        RYU-RASPBERRYPI 上の niconico-bot が再起動する（数秒の切断あり）。
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: 検証方法
+      description: この変更が正しいことをどう確認するか（テスト・手動確認手順）。
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: 起票元
+      options:
+        - Claude Code
+        - Codex
+        - 人手
+    validations:
+      required: true
