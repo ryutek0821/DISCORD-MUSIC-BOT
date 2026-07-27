@@ -12,3 +12,10 @@ cookies.txt
 # ローカル作業用ディレクトリ（エージェント設定・作業メモ）
 cao-profiles/
 docs/
+# コーディングエージェント用ファイル（GitHub には上げない）
+CLAUDE.md
+AGENTS.md
+.codex/
+.cursor/
+.windsurf/
+.github/copilot-instructions.md
