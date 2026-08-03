@@ -104,6 +104,13 @@ MAX_PLAYLIST_SIZE = int(os.getenv("MAX_PLAYLIST_SIZE", "50"))
 # unexpectedly large file instead of allowing a single guild to fill the disk.
 PREFETCH_MAX_BYTES = int(os.getenv("PREFETCH_MAX_BYTES", str(256 * 1024 * 1024)))
 
+# Autoplay (radio mode): how many tracks to append per refill, and how many
+# autoplay tracks may play back-to-back before the bot stops refilling. The
+# streak cap is what keeps an empty-but-occupied VC from playing forever; any
+# user-queued song resets it.
+AUTOPLAY_BATCH = int(os.getenv("AUTOPLAY_BATCH", "3"))
+AUTOPLAY_MAX_STREAK = int(os.getenv("AUTOPLAY_MAX_STREAK", "50"))
+
 # How often (seconds) to edit the now-playing embed so the progress bar advances.
 NP_UPDATE_INTERVAL = 10
 

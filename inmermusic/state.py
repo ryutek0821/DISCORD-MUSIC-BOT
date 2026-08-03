@@ -24,6 +24,9 @@ class GuildState:
         self.pitch: int = 0              # pitch shift in semitones (-12–+12)
         self.volume: int = 100
         self.idle_timeout: int = 180
+        self.autoplay: bool = False      # keep the queue fed with related tracks
+        self.autoplay_streak: int = 0    # consecutive autoplay tracks; reset by any user request
+        self.autoplay_seed: Optional[Dict[str, Any]] = None  # track related songs are drawn from
         self.effect: str = "off"         # active effect preset (see EFFECT_FILTERS)
         self.seek_position: float = 0.0  # start offset (s) of the current FFmpeg source
         self.loops_at_swap: int = 0      # player.loops captured when seek_position was set
@@ -70,6 +73,7 @@ def hydrate_state(guild_id: int) -> GuildState:
     state.volume = settings["default_volume"]
     state.idle_timeout = settings["idle_timeout"]
     state.loop_mode = settings["loop_mode"]
+    state.autoplay = settings["autoplay"]
     state.persistence_hydrated = True
     return state
 

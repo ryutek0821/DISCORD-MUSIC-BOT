@@ -12,7 +12,7 @@ from .config import IDLE_TIMEOUT, logger
 _db_lock = threading.RLock()
 _SONG_FIELDS = {
     "url", "title", "duration", "thumbnail", "is_niconico", "needs_local",
-    "uploader", "text_channel_id", "requester", "requester_id",
+    "uploader", "text_channel_id", "requester", "requester_id", "autoplay",
 }
 
 
@@ -66,7 +66,8 @@ def _connect() -> sqlite3.Connection:
             guild_id INTEGER PRIMARY KEY,
             default_volume INTEGER NOT NULL DEFAULT 100,
             idle_timeout INTEGER NOT NULL DEFAULT 180,
-            loop_mode TEXT NOT NULL DEFAULT 'off'
+            loop_mode TEXT NOT NULL DEFAULT 'off',
+            autoplay INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS play_counts (
             guild_id INTEGER NOT NULL,
@@ -91,7 +92,21 @@ def _connect() -> sqlite3.Connection:
         );
         """
     )
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns that CREATE TABLE IF NOT EXISTS can't add to an older DB."""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(guild_settings)")
+    }
+    if "autoplay" not in columns:
+        conn.execute(
+            "ALTER TABLE guild_settings "
+            "ADD COLUMN autoplay INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
 
 
 def clean_song(song: Dict[str, Any]) -> Dict[str, Any]:
@@ -610,13 +625,14 @@ def get_settings(guild_id: int) -> Dict[str, Any]:
         "default_volume": 100,
         "idle_timeout": IDLE_TIMEOUT,
         "loop_mode": "off",
+        "autoplay": False,
     }
     try:
         with _db_lock:
             conn = _connect()
             try:
                 row = conn.execute(
-                    "SELECT default_volume, idle_timeout, loop_mode "
+                    "SELECT default_volume, idle_timeout, loop_mode, autoplay "
                     "FROM guild_settings WHERE guild_id = ?",
                     (guild_id,),
                 ).fetchone()
@@ -631,6 +647,7 @@ def get_settings(guild_id: int) -> Dict[str, Any]:
         "default_volume": max(0, min(200, int(row[0]))),
         "idle_timeout": max(30, min(3600, int(row[1]))),
         "loop_mode": row[2] if row[2] in {"off", "song", "queue"} else "off",
+        "autoplay": bool(row[3]),
     }
 
 
@@ -641,19 +658,23 @@ def update_settings(guild_id: int, **changes: Any) -> Dict[str, Any]:
     settings["idle_timeout"] = max(30, min(3600, int(settings["idle_timeout"])))
     if settings["loop_mode"] not in {"off", "song", "queue"}:
         settings["loop_mode"] = "off"
+    settings["autoplay"] = bool(settings["autoplay"])
     try:
         with _db_lock:
             conn = _connect()
             try:
                 conn.execute(
                     "INSERT INTO guild_settings "
-                    "(guild_id, default_volume, idle_timeout, loop_mode) VALUES (?, ?, ?, ?) "
+                    "(guild_id, default_volume, idle_timeout, loop_mode, autoplay) "
+                    "VALUES (?, ?, ?, ?, ?) "
                     "ON CONFLICT(guild_id) DO UPDATE SET "
                     "default_volume = excluded.default_volume, "
-                    "idle_timeout = excluded.idle_timeout, loop_mode = excluded.loop_mode",
+                    "idle_timeout = excluded.idle_timeout, "
+                    "loop_mode = excluded.loop_mode, autoplay = excluded.autoplay",
                     (
                         guild_id, settings["default_volume"],
                         settings["idle_timeout"], settings["loop_mode"],
+                        int(settings["autoplay"]),
                     ),
                 )
                 conn.commit()

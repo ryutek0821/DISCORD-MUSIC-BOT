@@ -726,6 +726,193 @@ def test_play_next_skip_and_drain():
         guild_states.pop(guild_b, None)
 
 
+class FakeVoiceChannel:
+    def __init__(self, humans=1, bots=1):
+        self.members = (
+            [type("M", (), {"bot": False})() for _ in range(humans)]
+            + [type("M", (), {"bot": True})() for _ in range(bots)]
+        )
+
+
+def test_youtube_video_id():
+    assert audio.youtube_video_id(
+        "https://www.youtube.com/watch?v=abc123&list=RDabc123") == "abc123"
+    assert audio.youtube_video_id("https://youtu.be/abc123") == "abc123"
+    assert audio.youtube_video_id("https://www.youtube.com/shorts/abc123") == "abc123"
+    assert audio.youtube_video_id("https://www.nicovideo.jp/watch/sm9") is None
+    assert audio.youtube_video_id("https://www.youtube.com/playlist?list=PL1") is None
+    assert audio.youtube_video_id(None) is None
+
+
+def test_autoplay_refill_and_guards():
+    """Autoplay refills a drained queue only for an occupied VC, and never
+    spins when there is nothing left to suggest."""
+    from inmermusic.state import get_state, guild_states
+
+    def song(title, needs_local=False):
+        return {"title": title, "url": f"https://www.youtube.com/watch?v={title}",
+                "needs_local": needs_local}
+
+    suggested = [song("rel1"), song("rel2")]
+    disconnects = []
+    lookups = []
+
+    def fake_related_songs(url, guild_id=None, limit=5):
+        lookups.append(url)
+        return [dict(s) for s in suggested]
+
+    def fake_load_history(guild_id, limit=20):
+        return []
+
+    def fake_make_audio_source(song, state, seek=0.0):
+        return "SENTINEL_SOURCE"
+
+    async def fake_announce_now_playing(gid):
+        pass
+
+    def fake_start_np_updater(gid, interval=None):
+        pass
+
+    async def fake_schedule_disconnect(gid):
+        disconnects.append(gid)
+
+    originals = {
+        name: getattr(playback, name) for name in (
+            "related_songs", "make_audio_source", "announce_now_playing",
+            "start_np_updater", "schedule_disconnect")
+    }
+    original_load_history = playback.persistence.load_history
+    playback.related_songs = fake_related_songs
+    playback.persistence.load_history = fake_load_history
+    playback.make_audio_source = fake_make_audio_source
+    playback.announce_now_playing = fake_announce_now_playing
+    playback.start_np_updater = fake_start_np_updater
+    playback.schedule_disconnect = fake_schedule_disconnect
+
+    guild_id = 900130
+    try:
+        # Autoplay off -> drained queue disconnects as before.
+        state = get_state(guild_id)
+        state.voice_client = FakeVoiceClient()
+        state.voice_client.channel = FakeVoiceChannel()
+        state.autoplay = False
+        asyncio.run(playback.play_next(guild_id))
+        assert disconnects == [guild_id] and lookups == []
+
+        # Autoplay on -> the seed's related tracks play instead.
+        guild_states.pop(guild_id, None)
+        state = get_state(guild_id)
+        state.voice_client = FakeVoiceClient()
+        state.voice_client.channel = FakeVoiceChannel()
+        state.autoplay = True
+        state.autoplay_seed = song("seed")
+        disconnects.clear()
+        asyncio.run(playback.play_next(guild_id))
+        assert lookups == [song("seed")["url"]]
+        assert state.current_song["title"] == "rel1"
+        assert state.current_song["autoplay"] is True
+        assert state.current_song["requester"] == "オートDJ"
+        assert [s["title"] for s in state.queue] == ["rel2"]
+        assert disconnects == []
+        assert state.autoplay_streak == 1
+
+        # Nobody left in the VC -> no lookup, straight to idle disconnect.
+        guild_states.pop(guild_id, None)
+        state = get_state(guild_id)
+        state.voice_client = FakeVoiceClient()
+        state.voice_client.channel = FakeVoiceChannel(humans=0)
+        state.autoplay = True
+        state.autoplay_seed = song("seed")
+        lookups.clear()
+        asyncio.run(playback.play_next(guild_id))
+        assert lookups == [] and disconnects == [guild_id]
+
+        # Streak cap reached -> stop refilling even with listeners present.
+        guild_states.pop(guild_id, None)
+        state = get_state(guild_id)
+        state.voice_client = FakeVoiceClient()
+        state.voice_client.channel = FakeVoiceChannel()
+        state.autoplay = True
+        state.autoplay_seed = song("seed")
+        state.autoplay_streak = config.AUTOPLAY_MAX_STREAK
+        lookups.clear()
+        disconnects.clear()
+        asyncio.run(playback.play_next(guild_id))
+        assert lookups == [] and disconnects == [guild_id]
+
+        # No suggestions at all -> exactly one attempt, then disconnect.
+        suggested.clear()
+        guild_states.pop(guild_id, None)
+        state = get_state(guild_id)
+        state.voice_client = FakeVoiceClient()
+        state.voice_client.channel = FakeVoiceChannel()
+        state.autoplay = True
+        state.autoplay_seed = song("seed")
+        lookups.clear()
+        disconnects.clear()
+        asyncio.run(playback.play_next(guild_id))
+        assert len(lookups) == 1 and disconnects == [guild_id]
+
+        # A user request resets the streak the next time it plays.
+        guild_states.pop(guild_id, None)
+        state = get_state(guild_id)
+        state.voice_client = FakeVoiceClient()
+        state.voice_client.channel = FakeVoiceChannel()
+        state.autoplay = True
+        state.autoplay_streak = 7
+        state.queue = [song("user-request")]
+        asyncio.run(playback.play_next(guild_id))
+        assert state.autoplay_streak == 0
+        assert state.autoplay_seed["title"] == "user-request"
+    finally:
+        for name, value in originals.items():
+            setattr(playback, name, value)
+        playback.persistence.load_history = original_load_history
+        guild_states.pop(guild_id, None)
+
+
+def test_autoplay_falls_back_to_history():
+    """A NicoNico seed yields no mix, so the guild's own history feeds the radio."""
+    from inmermusic.state import get_state, guild_states
+
+    history = [
+        {"title": "old1", "url": "https://www.nicovideo.jp/watch/sm1"},
+        {"title": "old2", "url": "https://www.nicovideo.jp/watch/sm2"},
+        {"title": "queued", "url": "https://www.nicovideo.jp/watch/sm3"},
+    ]
+
+    def fake_related_songs(url, guild_id=None, limit=5):
+        return []
+
+    def fake_load_history(guild_id, limit=20):
+        # The exclusion window asks for 30; the fallback pool asks for 200.
+        return history if limit >= 200 else history[:1]
+
+    original_related = playback.related_songs
+    original_load_history = playback.persistence.load_history
+    playback.related_songs = fake_related_songs
+    playback.persistence.load_history = fake_load_history
+
+    guild_id = 900131
+    try:
+        state = get_state(guild_id)
+        state.voice_client = FakeVoiceClient()
+        state.voice_client.channel = FakeVoiceChannel()
+        state.autoplay = True
+        state.autoplay_seed = {
+            "title": "seed", "url": "https://www.nicovideo.jp/watch/sm0"}
+        state.queue = [history[2]]
+        songs = asyncio.run(playback.collect_autoplay_songs(guild_id, state))
+        titles = {song["title"] for song in songs}
+        # old1 is in the recent window and "queued" is already queued.
+        assert titles == {"old2"}
+        assert songs[0]["autoplay"] is True
+    finally:
+        playback.related_songs = original_related
+        playback.persistence.load_history = original_load_history
+        guild_states.pop(guild_id, None)
+
+
 def test_cleanup_guild_state():
     from inmermusic.state import get_state, guild_states
 
@@ -1097,7 +1284,15 @@ def test_music_persistence_round_trip():
         settings = persistence.update_settings(
             7001, default_volume=140, idle_timeout=75, loop_mode="queue")
         assert settings == {
-            "default_volume": 140, "idle_timeout": 75, "loop_mode": "queue"}
+            "default_volume": 140, "idle_timeout": 75, "loop_mode": "queue",
+            "autoplay": False}
+        assert persistence.update_settings(7001, autoplay=True)["autoplay"] is True
+        assert persistence.get_settings(7001)["autoplay"] is True
+        # Turning it back off must persist: False is a value, not "unchanged".
+        assert persistence.update_settings(7001, autoplay=False)["autoplay"] is False
+        assert persistence.get_settings(7001) == {
+            "default_volume": 140, "idle_timeout": 75, "loop_mode": "queue",
+            "autoplay": False}
     finally:
         config.STATE_DIR = original_state_dir
         shutil.rmtree(directory)

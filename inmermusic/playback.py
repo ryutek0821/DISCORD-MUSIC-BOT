@@ -2,14 +2,16 @@
 progress-bar updater. Sits above audio + ui; imported by cog and bot."""
 import asyncio
 import os
+import random
 import time
 from typing import Any, Dict, Optional
 
 import discord
 
 from .audio import (cleanup_download, current_elapsed, download_audio,
-                    make_audio_source, reapply_audio_settings)
-from .config import (DOWNLOAD_TIMEOUT, EFFECT_DEBOUNCE, NP_UPDATE_INTERVAL,
+                    make_audio_source, reapply_audio_settings, related_songs)
+from .config import (AUTOPLAY_BATCH, AUTOPLAY_MAX_STREAK, DOWNLOAD_TIMEOUT,
+                     EFFECT_DEBOUNCE, NP_UPDATE_INTERVAL,
                      PREFETCH_MAX_BYTES, logger)
 from . import persistence
 from .state import GuildState, get_state, guild_states
@@ -370,6 +372,94 @@ def mark_resumed(state: GuildState) -> None:
     state.clock_paused = False
 
 
+def _human_listeners(state: GuildState) -> int:
+    """Count non-bot members in the bot's voice channel."""
+    vc = state.voice_client
+    channel = getattr(vc, "channel", None) if vc is not None else None
+    members = getattr(channel, "members", None) or []
+    return sum(1 for member in members if not getattr(member, "bot", False))
+
+
+def _autoplay_allowed(state: GuildState) -> bool:
+    """Autoplay only for an occupied VC, and only up to the streak cap.
+
+    Without both guards a queue that nobody is listening to would keep the bot
+    connected indefinitely, since a refilled queue never reaches the idle
+    disconnect branch.
+    """
+    if not state.autoplay:
+        return False
+    if state.autoplay_streak >= AUTOPLAY_MAX_STREAK:
+        logger.info("Autoplay streak cap reached, falling back to idle disconnect")
+        return False
+    return _human_listeners(state) > 0
+
+
+def _autoplay_fallback(guild_id: int, exclude: set) -> list:
+    """Re-draw from the guild's own history when no related track is usable."""
+    history = persistence.load_history(guild_id, 200)
+    pool = {}
+    for song in history:
+        url = song.get("url")
+        if url and url not in exclude:
+            pool.setdefault(url, song)
+    if not pool:
+        return []
+    picks = list(pool.values())
+    random.shuffle(picks)
+    return picks[:AUTOPLAY_BATCH]
+
+
+async def collect_autoplay_songs(guild_id: int, state: GuildState) -> list:
+    """Pick the next autoplay tracks: YouTube mix first, history second.
+
+    Never raises: a failed suggestion must leave the drain path free to fall
+    through to the normal idle disconnect.
+    """
+    seed = state.autoplay_seed or state.current_song
+    # Recently played tracks are excluded so the radio doesn't loop a handful
+    # of songs; the queue is checked too because a refill can race a /play.
+    exclude = {song.get("url") for song in persistence.load_history(guild_id, 30)}
+    exclude.update(song.get("url") for song in state.queue)
+    if state.current_song:
+        exclude.add(state.current_song.get("url"))
+    exclude.discard(None)
+
+    songs = []
+    seed_url = (seed or {}).get("url")
+    if seed_url:
+        loop = asyncio.get_running_loop()
+        try:
+            songs = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, related_songs, seed_url, guild_id, AUTOPLAY_BATCH * 4),
+                timeout=DOWNLOAD_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Autoplay suggestion lookup timed out")
+            songs = []
+        except Exception as e:
+            logger.warning(f"Autoplay suggestion lookup failed: {e}")
+            songs = []
+        songs = [song for song in songs if song.get("url") not in exclude]
+        songs = songs[:AUTOPLAY_BATCH]
+    if not songs:
+        songs = _autoplay_fallback(guild_id, exclude)
+
+    channel_id = (seed or {}).get("text_channel_id")
+    prepared = []
+    for song in songs:
+        song = dict(song)
+        song["autoplay"] = True
+        song["requester"] = "オートDJ"
+        song.pop("requester_id", None)
+        song["local_file"] = None
+        if channel_id is not None:
+            song["text_channel_id"] = channel_id
+        prepared.append(song)
+    return prepared
+
+
 async def advance_queue(guild_id: int, finished_song: Dict[str, Any],
                         expected_state: Optional[GuildState] = None,
                         failed: bool = False) -> None:
@@ -431,26 +521,48 @@ async def _play_next(guild_id: int, state: GuildState, announce: bool = True) ->
             return
         cancel_idle_task(guild_id)
 
+    autoplay_attempts = 0
     while True:
+        refill = False
         async with state.lock:
             if guild_states.get(guild_id) is not state:
                 return
             if not state.queue:
                 # Queue drained (empty from the start, or every remaining
-                # song failed).
-                state.current_song = None
-                await retire_now_playing(state)
+                # song failed). Autoplay gets a chance to refill it first; one
+                # empty refill ends the attempts so this can't spin.
+                refill = autoplay_attempts < 1 and _autoplay_allowed(state)
+                if not refill:
+                    state.current_song = None
+                    await retire_now_playing(state)
+                    persist_queue(state)
+                    logger.info(f"Queue empty, scheduling disconnect in {state.idle_timeout}s")
+                    cancel_idle_task(guild_id)
+                    state.idle_task = asyncio.create_task(schedule_disconnect(guild_id))
+                    return
+            else:
+                song = state.queue.pop(0)
+                state.current_song = song
+                state.sound_used = False
+                state.dispatching = True
+                state.autoplay_seed = song
+                state.autoplay_streak = (
+                    state.autoplay_streak + 1 if song.get("autoplay") else 0)
                 persist_queue(state)
-                logger.info(f"Queue empty, scheduling disconnect in {state.idle_timeout}s")
-                cancel_idle_task(guild_id)
-                state.idle_task = asyncio.create_task(schedule_disconnect(guild_id))
-                return
-            song = state.queue.pop(0)
-            state.current_song = song
-            state.sound_used = False
-            state.dispatching = True
-            persist_queue(state)
-            logger.info(f"Playing: {song['title']}")
+                logger.info(f"Playing: {song['title']}")
+
+        if refill:
+            # Extraction is blocking and slow, so it runs without the lock.
+            autoplay_attempts += 1
+            songs = await collect_autoplay_songs(guild_id, state)
+            async with state.lock:
+                if guild_states.get(guild_id) is not state:
+                    return
+                if songs and not state.queue:
+                    state.queue.extend(songs)
+                    persist_queue(state)
+                    logger.info(f"Autoplay queued {len(songs)} related track(s)")
+            continue
 
         # Capture the running loop so the threaded `after` callback can hop back.
         loop = asyncio.get_running_loop()
