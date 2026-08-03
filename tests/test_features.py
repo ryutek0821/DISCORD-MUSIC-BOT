@@ -518,7 +518,7 @@ def test_cog_registration():
         "stop", "pause", "resume", "nowplaying", "na-", "sound", "refresh",
         "playlist", "history", "historyplay", "previous", "replay",
         "favorite", "favorites",
-        "playfavorite", "unfavorite", "settings",
+        "playfavorite", "unfavorite", "settings", "stats", "playtop",
     }
     assert names == expected, (expected - names, names - expected)
     playlist = next(command for command in commands if command.name == "playlist")
@@ -1098,6 +1098,78 @@ def test_music_persistence_round_trip():
             7001, default_volume=140, idle_timeout=75, loop_mode="queue")
         assert settings == {
             "default_volume": 140, "idle_timeout": 75, "loop_mode": "queue"}
+    finally:
+        config.STATE_DIR = original_state_dir
+        shutil.rmtree(directory)
+
+
+def test_play_count_aggregation():
+    import shutil
+    import tempfile
+    from inmermusic import persistence
+
+    def track(name, duration=60, requester_id=42):
+        return {
+            "url": f"https://www.youtube.com/watch?v={name}",
+            "title": name,
+            "duration": duration,
+            "requester": "tester",
+            "requester_id": requester_id,
+        }
+
+    directory = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    config.STATE_DIR = directory
+    try:
+        for _ in range(3):
+            assert persistence.record_history(7101, track("alpha"))
+        assert persistence.record_history(7101, track("beta", duration=30))
+        # Another guild must not leak into 7101's totals.
+        assert persistence.record_history(7102, track("alpha"))
+
+        ranking = persistence.top_songs(7101)
+        assert [entry["title"] for entry in ranking] == ["alpha", "beta"]
+        assert ranking[0]["play_count"] == 3
+        assert ranking[0]["total_sec"] == 180
+        assert ranking[0]["song"]["url"] == track("alpha")["url"]
+        assert persistence.top_songs(7102)[0]["play_count"] == 1
+        assert persistence.guild_play_totals(7101) == {
+            "unique_tracks": 2, "plays": 4, "total_sec": 210}
+
+        # Ties break deterministically, so the ranking never reshuffles between
+        # calls (the ordering bug class behind #26).
+        for _ in range(2):
+            assert persistence.record_history(7101, track("beta", duration=30))
+        assert [entry["title"] for entry in persistence.top_songs(7101)] == \
+            [entry["title"] for entry in persistence.top_songs(7101)]
+
+        # history is trimmed to `limit` rows; the lifetime totals are not.
+        for index in range(5):
+            assert persistence.record_history(
+                7101, track(f"filler{index}"), limit=2)
+        assert len(persistence.load_history(7101, 50)) == 2
+        assert persistence.top_songs(7101)[0]["play_count"] == 3
+        assert persistence.guild_play_totals(7101)["plays"] == 11
+
+        djs = persistence.top_requesters(7101)
+        assert djs[0]["user_id"] == 42 and djs[0]["play_count"] == 11
+        assert persistence.record_history(7101, track("gamma", requester_id=99))
+        assert [entry["user_id"] for entry in persistence.top_requesters(7101)] == \
+            [42, 99]
+        assert persistence.user_play_stats(7101, 99)["play_count"] == 1
+        assert persistence.user_play_stats(7101, 12345) == {
+            "play_count": 0, "total_sec": 0, "songs": []}
+
+        # A song without a URL can't be keyed, so it is counted in history only.
+        before = persistence.guild_play_totals(7101)["plays"]
+        assert persistence.record_history(7101, {"title": "no url"})
+        assert persistence.guild_play_totals(7101)["plays"] == before
+
+        persistence.delete_guild_data(7101)
+        assert persistence.top_songs(7101) == []
+        assert persistence.top_requesters(7101) == []
+        assert persistence.guild_play_totals(7101)["plays"] == 0
+        assert persistence.top_songs(7102)[0]["play_count"] == 1
     finally:
         config.STATE_DIR = original_state_dir
         shutil.rmtree(directory)
