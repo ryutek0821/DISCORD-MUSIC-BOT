@@ -1,4 +1,4 @@
-# INMERMUSIC BOT
+# DISCORD MUSIC BOT
 
 [![CI](https://github.com/ryutek0821/DISCORD-MUSIC-BOT/actions/workflows/ci.yml/badge.svg)](https://github.com/ryutek0821/DISCORD-MUSIC-BOT/actions/workflows/ci.yml)
 
