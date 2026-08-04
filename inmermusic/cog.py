@@ -21,8 +21,11 @@ from .playback import (cancel_idle_task, cancel_prefetch, cancel_reapply,
                        persist_queue, play_next, play_sound_effect,
                        refresh_now_playing, resolve_text_channel,
                        retire_now_playing,
-                       schedule_reapply, start_np_updater, start_prefetch)
-from .state import get_state, guild_states, hydrate_state, move_queue_item
+                       schedule_disconnect, schedule_reapply,
+                       schedule_refresh_now_playing,
+                       start_np_updater, start_prefetch)
+from .state import (drop_if_idle, get_state, guild_states, hydrate_state,
+                    move_queue_item)
 from .ui import (MusicControls, QueuePaginationView, create_now_playing_embed,
                  create_queue_embed, create_queued_embed)
 from .util import fmt_duration, friendly_extract_error, parse_time
@@ -556,7 +559,7 @@ class MusicCog(commands.Cog):
         state.loop_mode = mode.value
         persistence.update_settings(interaction.guild.id, loop_mode=state.loop_mode)
         labels = {"off": "オフ", "song": "1曲リピート", "queue": "キュー全体リピート"}
-        await refresh_now_playing(interaction.guild.id)
+        schedule_refresh_now_playing(interaction.guild.id)
         await interaction.response.send_message(f"🔁 リピート: **{labels[state.loop_mode]}**")
 
     @app_commands.command(name="shuffle", description="Shuffle the queue")
@@ -578,7 +581,7 @@ class MusicCog(commands.Cog):
         state.speed = round(rate, 2)
         if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
             schedule_reapply(interaction.guild.id)
-            await refresh_now_playing(interaction.guild.id)
+            schedule_refresh_now_playing(interaction.guild.id)
         await interaction.response.send_message(f"🎚️ 速度を **{state.speed:.2f}x** にしました。")
 
     @app_commands.command(name="pitch", description="Set pitch shift in semitones (-12 to +12)")
@@ -589,7 +592,7 @@ class MusicCog(commands.Cog):
         state.pitch = semitones
         if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
             schedule_reapply(interaction.guild.id)
-            await refresh_now_playing(interaction.guild.id)
+            schedule_refresh_now_playing(interaction.guild.id)
         await interaction.response.send_message(f"🎚️ ピッチを **{state.pitch:+d}半音** にしました。")
 
     @app_commands.command(name="seek", description="Jump to a position in the current song")
@@ -627,7 +630,7 @@ class MusicCog(commands.Cog):
         state.volume = level
         if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
             schedule_reapply(interaction.guild.id)
-            await refresh_now_playing(interaction.guild.id)
+            schedule_refresh_now_playing(interaction.guild.id)
         await interaction.response.send_message(f"🔊 音量を **{level}%** にしました。")
 
     @app_commands.command(name="preset", description="Apply an audio effect preset")
@@ -642,7 +645,7 @@ class MusicCog(commands.Cog):
         state.effect = preset["effect"]
         if vc and (vc.is_playing() or vc.is_paused()) and not state.is_playing_sound:
             schedule_reapply(interaction.guild.id)
-            await refresh_now_playing(interaction.guild.id)
+            schedule_refresh_now_playing(interaction.guild.id)
         await interaction.response.send_message(f"🎛️ プリセット **{name.name}** を適用しました。")
 
     @app_commands.command(name="remove", description="Remove a song from the queue by position")
@@ -961,6 +964,12 @@ class MusicCog(commands.Cog):
                     state.voice_client and (
                         state.voice_client.is_playing() or state.voice_client.is_paused())):
                 state.volume = settings["default_volume"]
+            if idle_timeout is not None and state.idle_task is not None:
+                # schedule_disconnect reads idle_timeout once, at task start, so
+                # a timer already sleeping would otherwise honor the old value.
+                cancel_idle_task(interaction.guild.id)
+                state.idle_task = asyncio.create_task(
+                    schedule_disconnect(interaction.guild.id))
         await interaction.response.send_message(
             "⚙️ サーバー設定\n"
             f"デフォルト音量: **{settings['default_volume']}%**\n"
@@ -1072,6 +1081,7 @@ class MusicCog(commands.Cog):
             mark_paused(get_state(interaction.guild.id), vc)
             vc.pause()
             await interaction.response.send_message("一時停止しました。")
+            await refresh_now_playing(interaction.guild.id)
         else:
             await interaction.response.send_message("再生していません。")
 
@@ -1082,6 +1092,7 @@ class MusicCog(commands.Cog):
             vc.resume()
             mark_resumed(get_state(interaction.guild.id))
             await interaction.response.send_message("再開しました。")
+            await refresh_now_playing(interaction.guild.id)
         else:
             await interaction.response.send_message("一時停止していません。")
 
@@ -1148,6 +1159,22 @@ class MusicCog(commands.Cog):
             await interaction.followup.send("Cookieを更新しました！", ephemeral=True)
         else:
             await interaction.followup.send("Cookieの更新に失敗しました", ephemeral=True)
+
+    @commands.Cog.listener()
+    async def on_app_command_completion(
+        self, interaction: discord.Interaction, command,
+    ):
+        """Release a GuildState that ended the command holding nothing.
+
+        interaction_check hydrates a state for almost every command, so a guild
+        that only ever browses (/queue, /nowplaying, …) used to be registered
+        forever — cleanup_guild_state only ever fires for guilds the bot was in
+        a VC with. drop_if_idle keeps anything the user actually set.
+        """
+        if interaction.guild is None:
+            return
+        if drop_if_idle(interaction.guild.id):
+            logger.debug(f"Dropped idle guild state {interaction.guild.id}")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
