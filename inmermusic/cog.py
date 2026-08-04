@@ -281,6 +281,10 @@ class MusicCog(commands.Cog):
                 song["text_channel_id"] = interaction.channel.id
                 song["requester"] = interaction.user.display_name
                 song["requester_id"] = interaction.user.id
+                # A re-queued autoplay track (history/stats/favorites) is a user
+                # request now: clear the flag so it isn't shown or counted as
+                # autoplay (which would also extend the autoplay streak).
+                song.pop("autoplay", None)
                 prepared.append(song)
                 existing_urls.add(song.get("url"))
 
@@ -676,6 +680,7 @@ class MusicCog(commands.Cog):
         if song is None:
             await interaction.response.send_message("以前の再生履歴はありません。")
             return
+        song.pop("autoplay", None)  # replaying it is a user request, not autoplay
         state.queue.insert(0, song)
         cancel_prefetch(state)
         persist_queue(state)
