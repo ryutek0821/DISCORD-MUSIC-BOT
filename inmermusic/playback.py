@@ -18,6 +18,11 @@ from .state import GuildState, get_state, guild_states
 from .ui import MusicControls, create_now_playing_embed
 from .util import fmt_duration, short_extract_error
 
+# The control panel is a stateless persistent view; one instance serves every
+# guild. Building a fresh one per edit allocated a new View (and its child
+# components) on every progress-bar tick.
+MUSIC_CONTROLS = MusicControls()
+
 
 def cancel_idle_task(guild_id: int) -> None:
     state = guild_states.get(guild_id)
@@ -84,10 +89,16 @@ def start_np_updater(guild_id: int, interval: float = NP_UPDATE_INTERVAL) -> Non
                     break
                 if not (vc.is_playing() or vc.is_paused()):
                     break
+                if vc.is_paused():
+                    # current_elapsed is frozen at paused_position while
+                    # paused, so this edit would resend an identical embed
+                    # every interval — forever, if nobody resumes. Idle here
+                    # instead and pick back up on resume.
+                    continue
                 elapsed = current_elapsed(vc, state)
                 try:
                     embed = create_now_playing_embed(song, elapsed=elapsed, state=state)
-                    await msg.edit(embed=embed, view=MusicControls())
+                    await msg.edit(embed=embed, view=MUSIC_CONTROLS)
                 except Exception as e:
                     logger.warning(f"Failed to update now playing message: {e}")
                     break
@@ -109,9 +120,44 @@ async def refresh_now_playing(guild_id: int) -> None:
     elapsed = current_elapsed(vc, state) if playing else None
     try:
         embed = create_now_playing_embed(song, elapsed=elapsed, state=state)
-        await msg.edit(embed=embed, view=MusicControls())
+        await msg.edit(embed=embed, view=MUSIC_CONTROLS)
     except Exception as e:
         logger.warning(f"Failed to refresh now playing message: {e}")
+
+
+def cancel_np_refresh(state: GuildState) -> None:
+    """Cancel a pending debounced panel refresh, if any."""
+    if state.np_refresh_task and not state.np_refresh_task.done():
+        state.np_refresh_task.cancel()
+    state.np_refresh_task = None
+
+
+def schedule_refresh_now_playing(guild_id: int) -> None:
+    """Debounce panel edits the way schedule_reapply debounces source swaps.
+
+    Mashing a speed/pitch/effect button used to queue one message.edit per
+    press. The audio only changes once, after EFFECT_DEBOUNCE, but the edits
+    piled up against Discord's rate limit and the panel lagged the sound by
+    seconds. Coalesce them into a single edit fired just after the swap.
+    """
+    state = get_state(guild_id)
+    cancel_np_refresh(state)
+
+    async def _refresh():
+        try:
+            # Slightly behind the source swap so the panel renders the values
+            # that are actually playing.
+            await asyncio.sleep(EFFECT_DEBOUNCE + 0.1)
+            if guild_states.get(guild_id) is not state:
+                return
+            await refresh_now_playing(guild_id)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if state.np_refresh_task is asyncio.current_task():
+                state.np_refresh_task = None
+
+    state.np_refresh_task = asyncio.create_task(_refresh())
 
 
 def cancel_reapply(state: GuildState) -> None:
@@ -172,7 +218,7 @@ async def announce_now_playing(guild_id: int) -> None:
         embed = create_now_playing_embed(song, elapsed=0.0, state=state)
         text_channel = resolve_text_channel(vc.channel.guild, song)
         if text_channel:
-            state.np_message = await text_channel.send(embed=embed, view=MusicControls())
+            state.np_message = await text_channel.send(embed=embed, view=MUSIC_CONTROLS)
             start_np_updater(guild_id)
     except Exception as e:
         logger.warning(f"Failed to send now playing message: {e}")
@@ -248,6 +294,24 @@ def persist_queue(state: GuildState) -> None:
                      + list(state.queue))
     ]
     persistence.submit_write(persistence.save_queue, state.guild_id, songs)
+
+
+def active_download_paths() -> set:
+    """Every temp file some guild is currently playing or holding for later.
+
+    The periodic temp sweep is age-based, so a track playing longer than the
+    sweep's max_age would otherwise be deleted mid-playback.
+    """
+    paths = set()
+    for state in list(guild_states.values()):
+        songs = ([state.current_song] if state.current_song else []) + list(state.queue)
+        if state.prefetch_song:
+            songs.append(state.prefetch_song)
+        for song in songs:
+            path = song.get("local_file")
+            if path:
+                paths.add(path)
+    return paths
 
 
 def cancel_prefetch(state: GuildState) -> None:
@@ -356,6 +420,7 @@ def cleanup_guild_state(guild_id: int, *, clear_persisted: bool = True) -> None:
         return
     cancel_idle_task(guild_id)
     cancel_np_updater(state)
+    cancel_np_refresh(state)  # debounced panel edit; same leak class as reapply
     cancel_reapply(state)  # previously never cancelled at teardown
     cancel_prefetch(state)
     for song in (([state.current_song] if state.current_song else []) + state.queue):
@@ -603,9 +668,14 @@ async def _play_next(guild_id: int, state: GuildState, announce: bool = True) ->
         def after_play(error, song=song, generation=generation):
             if error:
                 logger.error(f"Play error: {error}")
+            if state.is_playing_sound:
+                # A sound effect stopped this source deliberately; the song is
+                # about to resume from the same file. Deleting it here forced a
+                # full re-download (seconds of silence, sometimes a skip).
+                return
             cleanup_download(song.get("local_file"))
             song["local_file"] = None
-            if not state.is_playing_sound and guild_states.get(guild_id) is state:
+            if guild_states.get(guild_id) is state:
                 async def _finish() -> None:
                     if error:
                         await notify_skip(
@@ -676,6 +746,10 @@ async def _play_next(guild_id: int, state: GuildState, announce: bool = True) ->
                 persist_queue(state)
         except Exception as e:
             logger.error(f"Play failed: {e}")
+            # The song is already popped, so cleanup_guild_state won't see it:
+            # drop its download here or the dl_* dir leaks until the sweep.
+            cleanup_download(song.get("local_file"))
+            song["local_file"] = None
             await notify_skip(guild_id, song, "再生エラー", expected_state=state)
             state.dispatching = False
             continue
@@ -807,6 +881,8 @@ async def restart_song(guild_id: int, expected_state: Optional[GuildState] = Non
     except Exception as e:
         logger.error(f"Failed to restart song: {e}")
         state.is_playing_sound = False
+        cleanup_download(song.get("local_file"))
+        song["local_file"] = None
         state.skip_flag = True  # forced skip: don't let advance_queue re-loop this song
         await notify_skip(guild_id, song, "再開失敗", expected_state=state)
         await advance_queue(

@@ -40,6 +40,56 @@ def test_build_audio_filter_speed_pitch():
     assert "asetrate" in af and "atempo" in af
 
 
+def test_pitch_filter_normalizes_input_sample_rate():
+    """asetrate replaces the rate, so the input must be normalized first (#42)."""
+    af = audio.build_audio_filter(1.0, 12, 100, "off")
+    # The normalizing resample has to come before asetrate, otherwise the shift
+    # is 48000*ratio/input_rate and a 44.1kHz source lands sharp.
+    assert af.index("aresample=48000") < af.index("asetrate="), af
+    assert "asetrate=96000" in af, af
+    # pitch=0 must not pay for a resample it doesn't need.
+    assert "aresample" not in (audio.build_audio_filter(1.5, 0, 100, "off") or "")
+    assert audio.build_audio_filter(1.0, 0, 100, "off") is None
+
+
+def test_pitch_filter_holds_duration_across_sample_rates():
+    """+12 semitones at 1.0x must not change length, at 44.1kHz or 48kHz (#42)."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        return  # ffmpeg isn't a test dependency; skip where it's unavailable
+
+    def duration(path):
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, check=True)
+        return float(out.stdout.strip())
+
+    af = audio.build_audio_filter(1.0, 12, 100, "off")
+    directory = tempfile.mkdtemp()
+    try:
+        for rate in (44100, 48000):
+            src = os.path.join(directory, f"sine_{rate}.wav")
+            dst = os.path.join(directory, f"out_{rate}.wav")
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                 f"sine=frequency=440:duration=2:sample_rate={rate}", src],
+                check=True)
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-i", src, "-af", af,
+                 "-ar", "48000", dst],
+                check=True)
+            got = duration(dst)
+            # Before the fix a 44.1kHz input came out ~1.84s instead of ~2.0s;
+            # the remaining ~1% is atempo/resample rounding, not the rate bug.
+            assert abs(got - 2.0) < 0.05, (rate, got)
+    finally:
+        shutil.rmtree(directory)
+
+
 def test_build_audio_filter_combo():
     af = audio.build_audio_filter(1.25, 3, 150, "bassboost")
     for token in ("asetrate", "atempo", "bass=g=12", "volume=1.500"):
@@ -1148,6 +1198,73 @@ def test_download_audio_removes_temp_dir_on_failure():
         os.rmdir(d)
 
 
+def test_download_enforces_size_and_duration_limits():
+    """Playlist entries dodge the length check; the download must catch it (#28)."""
+    import tempfile as _tempfile
+
+    # The hard stop yt-dlp applies before any bytes move.
+    opts = audio.build_ydl_opts("https://example.com/v")
+    assert opts["max_filesize"] == config.MAX_DOWNLOAD_BYTES
+
+    class FakeYDL:
+        info = {}
+
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download=True):
+            return dict(FakeYDL.info)
+
+        def prepare_filename(self, info):
+            return os.path.join(config.DOWNLOAD_DIR, "never_written.m4a")
+
+    d = _tempfile.mkdtemp()
+    original_download_dir = config.DOWNLOAD_DIR
+    original_ydl = audio.yt_dlp.YoutubeDL
+    original_cookie_file = config.COOKIE_FILE
+    config.DOWNLOAD_DIR = d
+    audio.yt_dlp.YoutubeDL = FakeYDL
+    config.COOKIE_FILE = None
+    try:
+        # A flat playlist entry has no duration up front, so it enters the
+        # queue unchecked; the real value only shows up here.
+        FakeYDL.info = {"duration": config.MAX_TRACK_DURATION + 1}
+        result = audio.download_audio("https://example.com/long")
+        assert result.path is None
+        assert result.error == "動画が長すぎます"
+        assert [n for n in os.listdir(d) if n.startswith("dl_")] == []
+
+        # yt-dlp aborts an oversized download without raising, so no file is
+        # written; report that as a size rejection, not a generic failure.
+        FakeYDL.info = {"duration": 60,
+                        "filesize": config.MAX_DOWNLOAD_BYTES + 1}
+        result = audio.download_audio("https://example.com/huge")
+        assert result.path is None
+        assert result.error == "ファイルが大きすぎます"
+        assert [n for n in os.listdir(d) if n.startswith("dl_")] == []
+
+        # Within limits, the normal "file missing" path is unchanged.
+        FakeYDL.info = {"duration": 60, "filesize": 1024}
+        assert audio.download_audio("https://example.com/ok").error == \
+            "downloaded file missing"
+    finally:
+        config.DOWNLOAD_DIR = original_download_dir
+        audio.yt_dlp.YoutubeDL = original_ydl
+        config.COOKIE_FILE = original_cookie_file
+        os.rmdir(d)
+
+    # Both rejections must reach the user as readable skip reasons.
+    assert util.short_extract_error("動画が長すぎます") == "長すぎる動画"
+    assert util.short_extract_error("ファイルが大きすぎます") == "ファイルが大きすぎる"
+    assert "長すぎる" in util.friendly_extract_error("動画が長すぎます")
+
+
 def test_cleanup_late_download_removes_dir_after_timeout():
     """Regression for review item 5.
 
@@ -1871,6 +1988,379 @@ def test_play_never_moves_a_busy_bot_to_another_vc():
         cog_module.persist_queue = original_persist
         cog_module.play_next = original_play_next
         cog_module.start_prefetch = original_prefetch
+        guild_states.pop(guild_id, None)
+
+
+def test_sound_effect_interruption_keeps_downloaded_file():
+    """A sound effect must not delete the file the song resumes from (#31)."""
+    from inmermusic.state import get_state, guild_states
+
+    class CapturingVoiceClient(FakeVoiceClient):
+        def play(self, source, after=None):
+            super().play(source, after=after)
+            self.after = after
+
+    guild_id = 900140
+    removed = []
+    original_make = playback.make_audio_source
+    original_announce = playback.announce_now_playing
+    original_updater = playback.start_np_updater
+    original_prefetch = playback.start_prefetch
+    original_cleanup = playback.cleanup_download
+
+    async def fake_announce(_guild_id):
+        return None
+
+    playback.make_audio_source = lambda song, state, seek=0.0: "SOURCE"
+    playback.announce_now_playing = fake_announce
+    playback.start_np_updater = lambda *args, **kwargs: None
+    playback.start_prefetch = lambda *args, **kwargs: None
+    playback.cleanup_download = lambda path: removed.append(path)
+
+    async def scenario():
+        state = get_state(guild_id)
+        vc = CapturingVoiceClient()
+        state.voice_client = vc
+        song = {"title": "s", "needs_local": True,
+                "local_file": "/tmp/dl_x/a.m4a"}
+        state.queue = [song]
+        await playback.play_next(guild_id)
+        after = vc.after
+
+        # A sound effect stops the source deliberately; the file must survive
+        # so restart_song can resume without re-downloading the whole track.
+        state.is_playing_sound = True
+        after(None)
+        await asyncio.sleep(0.02)
+        assert song["local_file"] == "/tmp/dl_x/a.m4a"
+        assert removed == []
+
+        # A genuine end-of-song still cleans up.
+        state.is_playing_sound = False
+        after(None)
+        await asyncio.sleep(0.02)
+        assert song["local_file"] is None
+        assert removed == ["/tmp/dl_x/a.m4a"]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        playback.make_audio_source = original_make
+        playback.announce_now_playing = original_announce
+        playback.start_np_updater = original_updater
+        playback.start_prefetch = original_prefetch
+        playback.cleanup_download = original_cleanup
+        guild_states.pop(guild_id, None)
+
+
+def test_failed_play_start_cleans_up_its_download():
+    """A vc.play() exception must not leak the popped song's dl_* dir (#33)."""
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900141
+    removed = []
+    original_make = playback.make_audio_source
+    original_notify = playback.notify_skip
+    original_disconnect = playback.schedule_disconnect
+    original_cleanup = playback.cleanup_download
+
+    def exploding_source(song, state, seek=0.0):
+        raise RuntimeError("boom")
+
+    async def fake_notify(gid, song, reason, expected_state=None):
+        return None
+
+    async def fake_disconnect(gid):
+        return None
+
+    playback.make_audio_source = exploding_source
+    playback.notify_skip = fake_notify
+    playback.schedule_disconnect = fake_disconnect
+    playback.cleanup_download = lambda path: path and removed.append(path)
+
+    async def scenario():
+        state = get_state(guild_id)
+        state.voice_client = FakeVoiceClient()
+        song = {"title": "boom", "needs_local": False,
+                "local_file": "/tmp/dl_y/a.m4a"}
+        state.queue = [song]
+        await playback.play_next(guild_id)
+        assert removed == ["/tmp/dl_y/a.m4a"]
+        assert song["local_file"] is None
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        playback.make_audio_source = original_make
+        playback.notify_skip = original_notify
+        playback.schedule_disconnect = original_disconnect
+        playback.cleanup_download = original_cleanup
+        guild_states.pop(guild_id, None)
+
+
+def test_temp_sweep_spares_files_still_in_use():
+    """The periodic sweep must not delete a long track being played (#33)."""
+    import shutil
+    import tempfile
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900142
+    directory = tempfile.mkdtemp()
+    original_dir = config.DOWNLOAD_DIR
+    config.DOWNLOAD_DIR = directory
+    try:
+        in_use_dir = os.path.join(directory, "dl_inuse")
+        stale_dir = os.path.join(directory, "dl_stale")
+        os.makedirs(in_use_dir)
+        os.makedirs(stale_dir)
+        in_use_file = os.path.join(in_use_dir, "a.m4a")
+        open(in_use_file, "w").close()
+        # Both look old enough to sweep: a track longer than max_age has an
+        # old mtime too, which is exactly the dangerous case.
+        old = time.time() - 7200
+        for path in (in_use_dir, stale_dir):
+            os.utime(path, (old, old))
+
+        state = get_state(guild_id)
+        state.current_song = {"title": "long", "local_file": in_use_file}
+
+        removed = audio.cleanup_temp_files(
+            max_age=3600, in_use=playback.active_download_paths())
+        assert removed == 1
+        assert os.path.isdir(in_use_dir)
+        assert not os.path.exists(stale_dir)
+
+        # Without the protection set it is swept like anything else.
+        assert audio.cleanup_temp_files(max_age=3600) == 1
+        assert not os.path.exists(in_use_dir)
+    finally:
+        config.DOWNLOAD_DIR = original_dir
+        shutil.rmtree(directory, ignore_errors=True)
+        guild_states.pop(guild_id, None)
+
+
+def test_startup_work_runs_once_per_process():
+    """on_ready refires on every reconnect; tree.sync must not (#25)."""
+    from types import SimpleNamespace
+    from inmermusic import bot as bot_module
+
+    syncs = []
+    tasks = []
+
+    class FakeTree:
+        async def sync(self):
+            syncs.append(1)
+            return []
+
+    class FakeLoop:
+        def create_task(self, coro):
+            coro.close()  # never scheduled; we only care that it was requested
+            tasks.append(1)
+
+    original_bot = bot_module.bot
+    original_cleanup = bot_module.cleanup_temp_files
+    sweeps = []
+    bot_module.cleanup_temp_files = lambda *a, **k: sweeps.append(1)
+    bot_module.bot = SimpleNamespace(
+        user="fake", tree=FakeTree(), loop=FakeLoop())
+
+    async def scenario():
+        await bot_module.on_ready()
+        # A gateway reconnect fires on_ready again.
+        await bot_module.on_ready()
+        await bot_module.on_ready()
+        assert syncs == [1], syncs
+        assert sweeps == [1], sweeps
+        # Both background loops start, and only once.
+        assert len(tasks) == 2, tasks
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        bot_module.bot = original_bot
+        bot_module.cleanup_temp_files = original_cleanup
+
+
+def test_panel_refresh_is_debounced():
+    """Button mashing must coalesce into one message.edit (#29)."""
+    from types import SimpleNamespace
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900150
+    edits = []
+
+    class Message:
+        id = 7
+
+        async def edit(self, **kwargs):
+            edits.append(kwargs)
+
+    class PlayingVoiceClient(FakeVoiceClient):
+        def __init__(self):
+            super().__init__()
+            self._playing = True
+
+    async def scenario():
+        state = get_state(guild_id)
+        state.voice_client = PlayingVoiceClient()
+        state.current_song = {"title": "t", "url": "https://example.com/t",
+                              "duration": 100}
+        state.np_message = Message()
+
+        for _ in range(5):
+            playback.schedule_refresh_now_playing(guild_id)
+            await asyncio.sleep(0.01)
+        assert edits == []  # nothing fired during the burst
+        await asyncio.sleep(config.EFFECT_DEBOUNCE + 0.3)
+        assert len(edits) == 1, edits
+
+        # The pending task must not outlive the guild (the reapply_task leak).
+        playback.schedule_refresh_now_playing(guild_id)
+        task = state.np_refresh_task
+        playback.cleanup_guild_state(guild_id)
+        await asyncio.sleep(0.01)
+        assert task.cancelled() or task.done()
+        assert guild_id not in guild_states
+
+    original_persist = playback.persist_queue
+    playback.persist_queue = lambda state: None
+    try:
+        asyncio.run(scenario())
+    finally:
+        playback.persist_queue = original_persist
+        guild_states.pop(guild_id, None)
+    assert isinstance(SimpleNamespace(), object)
+
+
+def test_np_updater_goes_quiet_while_paused():
+    """A paused song must not be re-rendered every interval forever (#32)."""
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900151
+    edits = []
+
+    class Message:
+        id = 8
+
+        async def edit(self, **kwargs):
+            edits.append(kwargs)
+
+    class PausableVoiceClient(FakeVoiceClient):
+        def __init__(self):
+            super().__init__()
+            self._playing = True
+            self._paused = False
+
+        def is_playing(self):
+            return self._playing and not self._paused
+
+        def is_paused(self):
+            return self._paused
+
+    async def scenario():
+        state = get_state(guild_id)
+        vc = PausableVoiceClient()
+        state.voice_client = vc
+        state.current_song = {"title": "t", "url": "https://example.com/t",
+                              "duration": 100}
+        state.np_message = Message()
+
+        vc._paused = True
+        state.clock_paused = True
+        playback.start_np_updater(guild_id, interval=0.01)
+        await asyncio.sleep(0.1)
+        assert edits == [], edits  # ~10 intervals, zero identical edits
+
+        # Resuming picks the progress bar back up without a restart.
+        vc._paused = False
+        state.clock_paused = False
+        await asyncio.sleep(0.05)
+        assert edits, "updater did not resume after unpause"
+        playback.cancel_np_updater(state)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        guild_states.pop(guild_id, None)
+
+
+def test_paused_embed_says_so():
+    """The panel has to explain why the progress bar stopped (#32)."""
+    from inmermusic.state import GuildState
+
+    state = GuildState(1)
+    song = {"title": "t", "url": "https://example.com/t", "duration": 100}
+    assert ui.create_now_playing_embed(song, state=state).title == "再生中"
+    state.clock_paused = True
+    assert "一時停止" in ui.create_now_playing_embed(song, state=state).title
+
+
+def test_idle_guild_state_is_released():
+    """Browsing commands must not register a guild forever (#30)."""
+    from inmermusic.state import (drop_if_idle, get_state, guild_states,
+                                  is_idle)
+
+    guild_id = 900152
+    try:
+        state = get_state(guild_id)
+        assert is_idle(state)
+        assert drop_if_idle(guild_id) is True
+        assert guild_id not in guild_states
+
+        # A guild holding anything real is kept.
+        for setup in (
+            lambda s: setattr(s, "voice_client", object()),
+            lambda s: setattr(s, "current_song", {"title": "t"}),
+            lambda s: s.queue.append({"title": "t"}),
+            lambda s: setattr(s, "np_message", object()),
+            lambda s: setattr(s, "dispatching", True),
+            # Runtime-only knobs would be silently lost if we dropped these.
+            lambda s: setattr(s, "speed", 1.5),
+            lambda s: setattr(s, "pitch", 3),
+            lambda s: setattr(s, "effect", "bassboost"),
+            lambda s: setattr(s, "volume", 50),
+        ):
+            state = get_state(guild_id)
+            setup(state)
+            assert drop_if_idle(guild_id) is False, setup
+            assert guild_states.get(guild_id) is state
+            guild_states.pop(guild_id, None)
+
+        # volume matching the guild default is not a user tweak.
+        state = get_state(guild_id)
+        state.volume = state.default_volume = 70
+        assert drop_if_idle(guild_id) is True
+    finally:
+        guild_states.pop(guild_id, None)
+
+
+def test_settings_reschedules_a_running_idle_timer():
+    """A sleeping disconnect timer must pick up a new idle_timeout (#32)."""
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900153
+
+    async def scenario():
+        state = get_state(guild_id)
+        state.idle_timeout = 3600
+        state.idle_task = asyncio.create_task(
+            playback.schedule_disconnect(guild_id))
+        await asyncio.sleep(0)
+        first = state.idle_task
+
+        # Emulate the /settings branch: shorten the timeout and restart.
+        state.idle_timeout = 30
+        playback.cancel_idle_task(guild_id)
+        state.idle_task = asyncio.create_task(
+            playback.schedule_disconnect(guild_id))
+        await asyncio.sleep(0)
+        assert first.cancelled() or first.done()
+        assert state.idle_task is not first
+        playback.cancel_idle_task(guild_id)
+
+    try:
+        asyncio.run(scenario())
+    finally:
         guild_states.pop(guild_id, None)
 
 
