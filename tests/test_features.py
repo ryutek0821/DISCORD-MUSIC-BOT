@@ -1266,14 +1266,16 @@ def test_music_persistence_round_trip():
         assert persistence.pop_history(7001)["url"] == song["url"]
         assert persistence.load_history(7001) == []
 
-        assert persistence.save_named_playlist(7001, "Favorites", [song], 42)
+        assert persistence.save_named_playlist(
+            7001, "Favorites", [song], 42) == "saved"
         assert persistence.count_named_playlists(7001) == 1
         assert persistence.load_named_playlist(7001, "favorites")[0]["title"] == \
             "persist me"
         playlists = persistence.list_named_playlists(7001)
         assert playlists[0]["name"] == "Favorites"
         assert playlists[0]["song_count"] == 1
-        assert persistence.delete_named_playlist(7001, "FAVORITES")
+        assert persistence.delete_named_playlist(
+            7001, "FAVORITES", 42) == "deleted"
         assert persistence.count_named_playlists(7001) == 0
 
         assert persistence.add_favorite(7001, 42, song)
@@ -1293,6 +1295,96 @@ def test_music_persistence_round_trip():
         assert persistence.get_settings(7001) == {
             "default_volume": 140, "idle_timeout": 75, "loop_mode": "queue",
             "autoplay": False}
+    finally:
+        config.STATE_DIR = original_state_dir
+        shutil.rmtree(directory)
+
+
+def test_favorite_position_is_stable_across_limits():
+    """/favorites and /unfavorite must number the same rows (issue #26)."""
+    import shutil
+    import tempfile
+    from inmermusic import persistence
+
+    directory = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    config.STATE_DIR = directory
+    try:
+        # Added back-to-back, so created_at ties at whole-second resolution.
+        # Insert order is deliberately not url order.
+        for index in [3, 0, 4, 1, 2]:
+            assert persistence.add_favorite(7101, 42, {
+                "url": f"https://www.youtube.com/watch?v=fav{index}",
+                "title": f"favorite {index}",
+                "duration": 60,
+            })
+        shown = persistence.load_favorites(7101, 42, config.FAVORITES_PAGE_SIZE)
+        assert len(shown) == 5
+        # Ties resolve by url, not by whatever order the query plan happens to
+        # produce — otherwise position 1 can mean two different songs.
+        assert [song["url"] for song in shown] == sorted(
+            song["url"] for song in shown)
+        # A different LIMIT may pick a different plan; the order must not depend
+        # on it, since /favorites and /unfavorite resolve positions separately.
+        assert [song["url"] for song in persistence.load_favorites(7101, 42, 200)] \
+            == [song["url"] for song in shown]
+
+        removed = persistence.remove_favorite(7101, 42, 1)
+        assert removed["url"] == shown[0]["url"]
+        assert [song["url"] for song in persistence.load_favorites(7101, 42)] \
+            == [song["url"] for song in shown[1:]]
+    finally:
+        config.STATE_DIR = original_state_dir
+        shutil.rmtree(directory)
+
+
+def test_named_playlist_requires_owner_or_manage_guild():
+    """Only the creator (or an admin) may overwrite/delete a playlist (#36)."""
+    import shutil
+    import tempfile
+    from inmermusic import persistence
+
+    def track(url):
+        return {"url": url, "title": url, "duration": 60}
+
+    owner, other = 111, 222
+    directory = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    config.STATE_DIR = directory
+    try:
+        assert persistence.save_named_playlist(
+            7102, "rock", [track("https://example.com/a")], owner) == "saved"
+
+        # Another member can neither overwrite nor delete, and must not become
+        # the owner by trying.
+        assert persistence.save_named_playlist(
+            7102, "rock", [track("https://example.com/b")], other) == "denied"
+        assert persistence.delete_named_playlist(7102, "rock", other) == "denied"
+        meta = persistence.get_named_playlist_meta(7102, "ROCK")
+        assert meta["owner_id"] == owner
+        assert persistence.load_named_playlist(7102, "rock")[0]["url"] == \
+            "https://example.com/a"
+
+        # The owner can overwrite; ownership stays put.
+        assert persistence.save_named_playlist(
+            7102, "rock", [track("https://example.com/c")], owner) == "saved"
+        assert persistence.load_named_playlist(7102, "rock")[0]["url"] == \
+            "https://example.com/c"
+        assert persistence.get_named_playlist_meta(7102, "rock")["owner_id"] == owner
+
+        # Manage Guild overrides, but still does not transfer ownership.
+        assert persistence.save_named_playlist(
+            7102, "rock", [track("https://example.com/d")], other,
+            force=True) == "saved"
+        assert persistence.get_named_playlist_meta(7102, "rock")["owner_id"] == owner
+        assert persistence.load_named_playlist(7102, "rock")[0]["url"] == \
+            "https://example.com/d"
+
+        assert persistence.delete_named_playlist(7102, "nope", owner) == "missing"
+        assert persistence.delete_named_playlist(
+            7102, "rock", other, force=True) == "deleted"
+        assert persistence.get_named_playlist_meta(7102, "rock") is None
+        assert persistence.count_named_playlists(7102) == 0
     finally:
         config.STATE_DIR = original_state_dir
         shutil.rmtree(directory)

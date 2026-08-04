@@ -7,7 +7,7 @@ import time
 from typing import Any, Dict, Iterable, List, Optional
 
 from . import config
-from .config import IDLE_TIMEOUT, logger
+from .config import FAVORITES_PAGE_SIZE, IDLE_TIMEOUT, logger
 
 _db_lock = threading.RLock()
 _SONG_FIELDS = {
@@ -452,33 +452,64 @@ def count_named_playlists(guild_id: int) -> int:
     return int(row[0]) if row else 0
 
 
+def get_named_playlist_meta(guild_id: int, name: str) -> Optional[Dict[str, Any]]:
+    """Owner and metadata for one playlist, or None when it does not exist."""
+    try:
+        with _db_lock:
+            conn = _connect()
+            try:
+                row = conn.execute(
+                    "SELECT name, owner_id, updated_at FROM named_playlists "
+                    "WHERE guild_id = ? AND name_key = ?",
+                    (guild_id, _playlist_key(name)),
+                ).fetchone()
+            finally:
+                conn.close()
+    except (OSError, sqlite3.Error) as e:
+        logger.warning(f"Failed to read playlist meta for guild {guild_id}: {e}")
+        return None
+    if row is None:
+        return None
+    return {"name": row[0], "owner_id": row[1], "updated_at": row[2]}
+
+
 def save_named_playlist(
     guild_id: int, name: str, songs: Iterable[Dict[str, Any]], owner_id: int,
-) -> bool:
+    force: bool = False,
+) -> str:
+    """Create or overwrite a playlist. Returns "saved", "denied", or "error".
+
+    Overwriting an existing playlist requires `owner_id` to match the stored
+    owner (or `force`, for Manage Guild). The ownership test lives in the SQL
+    itself, so a caller's pre-check can't be raced, and `owner_id` is never
+    updated on conflict — overwriting must not transfer ownership.
+    """
     payload = json.dumps([clean_song(song) for song in songs], ensure_ascii=False)
     try:
         with _db_lock:
             conn = _connect()
             try:
-                conn.execute(
+                cursor = conn.execute(
                     "INSERT INTO named_playlists "
                     "(guild_id, name_key, name, songs_json, owner_id, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(guild_id, name_key) DO UPDATE SET "
                     "name = excluded.name, songs_json = excluded.songs_json, "
-                    "owner_id = excluded.owner_id, updated_at = excluded.updated_at",
+                    "updated_at = excluded.updated_at "
+                    "WHERE ? = 1 OR named_playlists.owner_id = excluded.owner_id",
                     (
                         guild_id, _playlist_key(name), name.strip(), payload,
-                        owner_id, int(time.time()),
+                        owner_id, int(time.time()), 1 if force else 0,
                     ),
                 )
                 conn.commit()
             finally:
                 conn.close()
-        return True
     except (OSError, sqlite3.Error) as e:
         logger.warning(f"Failed to save playlist for guild {guild_id}: {e}")
-        return False
+        return "error"
+    # A suppressed DO UPDATE reports zero changes: someone else owns the name.
+    return "saved" if cursor.rowcount > 0 else "denied"
 
 
 def load_named_playlist(guild_id: int, name: str) -> List[Dict[str, Any]]:
@@ -537,23 +568,40 @@ def list_named_playlists(guild_id: int) -> List[Dict[str, Any]]:
     return result
 
 
-def delete_named_playlist(guild_id: int, name: str) -> bool:
+def delete_named_playlist(
+    guild_id: int, name: str, user_id: Optional[int] = None, force: bool = False,
+) -> str:
+    """Delete a playlist. Returns "deleted", "denied", "missing", or "error".
+
+    `user_id` must match the stored owner unless `force` (Manage Guild) is set;
+    the condition is part of the DELETE so a pre-check can't be raced. Passing
+    neither `user_id` nor `force` deletes nothing.
+    """
+    key = _playlist_key(name)
     try:
         with _db_lock:
             conn = _connect()
             try:
                 cursor = conn.execute(
                     "DELETE FROM named_playlists "
-                    "WHERE guild_id = ? AND name_key = ?",
-                    (guild_id, _playlist_key(name)),
+                    "WHERE guild_id = ? AND name_key = ? "
+                    "AND (? = 1 OR owner_id = ?)",
+                    (guild_id, key, 1 if force else 0, user_id),
                 )
                 conn.commit()
+                if cursor.rowcount > 0:
+                    return "deleted"
+                exists = conn.execute(
+                    "SELECT 1 FROM named_playlists "
+                    "WHERE guild_id = ? AND name_key = ?",
+                    (guild_id, key),
+                ).fetchone()
             finally:
                 conn.close()
     except (OSError, sqlite3.Error) as e:
         logger.warning(f"Failed to delete playlist for guild {guild_id}: {e}")
-        return False
-    return cursor.rowcount > 0
+        return "error"
+    return "denied" if exists else "missing"
 
 
 def add_favorite(guild_id: int, user_id: int, song: Dict[str, Any]) -> bool:
@@ -581,7 +629,8 @@ def add_favorite(guild_id: int, user_id: int, song: Dict[str, Any]) -> bool:
 
 
 def remove_favorite(guild_id: int, user_id: int, position: int) -> Optional[Dict[str, Any]]:
-    songs = load_favorites(guild_id, user_id, limit=200)
+    # Same window as /favorites, so `position` resolves to the row the user read.
+    songs = load_favorites(guild_id, user_id, limit=FAVORITES_PAGE_SIZE)
     if not 1 <= position <= len(songs):
         return None
     song = songs[position - 1]
@@ -602,14 +651,20 @@ def remove_favorite(guild_id: int, user_id: int, position: int) -> Optional[Dict
         return None
 
 
-def load_favorites(guild_id: int, user_id: int, limit: int = 25) -> List[Dict[str, Any]]:
+def load_favorites(
+    guild_id: int, user_id: int, limit: int = FAVORITES_PAGE_SIZE,
+) -> List[Dict[str, Any]]:
     try:
         with _db_lock:
             conn = _connect()
             try:
+                # `created_at` is whole seconds, so favorites added in the same
+                # second tie. Without the `url` tiebreaker SQLite may order ties
+                # differently per query plan, and the number shown by /favorites
+                # would no longer address the same row as /unfavorite.
                 rows = conn.execute(
                     "SELECT song_json FROM favorites WHERE guild_id = ? AND user_id = ? "
-                    "ORDER BY created_at DESC LIMIT ?",
+                    "ORDER BY created_at DESC, url LIMIT ?",
                     (guild_id, user_id, limit),
                 ).fetchall()
             finally:

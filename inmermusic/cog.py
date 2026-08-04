@@ -11,7 +11,8 @@ from . import cookies, persistence
 from .audio import (cleanup_download, current_elapsed, extract_audio_url,
                     extract_playlist, is_playlist_url, search_candidates, swap_source_at,
                     validate_query)
-from .config import (EFFECT_LABELS, EFFECT_PRESETS, MAX_PLAYLIST_NAME_LEN,
+from .config import (EFFECT_LABELS, EFFECT_PRESETS, FAVORITES_PAGE_SIZE,
+                     MAX_PLAYLIST_NAME_LEN,
                      MAX_PLAYLIST_SIZE, MAX_PLAYLISTS_PER_GUILD, MAX_QUEUE_SIZE,
                      list_sound_names, logger,
                      resolve_sound)
@@ -367,18 +368,39 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(
                 "保存できる曲がありません。", ephemeral=True)
             return
-        rows = persistence.list_named_playlists(interaction.guild.id)
-        overwriting = any(
-            row["name"].casefold() == stripped.casefold() for row in rows)
-        if not overwriting and len(rows) >= MAX_PLAYLISTS_PER_GUILD:
+        existing = persistence.get_named_playlist_meta(
+            interaction.guild.id, stripped)
+        overwriting = existing is not None
+        if not overwriting and (
+                persistence.count_named_playlists(interaction.guild.id)
+                >= MAX_PLAYLISTS_PER_GUILD):
             await interaction.response.send_message(
                 f"保存できるプレイリストは{MAX_PLAYLISTS_PER_GUILD}個までです。",
                 ephemeral=True,
             )
             return
-        saved = persistence.save_named_playlist(
-            interaction.guild.id, stripped, songs, interaction.user.id)
-        if not saved:
+        manage_guild = getattr(
+            interaction.user.guild_permissions, "manage_guild", False)
+        if overwriting and existing["owner_id"] != interaction.user.id \
+                and not manage_guild:
+            await interaction.response.send_message(
+                f"**{existing['name']}** は <@{existing['owner_id']}> の"
+                "プレイリストです。上書きできるのは作成者またはサーバー管理者のみです。",
+                ephemeral=True,
+            )
+            return
+        result = persistence.save_named_playlist(
+            interaction.guild.id, stripped, songs, interaction.user.id,
+            force=manage_guild)
+        if result == "denied":
+            # Lost a race: someone created/claimed the name between the check
+            # above and the write. The SQL guard refused it.
+            await interaction.response.send_message(
+                "そのプレイリストは他のユーザーのものです。上書きできませんでした。",
+                ephemeral=True,
+            )
+            return
+        if result != "saved":
             await interaction.response.send_message(
                 "プレイリストの保存に失敗しました。", ephemeral=True)
             return
@@ -411,7 +433,10 @@ class MusicCog(commands.Cog):
         for row in rows:
             embed.add_field(
                 name=row["name"],
-                value=f"{row['song_count']}曲・更新 <t:{row['updated_at']}:f>",
+                value=(
+                    f"{row['song_count']}曲・作成 <@{row['owner_id']}>"
+                    f"・更新 <t:{row['updated_at']}:f>"
+                ),
                 inline=False,
             )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -419,12 +444,24 @@ class MusicCog(commands.Cog):
     @playlist_group.command(name="delete", description="保存済みプレイリストを削除")
     @app_commands.describe(name="削除するプレイリスト名")
     async def playlist_delete(self, interaction: discord.Interaction, name: str):
-        if persistence.delete_named_playlist(interaction.guild.id, name):
+        manage_guild = getattr(
+            interaction.user.guild_permissions, "manage_guild", False)
+        result = persistence.delete_named_playlist(
+            interaction.guild.id, name, interaction.user.id, force=manage_guild)
+        if result == "deleted":
             await interaction.response.send_message(
                 f"🗑️ **{name}** を削除しました。", ephemeral=True)
-        else:
+        elif result == "denied":
+            await interaction.response.send_message(
+                f"**{name}** を削除できるのは作成者またはサーバー管理者のみです。",
+                ephemeral=True,
+            )
+        elif result == "missing":
             await interaction.response.send_message(
                 "そのプレイリストは見つかりません。", ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                "プレイリストの削除に失敗しました。", ephemeral=True)
 
     async def _playlist_autocomplete(
         self, interaction: discord.Interaction, current: str,
@@ -824,7 +861,7 @@ class MusicCog(commands.Cog):
     @app_commands.command(name="favorites", description="Show your favorite tracks")
     async def favorites_cmd(self, interaction: discord.Interaction):
         songs = persistence.load_favorites(
-            interaction.guild.id, interaction.user.id, 25)
+            interaction.guild.id, interaction.user.id, FAVORITES_PAGE_SIZE)
         if not songs:
             await interaction.response.send_message(
                 "お気に入りはありません。", ephemeral=True)
@@ -848,7 +885,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("VCに参加してください。")
             return
         songs = persistence.load_favorites(
-            interaction.guild.id, interaction.user.id, 25)
+            interaction.guild.id, interaction.user.id, FAVORITES_PAGE_SIZE)
         if not 1 <= position <= len(songs):
             await interaction.response.send_message(
                 f"1〜{len(songs)} の範囲で指定してください。" if songs

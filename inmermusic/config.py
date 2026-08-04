@@ -100,6 +100,10 @@ MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))
 MAX_PLAYLIST_NAME_LEN = 50
 MAX_PLAYLISTS_PER_GUILD = int(os.getenv("MAX_PLAYLISTS_PER_GUILD", "25"))
 MAX_PLAYLIST_SIZE = int(os.getenv("MAX_PLAYLIST_SIZE", "50"))
+# How many favorites /favorites lists and /playfavorite / /unfavorite address by
+# number. Display and removal must share this window, or the position a user
+# reads and the position that gets deleted can refer to different tracks.
+FAVORITES_PAGE_SIZE = 25
 # Prefetch is deliberately bounded to one queued track per guild. Reject an
 # unexpectedly large file instead of allowing a single guild to fill the disk.
 PREFETCH_MAX_BYTES = int(os.getenv("PREFETCH_MAX_BYTES", str(256 * 1024 * 1024)))
