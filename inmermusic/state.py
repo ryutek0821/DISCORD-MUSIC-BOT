@@ -23,6 +23,7 @@ class GuildState:
         self.speed: float = 1.0          # playback tempo (0.5–2.0), pitch preserved
         self.pitch: int = 0              # pitch shift in semitones (-12–+12)
         self.volume: int = 100
+        self.default_volume: int = 100  # guild default; volume != this is a user tweak
         self.idle_timeout: int = 180
         self.autoplay: bool = False      # keep the queue fed with related tracks
         self.autoplay_streak: int = 0    # consecutive autoplay tracks; reset by any user request
@@ -41,6 +42,7 @@ class GuildState:
         self.paused_position: float = 0.0
         self.np_message: Optional[discord.Message] = None  # live now-playing message
         self.np_updater: Optional[asyncio.Task] = None      # progress-bar refresh loop
+        self.np_refresh_task: Optional[asyncio.Task] = None  # debounced panel edit
         self.reapply_task: Optional[asyncio.Task] = None    # debounced source-swap timer
         self.prefetch_task: Optional[asyncio.Task] = None   # next-track download
         self.prefetch_song: Optional[Dict[str, Any]] = None
@@ -82,11 +84,49 @@ def hydrate_state(guild_id: int) -> GuildState:
         state.queue = persistence.load_queue(guild_id)
         state.restored_count = len(state.queue)
     state.volume = settings["default_volume"]
+    state.default_volume = settings["default_volume"]
     state.idle_timeout = settings["idle_timeout"]
     state.loop_mode = settings["loop_mode"]
     state.autoplay = settings["autoplay"]
     state.persistence_hydrated = True
     return state
+
+
+def is_idle(state: GuildState) -> bool:
+    """True when a state holds nothing worth keeping in memory.
+
+    Deliberately strict: anything the user set but hasn't persisted (speed,
+    pitch, effect, a volume tweak) counts as "in use", because dropping the
+    state would silently discard it. loop_mode/autoplay/idle_timeout live in
+    the settings table, so they survive either way.
+    """
+    if state.voice_client is not None or state.current_song is not None:
+        return False
+    if state.queue or state.np_message is not None:
+        return False
+    if state.dispatching or state.is_playing_sound:
+        return False
+    if any(task is not None for task in (
+            state.idle_task, state.np_updater, state.np_refresh_task,
+            state.reapply_task, state.prefetch_task)):
+        return False
+    return (state.speed == 1.0 and state.pitch == 0 and state.effect == "off"
+            and state.volume == state.default_volume)
+
+
+def drop_if_idle(guild_id: int) -> bool:
+    """Unregister a guild whose state is empty. Returns True if dropped.
+
+    Nearly every command runs hydrate_state, which registers a GuildState even
+    for a guild that never plays anything — and the only unregister path
+    (cleanup_guild_state) assumes the bot was in a VC. Without this, browsing
+    commands alone grow guild_states without bound.
+    """
+    state = guild_states.get(guild_id)
+    if state is None or not is_idle(state):
+        return False
+    guild_states.pop(guild_id, None)
+    return True
 
 
 def move_queue_item(queue: List[Any], from_pos: int, to_pos: int) -> bool:

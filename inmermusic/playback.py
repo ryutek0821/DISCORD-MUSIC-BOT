@@ -18,6 +18,11 @@ from .state import GuildState, get_state, guild_states
 from .ui import MusicControls, create_now_playing_embed
 from .util import fmt_duration, short_extract_error
 
+# The control panel is a stateless persistent view; one instance serves every
+# guild. Building a fresh one per edit allocated a new View (and its child
+# components) on every progress-bar tick.
+MUSIC_CONTROLS = MusicControls()
+
 
 def cancel_idle_task(guild_id: int) -> None:
     state = guild_states.get(guild_id)
@@ -82,10 +87,16 @@ def start_np_updater(guild_id: int, interval: float = NP_UPDATE_INTERVAL) -> Non
                     break
                 if not (vc.is_playing() or vc.is_paused()):
                     break
+                if vc.is_paused():
+                    # current_elapsed is frozen at paused_position while
+                    # paused, so this edit would resend an identical embed
+                    # every interval — forever, if nobody resumes. Idle here
+                    # instead and pick back up on resume.
+                    continue
                 elapsed = current_elapsed(vc, state)
                 try:
                     embed = create_now_playing_embed(song, elapsed=elapsed, state=state)
-                    await msg.edit(embed=embed, view=MusicControls())
+                    await msg.edit(embed=embed, view=MUSIC_CONTROLS)
                 except Exception as e:
                     logger.warning(f"Failed to update now playing message: {e}")
                     break
@@ -107,9 +118,44 @@ async def refresh_now_playing(guild_id: int) -> None:
     elapsed = current_elapsed(vc, state) if playing else None
     try:
         embed = create_now_playing_embed(song, elapsed=elapsed, state=state)
-        await msg.edit(embed=embed, view=MusicControls())
+        await msg.edit(embed=embed, view=MUSIC_CONTROLS)
     except Exception as e:
         logger.warning(f"Failed to refresh now playing message: {e}")
+
+
+def cancel_np_refresh(state: GuildState) -> None:
+    """Cancel a pending debounced panel refresh, if any."""
+    if state.np_refresh_task and not state.np_refresh_task.done():
+        state.np_refresh_task.cancel()
+    state.np_refresh_task = None
+
+
+def schedule_refresh_now_playing(guild_id: int) -> None:
+    """Debounce panel edits the way schedule_reapply debounces source swaps.
+
+    Mashing a speed/pitch/effect button used to queue one message.edit per
+    press. The audio only changes once, after EFFECT_DEBOUNCE, but the edits
+    piled up against Discord's rate limit and the panel lagged the sound by
+    seconds. Coalesce them into a single edit fired just after the swap.
+    """
+    state = get_state(guild_id)
+    cancel_np_refresh(state)
+
+    async def _refresh():
+        try:
+            # Slightly behind the source swap so the panel renders the values
+            # that are actually playing.
+            await asyncio.sleep(EFFECT_DEBOUNCE + 0.1)
+            if guild_states.get(guild_id) is not state:
+                return
+            await refresh_now_playing(guild_id)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if state.np_refresh_task is asyncio.current_task():
+                state.np_refresh_task = None
+
+    state.np_refresh_task = asyncio.create_task(_refresh())
 
 
 def cancel_reapply(state: GuildState) -> None:
@@ -170,7 +216,7 @@ async def announce_now_playing(guild_id: int) -> None:
         embed = create_now_playing_embed(song, elapsed=0.0, state=state)
         text_channel = resolve_text_channel(vc.channel.guild, song)
         if text_channel:
-            state.np_message = await text_channel.send(embed=embed, view=MusicControls())
+            state.np_message = await text_channel.send(embed=embed, view=MUSIC_CONTROLS)
             start_np_updater(guild_id)
     except Exception as e:
         logger.warning(f"Failed to send now playing message: {e}")
@@ -364,6 +410,7 @@ def cleanup_guild_state(guild_id: int, *, clear_persisted: bool = True) -> None:
         return
     cancel_idle_task(guild_id)
     cancel_np_updater(state)
+    cancel_np_refresh(state)  # debounced panel edit; same leak class as reapply
     cancel_reapply(state)  # previously never cancelled at teardown
     cancel_prefetch(state)
     for song in (([state.current_song] if state.current_song else []) + state.queue):

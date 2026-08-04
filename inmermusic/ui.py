@@ -42,7 +42,9 @@ def effect_status_line(state: GuildState) -> str:
 def create_now_playing_embed(song: Dict[str, Any], *, elapsed: Optional[float] = None,
                              state: Optional[GuildState] = None) -> discord.Embed:
     """Create a 'now playing' embed, optionally with a progress bar and effects."""
-    title = "再生中"
+    # The progress-bar updater goes quiet while paused (its embed would be
+    # byte-identical every tick), so the title has to say why it stopped.
+    title = "⏸️ 一時停止中" if state is not None and state.clock_paused else "再生中"
     if state is not None and state.loop_mode != "off":
         loop_labels = {"song": "🔁 1曲リピート", "queue": "🔁 全体リピート"}
         title += f"  {loop_labels.get(state.loop_mode, '')}"
@@ -190,6 +192,11 @@ class MusicControls(discord.ui.View):
         elif vc and vc.is_paused():
             vc.resume()
             playback.mark_resumed(get_state(interaction.guild.id))
+        else:
+            return
+        # One edit at the transition; the periodic updater stays quiet while
+        # paused and picks the progress bar back up on resume.
+        await playback.refresh_now_playing(interaction.guild.id)
 
     @discord.ui.button(emoji="⏭️", style=discord.ButtonStyle.secondary, custom_id="music:skip")
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -223,7 +230,7 @@ class MusicControls(discord.ui.View):
         state.loop_mode = order.get(state.loop_mode, "off")
         from . import persistence
         persistence.update_settings(interaction.guild.id, loop_mode=state.loop_mode)
-        await playback.refresh_now_playing(interaction.guild.id)
+        playback.schedule_refresh_now_playing(interaction.guild.id)
 
     @discord.ui.button(emoji="🔀", style=discord.ButtonStyle.secondary, custom_id="music:shuffle")
     async def shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -254,7 +261,7 @@ class MusicControls(discord.ui.View):
         if effect is not None:
             state.effect = effect
         playback.schedule_reapply(interaction.guild.id)
-        await playback.refresh_now_playing(interaction.guild.id)
+        playback.schedule_refresh_now_playing(interaction.guild.id)
 
     @discord.ui.button(emoji="🐢", label="遅く", style=discord.ButtonStyle.secondary, row=1, custom_id="music:slow_down")
     async def slow_down(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -298,7 +305,7 @@ class MusicControls(discord.ui.View):
         state.pitch = preset["pitch"]
         state.effect = preset["effect"]
         playback.schedule_reapply(interaction.guild.id)
-        await playback.refresh_now_playing(interaction.guild.id)
+        playback.schedule_refresh_now_playing(interaction.guild.id)
 
     @discord.ui.button(emoji="📻", label="自動再生", style=discord.ButtonStyle.secondary, row=3, custom_id="music:autoplay")
     async def autoplay(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -308,7 +315,7 @@ class MusicControls(discord.ui.View):
         state.autoplay = not state.autoplay
         state.autoplay_streak = 0
         persistence.update_settings(interaction.guild.id, autoplay=state.autoplay)
-        await playback.refresh_now_playing(interaction.guild.id)
+        playback.schedule_refresh_now_playing(interaction.guild.id)
 
     @discord.ui.select(
         placeholder="🎛️ エフェクトプリセットを選択…",

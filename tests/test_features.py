@@ -2181,6 +2181,189 @@ def test_startup_work_runs_once_per_process():
         bot_module.cleanup_temp_files = original_cleanup
 
 
+def test_panel_refresh_is_debounced():
+    """Button mashing must coalesce into one message.edit (#29)."""
+    from types import SimpleNamespace
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900150
+    edits = []
+
+    class Message:
+        id = 7
+
+        async def edit(self, **kwargs):
+            edits.append(kwargs)
+
+    class PlayingVoiceClient(FakeVoiceClient):
+        def __init__(self):
+            super().__init__()
+            self._playing = True
+
+    async def scenario():
+        state = get_state(guild_id)
+        state.voice_client = PlayingVoiceClient()
+        state.current_song = {"title": "t", "url": "https://example.com/t",
+                              "duration": 100}
+        state.np_message = Message()
+
+        for _ in range(5):
+            playback.schedule_refresh_now_playing(guild_id)
+            await asyncio.sleep(0.01)
+        assert edits == []  # nothing fired during the burst
+        await asyncio.sleep(config.EFFECT_DEBOUNCE + 0.3)
+        assert len(edits) == 1, edits
+
+        # The pending task must not outlive the guild (the reapply_task leak).
+        playback.schedule_refresh_now_playing(guild_id)
+        task = state.np_refresh_task
+        playback.cleanup_guild_state(guild_id)
+        await asyncio.sleep(0.01)
+        assert task.cancelled() or task.done()
+        assert guild_id not in guild_states
+
+    original_persist = playback.persist_queue
+    playback.persist_queue = lambda state: None
+    try:
+        asyncio.run(scenario())
+    finally:
+        playback.persist_queue = original_persist
+        guild_states.pop(guild_id, None)
+    assert isinstance(SimpleNamespace(), object)
+
+
+def test_np_updater_goes_quiet_while_paused():
+    """A paused song must not be re-rendered every interval forever (#32)."""
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900151
+    edits = []
+
+    class Message:
+        id = 8
+
+        async def edit(self, **kwargs):
+            edits.append(kwargs)
+
+    class PausableVoiceClient(FakeVoiceClient):
+        def __init__(self):
+            super().__init__()
+            self._playing = True
+            self._paused = False
+
+        def is_playing(self):
+            return self._playing and not self._paused
+
+        def is_paused(self):
+            return self._paused
+
+    async def scenario():
+        state = get_state(guild_id)
+        vc = PausableVoiceClient()
+        state.voice_client = vc
+        state.current_song = {"title": "t", "url": "https://example.com/t",
+                              "duration": 100}
+        state.np_message = Message()
+
+        vc._paused = True
+        state.clock_paused = True
+        playback.start_np_updater(guild_id, interval=0.01)
+        await asyncio.sleep(0.1)
+        assert edits == [], edits  # ~10 intervals, zero identical edits
+
+        # Resuming picks the progress bar back up without a restart.
+        vc._paused = False
+        state.clock_paused = False
+        await asyncio.sleep(0.05)
+        assert edits, "updater did not resume after unpause"
+        playback.cancel_np_updater(state)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        guild_states.pop(guild_id, None)
+
+
+def test_paused_embed_says_so():
+    """The panel has to explain why the progress bar stopped (#32)."""
+    from inmermusic.state import GuildState
+
+    state = GuildState(1)
+    song = {"title": "t", "url": "https://example.com/t", "duration": 100}
+    assert ui.create_now_playing_embed(song, state=state).title == "再生中"
+    state.clock_paused = True
+    assert "一時停止" in ui.create_now_playing_embed(song, state=state).title
+
+
+def test_idle_guild_state_is_released():
+    """Browsing commands must not register a guild forever (#30)."""
+    from inmermusic.state import (drop_if_idle, get_state, guild_states,
+                                  is_idle)
+
+    guild_id = 900152
+    try:
+        state = get_state(guild_id)
+        assert is_idle(state)
+        assert drop_if_idle(guild_id) is True
+        assert guild_id not in guild_states
+
+        # A guild holding anything real is kept.
+        for setup in (
+            lambda s: setattr(s, "voice_client", object()),
+            lambda s: setattr(s, "current_song", {"title": "t"}),
+            lambda s: s.queue.append({"title": "t"}),
+            lambda s: setattr(s, "np_message", object()),
+            lambda s: setattr(s, "dispatching", True),
+            # Runtime-only knobs would be silently lost if we dropped these.
+            lambda s: setattr(s, "speed", 1.5),
+            lambda s: setattr(s, "pitch", 3),
+            lambda s: setattr(s, "effect", "bassboost"),
+            lambda s: setattr(s, "volume", 50),
+        ):
+            state = get_state(guild_id)
+            setup(state)
+            assert drop_if_idle(guild_id) is False, setup
+            assert guild_states.get(guild_id) is state
+            guild_states.pop(guild_id, None)
+
+        # volume matching the guild default is not a user tweak.
+        state = get_state(guild_id)
+        state.volume = state.default_volume = 70
+        assert drop_if_idle(guild_id) is True
+    finally:
+        guild_states.pop(guild_id, None)
+
+
+def test_settings_reschedules_a_running_idle_timer():
+    """A sleeping disconnect timer must pick up a new idle_timeout (#32)."""
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900153
+
+    async def scenario():
+        state = get_state(guild_id)
+        state.idle_timeout = 3600
+        state.idle_task = asyncio.create_task(
+            playback.schedule_disconnect(guild_id))
+        await asyncio.sleep(0)
+        first = state.idle_task
+
+        # Emulate the /settings branch: shorten the timeout and restart.
+        state.idle_timeout = 30
+        playback.cancel_idle_task(guild_id)
+        state.idle_task = asyncio.create_task(
+            playback.schedule_disconnect(guild_id))
+        await asyncio.sleep(0)
+        assert first.cancelled() or first.done()
+        assert state.idle_task is not first
+        playback.cancel_idle_task(guild_id)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        guild_states.pop(guild_id, None)
+
+
 def test_nico_cli_never_prints_session_secret():
     import contextlib
     import io
