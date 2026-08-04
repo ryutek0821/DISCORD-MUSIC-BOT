@@ -108,6 +108,10 @@ FAVORITES_PAGE_SIZE = 25
 # unexpectedly large file instead of allowing a single guild to fill the disk.
 PREFETCH_MAX_BYTES = int(os.getenv("PREFETCH_MAX_BYTES", str(256 * 1024 * 1024)))
 
+# How often (seconds) to reap orphaned dl_* temp dirs. A startup-only sweep
+# leaves anything leaked mid-run sitting on disk until the next restart.
+TEMP_SWEEP_INTERVAL = int(os.getenv("TEMP_SWEEP_INTERVAL", "3600"))
+
 # Autoplay (radio mode): how many tracks to append per refill, and how many
 # autoplay tracks may play back-to-back before the bot stops refilling. The
 # streak cap is what keeps an empty-but-occupied VC from playing forever; any

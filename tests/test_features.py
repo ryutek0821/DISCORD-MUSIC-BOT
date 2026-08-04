@@ -10,6 +10,7 @@ __name__ == "__main__", so importing here never starts the bot.
 import asyncio
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -37,6 +38,56 @@ def test_build_audio_filter_speed_pitch():
     af = audio.build_audio_filter(1.0, 3, 100, "off")
     # pitch via asetrate shifts speed; atempo compensates back
     assert "asetrate" in af and "atempo" in af
+
+
+def test_pitch_filter_normalizes_input_sample_rate():
+    """asetrate replaces the rate, so the input must be normalized first (#42)."""
+    af = audio.build_audio_filter(1.0, 12, 100, "off")
+    # The normalizing resample has to come before asetrate, otherwise the shift
+    # is 48000*ratio/input_rate and a 44.1kHz source lands sharp.
+    assert af.index("aresample=48000") < af.index("asetrate="), af
+    assert "asetrate=96000" in af, af
+    # pitch=0 must not pay for a resample it doesn't need.
+    assert "aresample" not in (audio.build_audio_filter(1.5, 0, 100, "off") or "")
+    assert audio.build_audio_filter(1.0, 0, 100, "off") is None
+
+
+def test_pitch_filter_holds_duration_across_sample_rates():
+    """+12 semitones at 1.0x must not change length, at 44.1kHz or 48kHz (#42)."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        return  # ffmpeg isn't a test dependency; skip where it's unavailable
+
+    def duration(path):
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, check=True)
+        return float(out.stdout.strip())
+
+    af = audio.build_audio_filter(1.0, 12, 100, "off")
+    directory = tempfile.mkdtemp()
+    try:
+        for rate in (44100, 48000):
+            src = os.path.join(directory, f"sine_{rate}.wav")
+            dst = os.path.join(directory, f"out_{rate}.wav")
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                 f"sine=frequency=440:duration=2:sample_rate={rate}", src],
+                check=True)
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-i", src, "-af", af,
+                 "-ar", "48000", dst],
+                check=True)
+            got = duration(dst)
+            # Before the fix a 44.1kHz input came out ~1.84s instead of ~2.0s;
+            # the remaining ~1% is atempo/resample rounding, not the rate bug.
+            assert abs(got - 2.0) < 0.05, (rate, got)
+    finally:
+        shutil.rmtree(directory)
 
 
 def test_build_audio_filter_combo():
@@ -1871,6 +1922,196 @@ def test_play_never_moves_a_busy_bot_to_another_vc():
         cog_module.play_next = original_play_next
         cog_module.start_prefetch = original_prefetch
         guild_states.pop(guild_id, None)
+
+
+def test_sound_effect_interruption_keeps_downloaded_file():
+    """A sound effect must not delete the file the song resumes from (#31)."""
+    from inmermusic.state import get_state, guild_states
+
+    class CapturingVoiceClient(FakeVoiceClient):
+        def play(self, source, after=None):
+            super().play(source, after=after)
+            self.after = after
+
+    guild_id = 900140
+    removed = []
+    original_make = playback.make_audio_source
+    original_announce = playback.announce_now_playing
+    original_updater = playback.start_np_updater
+    original_prefetch = playback.start_prefetch
+    original_cleanup = playback.cleanup_download
+
+    async def fake_announce(_guild_id):
+        return None
+
+    playback.make_audio_source = lambda song, state, seek=0.0: "SOURCE"
+    playback.announce_now_playing = fake_announce
+    playback.start_np_updater = lambda *args, **kwargs: None
+    playback.start_prefetch = lambda *args, **kwargs: None
+    playback.cleanup_download = lambda path: removed.append(path)
+
+    async def scenario():
+        state = get_state(guild_id)
+        vc = CapturingVoiceClient()
+        state.voice_client = vc
+        song = {"title": "s", "needs_local": True,
+                "local_file": "/tmp/dl_x/a.m4a"}
+        state.queue = [song]
+        await playback.play_next(guild_id)
+        after = vc.after
+
+        # A sound effect stops the source deliberately; the file must survive
+        # so restart_song can resume without re-downloading the whole track.
+        state.is_playing_sound = True
+        after(None)
+        await asyncio.sleep(0.02)
+        assert song["local_file"] == "/tmp/dl_x/a.m4a"
+        assert removed == []
+
+        # A genuine end-of-song still cleans up.
+        state.is_playing_sound = False
+        after(None)
+        await asyncio.sleep(0.02)
+        assert song["local_file"] is None
+        assert removed == ["/tmp/dl_x/a.m4a"]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        playback.make_audio_source = original_make
+        playback.announce_now_playing = original_announce
+        playback.start_np_updater = original_updater
+        playback.start_prefetch = original_prefetch
+        playback.cleanup_download = original_cleanup
+        guild_states.pop(guild_id, None)
+
+
+def test_failed_play_start_cleans_up_its_download():
+    """A vc.play() exception must not leak the popped song's dl_* dir (#33)."""
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900141
+    removed = []
+    original_make = playback.make_audio_source
+    original_notify = playback.notify_skip
+    original_disconnect = playback.schedule_disconnect
+    original_cleanup = playback.cleanup_download
+
+    def exploding_source(song, state, seek=0.0):
+        raise RuntimeError("boom")
+
+    async def fake_notify(gid, song, reason, expected_state=None):
+        return None
+
+    async def fake_disconnect(gid):
+        return None
+
+    playback.make_audio_source = exploding_source
+    playback.notify_skip = fake_notify
+    playback.schedule_disconnect = fake_disconnect
+    playback.cleanup_download = lambda path: path and removed.append(path)
+
+    async def scenario():
+        state = get_state(guild_id)
+        state.voice_client = FakeVoiceClient()
+        song = {"title": "boom", "needs_local": False,
+                "local_file": "/tmp/dl_y/a.m4a"}
+        state.queue = [song]
+        await playback.play_next(guild_id)
+        assert removed == ["/tmp/dl_y/a.m4a"]
+        assert song["local_file"] is None
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        playback.make_audio_source = original_make
+        playback.notify_skip = original_notify
+        playback.schedule_disconnect = original_disconnect
+        playback.cleanup_download = original_cleanup
+        guild_states.pop(guild_id, None)
+
+
+def test_temp_sweep_spares_files_still_in_use():
+    """The periodic sweep must not delete a long track being played (#33)."""
+    import shutil
+    import tempfile
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900142
+    directory = tempfile.mkdtemp()
+    original_dir = config.DOWNLOAD_DIR
+    config.DOWNLOAD_DIR = directory
+    try:
+        in_use_dir = os.path.join(directory, "dl_inuse")
+        stale_dir = os.path.join(directory, "dl_stale")
+        os.makedirs(in_use_dir)
+        os.makedirs(stale_dir)
+        in_use_file = os.path.join(in_use_dir, "a.m4a")
+        open(in_use_file, "w").close()
+        # Both look old enough to sweep: a track longer than max_age has an
+        # old mtime too, which is exactly the dangerous case.
+        old = time.time() - 7200
+        for path in (in_use_dir, stale_dir):
+            os.utime(path, (old, old))
+
+        state = get_state(guild_id)
+        state.current_song = {"title": "long", "local_file": in_use_file}
+
+        removed = audio.cleanup_temp_files(
+            max_age=3600, in_use=playback.active_download_paths())
+        assert removed == 1
+        assert os.path.isdir(in_use_dir)
+        assert not os.path.exists(stale_dir)
+
+        # Without the protection set it is swept like anything else.
+        assert audio.cleanup_temp_files(max_age=3600) == 1
+        assert not os.path.exists(in_use_dir)
+    finally:
+        config.DOWNLOAD_DIR = original_dir
+        shutil.rmtree(directory, ignore_errors=True)
+        guild_states.pop(guild_id, None)
+
+
+def test_startup_work_runs_once_per_process():
+    """on_ready refires on every reconnect; tree.sync must not (#25)."""
+    from types import SimpleNamespace
+    from inmermusic import bot as bot_module
+
+    syncs = []
+    tasks = []
+
+    class FakeTree:
+        async def sync(self):
+            syncs.append(1)
+            return []
+
+    class FakeLoop:
+        def create_task(self, coro):
+            coro.close()  # never scheduled; we only care that it was requested
+            tasks.append(1)
+
+    original_bot = bot_module.bot
+    original_cleanup = bot_module.cleanup_temp_files
+    sweeps = []
+    bot_module.cleanup_temp_files = lambda *a, **k: sweeps.append(1)
+    bot_module.bot = SimpleNamespace(
+        user="fake", tree=FakeTree(), loop=FakeLoop())
+
+    async def scenario():
+        await bot_module.on_ready()
+        # A gateway reconnect fires on_ready again.
+        await bot_module.on_ready()
+        await bot_module.on_ready()
+        assert syncs == [1], syncs
+        assert sweeps == [1], sweeps
+        # Both background loops start, and only once.
+        assert len(tasks) == 2, tasks
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        bot_module.bot = original_bot
+        bot_module.cleanup_temp_files = original_cleanup
 
 
 def test_nico_cli_never_prints_session_secret():

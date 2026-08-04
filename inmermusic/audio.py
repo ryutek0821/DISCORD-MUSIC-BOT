@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional
 
 import discord
 import yt_dlp
@@ -480,18 +480,29 @@ def cleanup_download(path: Optional[str]) -> None:
         shutil.rmtree(parent, ignore_errors=True)
 
 
-def cleanup_temp_files(max_age: float = 3600) -> int:
+def cleanup_temp_files(max_age: float = 3600,
+                       in_use: Optional[Iterable[str]] = None) -> int:
     """Remove orphaned dl_* temp files/directories left by a previous crash.
 
     Downloads are normally deleted in the play `after` callback, but a crash
-    mid-playback leaks them in the temp dir. Sweep ones older than max_age on
-    startup so they don't accumulate. Handles both the current per-request
-    `dl_*` directories and any pre-migration `dl_*` files. Returns the number
-    removed.
+    mid-playback leaks them in the temp dir. Sweep ones older than max_age so
+    they don't accumulate. Handles both the current per-request `dl_*`
+    directories and any pre-migration `dl_*` files. Returns the number removed.
+
+    `in_use` is a set of paths (or their parent dirs) that must never be
+    swept. It matters because this now runs periodically rather than only at
+    startup: a track playing for longer than max_age has an old mtime, and
+    deleting it out from under FFmpeg would kill playback.
     """
     removed = 0
     tmpdir = config.DOWNLOAD_DIR
     now = time.time()
+    protected = set()
+    for path in (in_use or ()):
+        if not path:
+            continue
+        protected.add(os.path.abspath(path))
+        protected.add(os.path.abspath(os.path.dirname(path)))
     try:
         names = os.listdir(tmpdir)
     except OSError as e:
@@ -501,6 +512,8 @@ def cleanup_temp_files(max_age: float = 3600) -> int:
         if not name.startswith("dl_"):
             continue
         path = os.path.join(tmpdir, name)
+        if os.path.abspath(path) in protected:
+            continue
         try:
             if now - os.path.getmtime(path) > max_age:
                 if os.path.isdir(path):
@@ -538,6 +551,11 @@ def build_audio_filter(speed: float, pitch: int, volume: int = 100,
     filters: List[str] = []
     ratio = 2 ** (pitch / 12.0)
     if pitch != 0:
+        # asetrate *replaces* the sample rate rather than scaling it, so the
+        # shift it produces is 48000*ratio / input_rate. Normalize the input to
+        # 48k first, or a 44.1kHz source lands ~8.8% sharp (+12 semitones gives
+        # ~958Hz instead of 880Hz) and plays correspondingly short.
+        filters.append("aresample=48000")
         # asetrate shifts pitch *and* speed by `ratio`; resample back to 48k.
         filters.append(f"asetrate={int(round(48000 * ratio))}")
         filters.append("aresample=48000")
