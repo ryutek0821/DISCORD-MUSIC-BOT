@@ -46,9 +46,15 @@ def create_now_playing_embed(song: Dict[str, Any], *, elapsed: Optional[float] =
     if state is not None and state.loop_mode != "off":
         loop_labels = {"song": "🔁 1曲リピート", "queue": "🔁 全体リピート"}
         title += f"  {loop_labels.get(state.loop_mode, '')}"
+    if state is not None and state.autoplay:
+        title += "  📻 自動再生"
+    requester_line = (
+        "🎲 自動再生（オートDJ）" if song.get("autoplay")
+        else f"リクエスト: {song.get('requester', '不明')}"
+    )
     embed = discord.Embed(
         title=title,
-        description=f"**[{song['title']}]({song['url']})**\nリクエスト: {song.get('requester', '不明')}",
+        description=f"**[{song['title']}]({song['url']})**\n{requester_line}",
         color=0x00ff00,
     )
     duration = song.get("duration") or 0
@@ -292,6 +298,16 @@ class MusicControls(discord.ui.View):
         state.pitch = preset["pitch"]
         state.effect = preset["effect"]
         playback.schedule_reapply(interaction.guild.id)
+        await playback.refresh_now_playing(interaction.guild.id)
+
+    @discord.ui.button(emoji="📻", label="自動再生", style=discord.ButtonStyle.secondary, row=3, custom_id="music:autoplay")
+    async def autoplay(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()  # 無言で承認。状態は再生パネルに表示
+        from . import persistence, playback
+        state = get_state(interaction.guild.id)
+        state.autoplay = not state.autoplay
+        state.autoplay_streak = 0
+        persistence.update_settings(interaction.guild.id, autoplay=state.autoplay)
         await playback.refresh_now_playing(interaction.guild.id)
 
     @discord.ui.select(

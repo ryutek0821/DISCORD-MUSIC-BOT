@@ -281,6 +281,10 @@ class MusicCog(commands.Cog):
                 song["text_channel_id"] = interaction.channel.id
                 song["requester"] = interaction.user.display_name
                 song["requester_id"] = interaction.user.id
+                # A re-queued autoplay track (history/stats/favorites) is a user
+                # request now: clear the flag so it isn't shown or counted as
+                # autoplay (which would also extend the autoplay streak).
+                song.pop("autoplay", None)
                 prepared.append(song)
                 existing_urls.add(song.get("url"))
 
@@ -676,6 +680,7 @@ class MusicCog(commands.Cog):
         if song is None:
             await interaction.response.send_message("以前の再生履歴はありません。")
             return
+        song.pop("autoplay", None)  # replaying it is a user request, not autoplay
         state.queue.insert(0, song)
         cancel_prefetch(state)
         persist_queue(state)
@@ -870,21 +875,28 @@ class MusicCog(commands.Cog):
     @app_commands.describe(
         default_volume="新しいデフォルト音量（省略時は変更なし）",
         idle_timeout="アイドル切断までの秒数（省略時は変更なし）",
+        autoplay="キューが空になったら関連曲を自動追加（省略時は変更なし）",
     )
     async def settings_cmd(
         self, interaction: discord.Interaction,
         default_volume: Optional[app_commands.Range[int, 0, 200]] = None,
         idle_timeout: Optional[app_commands.Range[int, 30, 3600]] = None,
+        autoplay: Optional[bool] = None,
     ):
+        changed = (default_volume is not None or idle_timeout is not None
+                   or autoplay is not None)
         settings = persistence.update_settings(
             interaction.guild.id,
             default_volume=default_volume,
             idle_timeout=idle_timeout,
-        ) if default_volume is not None or idle_timeout is not None \
-            else persistence.get_settings(interaction.guild.id)
+            autoplay=autoplay,
+        ) if changed else persistence.get_settings(interaction.guild.id)
         state = guild_states.get(interaction.guild.id)
         if state is not None:
             state.idle_timeout = settings["idle_timeout"]
+            state.autoplay = settings["autoplay"]
+            if autoplay is not None:
+                state.autoplay_streak = 0
             if default_volume is not None and not (
                     state.voice_client and (
                         state.voice_client.is_playing() or state.voice_client.is_paused())):
@@ -893,7 +905,8 @@ class MusicCog(commands.Cog):
             "⚙️ サーバー設定\n"
             f"デフォルト音量: **{settings['default_volume']}%**\n"
             f"アイドル切断: **{settings['idle_timeout']}秒**\n"
-            f"デフォルトリピート: **{settings['loop_mode']}**",
+            f"デフォルトリピート: **{settings['loop_mode']}**\n"
+            f"自動再生: **{'ON' if settings['autoplay'] else 'OFF'}**",
             ephemeral=True,
         )
 
@@ -966,12 +979,15 @@ class MusicCog(commands.Cog):
             name="/stats・/playtop", value="再生ランキング・上位曲をキューへ", inline=True)
         embed.add_field(name="/favorite・/favorites", value="お気に入り保存・表示", inline=True)
         embed.add_field(name="/playfavorite・/unfavorite", value="お気に入り再生・削除", inline=True)
-        embed.add_field(name="/settings", value="サーバー既定値（管理者）", inline=True)
+        embed.add_field(
+            name="/settings", value="サーバー既定値・自動再生（管理者）", inline=True)
         embed.add_field(name="/join・/leave", value="VCに参加・退出", inline=True)
         embed.add_field(name="/na-", value="効果音（同一曲中1回）", inline=True)
         embed.add_field(name="/sound <名前>", value="サウンドボード再生", inline=True)
         embed.add_field(name="/refresh", value="ニコニコCookie更新", inline=True)
-        embed.add_field(name="再生中ボタン", value="🐢🐇 速度 / 🔽🔼 ピッチ / 🎚️ リセット", inline=False)
+        embed.add_field(
+            name="再生中ボタン",
+            value="🐢🐇 速度 / 🔽🔼 ピッチ / 🎚️ リセット / 📻 自動再生", inline=False)
         embed.add_field(name="メッセージトリガー", value="`んあー` / `んあーと` で効果音", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 

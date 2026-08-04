@@ -360,6 +360,65 @@ def extract_playlist(url: str, guild_id: Optional[int] = None,
         raise
 
 
+def youtube_video_id(url: str) -> Optional[str]:
+    """Return the video id of a YouTube watch/short URL, else None."""
+    if not isinstance(url, str):
+        return None
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host.endswith("youtu.be"):
+        video_id = parsed.path.lstrip("/").split("/")[0]
+        return video_id or None
+    if "youtube.com" not in host:
+        return None
+    if parsed.path == "/watch":
+        return parse_qs(parsed.query).get("v", [None])[0]
+    for prefix in ("/shorts/", "/embed/", "/v/"):
+        if parsed.path.startswith(prefix):
+            video_id = parsed.path[len(prefix):].split("/")[0]
+            return video_id or None
+    return None
+
+
+def related_songs(url: str, guild_id: Optional[int] = None,
+                  limit: int = 5) -> List[Dict[str, Any]]:
+    """Flat-extract YouTube's mix (radio) playlist seeded by `url`.
+
+    Autoplay-only helper: returns [] instead of raising, because a failed
+    suggestion must never interfere with playback. NicoNico has no equivalent
+    mix endpoint, so a NicoNico seed yields no candidates and the caller falls
+    back to the guild's own history.
+    """
+    video_id = youtube_video_id(url)
+    if not video_id:
+        return []
+    count = max(1, min(25, int(limit)))
+    # The mix always starts with the seed itself, so ask for one extra row.
+    mix_url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+    try:
+        info = _extract_info_with_failover(
+            mix_url, guild_id, noplaylist=False, extract_flat="in_playlist",
+            playlistend=count + 1, socket_timeout=10)
+    except Exception as e:
+        logger.warning(f"Failed to fetch related tracks: {_redact_error(e)}")
+        return []
+    entries = info.get("entries", []) if isinstance(info, dict) else []
+    songs: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_url = _flat_entry_url(entry, mix_url)
+        if entry_url is None or youtube_video_id(entry_url) == video_id:
+            continue
+        try:
+            songs.append(_song_from_info(entry, entry_url))
+        except ValueError:
+            continue
+        if len(songs) >= count:
+            break
+    return songs
+
+
 class DownloadResult(NamedTuple):
     """Outcome of a download, including a safe user-facing failure source."""
 
