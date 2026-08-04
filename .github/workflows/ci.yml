@@ -6,7 +6,7 @@ on:
   push:
     branches: [master]
 
-# Allow auto-merge.yml to react to this workflow's completion.
+# Allow deploy-on-push.yml to react to this workflow's completion.
 permissions:
   contents: read
 

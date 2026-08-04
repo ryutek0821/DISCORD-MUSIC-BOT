@@ -242,12 +242,15 @@ python -m inmermusic.nico_cli delete 123456789012345678
 自動化された GitOps ワークフロー：
 
 1. **PR → CI**（`ci.yml`）: Python 3.11/3.12でruff + pytestを実行
-2. **CI green → Auto merge**（`auto-merge.yml`）: CI 成功時のみ squash マージ
-3. **Auto merge → Deploy**: マージ後に `deploy-on-push.yml` を dispatch し RYU-RASPBERRYPI へ反映
-   （`GITHUB_TOKEN` のマージは `push` を発火しないため明示 dispatch している）
-4. **master へ直接 push**: `deploy-on-push.yml`（deploy）と `version-tag.yml`（タグ付け）が発火
+2. **マージは人が行う**: CI green を確認したうえで手動で squash マージする（自動マージはしない）
+3. **master が更新される → Deploy**: CI 成功後に `deploy-on-push.yml` が RYU-RASPBERRYPI へ反映し、
+   `version-tag.yml` がタグ／リリースを作成する
+4. **手動デプロイ**: `deploy-on-push.yml` は `workflow_dispatch` でも実行できるが、master 以外の
+   ブランチを選んだ場合はジョブがスキップされる
 
-> CI が赤の PR はマージされない。`niconico-bot.service` はリポジトリ管理下にあり、上記「systemd サービスとして起動」の手順で `/etc/systemd/system/` に配置する。
+> **master へのマージ＝本番デプロイ**。マージ前に CI が green であることを必ず確認する。
+> `niconico-bot.service` はリポジトリ管理下にあり、上記「systemd サービスとして起動」の手順で
+> `/etc/systemd/system/` に配置する。
 
 ### 必要な GitHub Secrets
 
@@ -257,4 +260,3 @@ python -m inmermusic.nico_cli delete 123456789012345678
 | `SSH_HOST` | デプロイ先サーバーのIP（Tailscale IP） |
 | `SSH_KEY` | デプロイ用SSHプライベートキー |
 | `SSH_KNOWN_HOSTS` | デプロイ先の固定済みknown_hosts行 |
-| `PAT_FOR_AUTOMERGE` | auto-merge ワークフロー用 Personal Access Token |
