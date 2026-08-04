@@ -1198,6 +1198,73 @@ def test_download_audio_removes_temp_dir_on_failure():
         os.rmdir(d)
 
 
+def test_download_enforces_size_and_duration_limits():
+    """Playlist entries dodge the length check; the download must catch it (#28)."""
+    import tempfile as _tempfile
+
+    # The hard stop yt-dlp applies before any bytes move.
+    opts = audio.build_ydl_opts("https://example.com/v")
+    assert opts["max_filesize"] == config.MAX_DOWNLOAD_BYTES
+
+    class FakeYDL:
+        info = {}
+
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download=True):
+            return dict(FakeYDL.info)
+
+        def prepare_filename(self, info):
+            return os.path.join(config.DOWNLOAD_DIR, "never_written.m4a")
+
+    d = _tempfile.mkdtemp()
+    original_download_dir = config.DOWNLOAD_DIR
+    original_ydl = audio.yt_dlp.YoutubeDL
+    original_cookie_file = config.COOKIE_FILE
+    config.DOWNLOAD_DIR = d
+    audio.yt_dlp.YoutubeDL = FakeYDL
+    config.COOKIE_FILE = None
+    try:
+        # A flat playlist entry has no duration up front, so it enters the
+        # queue unchecked; the real value only shows up here.
+        FakeYDL.info = {"duration": config.MAX_TRACK_DURATION + 1}
+        result = audio.download_audio("https://example.com/long")
+        assert result.path is None
+        assert result.error == "動画が長すぎます"
+        assert [n for n in os.listdir(d) if n.startswith("dl_")] == []
+
+        # yt-dlp aborts an oversized download without raising, so no file is
+        # written; report that as a size rejection, not a generic failure.
+        FakeYDL.info = {"duration": 60,
+                        "filesize": config.MAX_DOWNLOAD_BYTES + 1}
+        result = audio.download_audio("https://example.com/huge")
+        assert result.path is None
+        assert result.error == "ファイルが大きすぎます"
+        assert [n for n in os.listdir(d) if n.startswith("dl_")] == []
+
+        # Within limits, the normal "file missing" path is unchanged.
+        FakeYDL.info = {"duration": 60, "filesize": 1024}
+        assert audio.download_audio("https://example.com/ok").error == \
+            "downloaded file missing"
+    finally:
+        config.DOWNLOAD_DIR = original_download_dir
+        audio.yt_dlp.YoutubeDL = original_ydl
+        config.COOKIE_FILE = original_cookie_file
+        os.rmdir(d)
+
+    # Both rejections must reach the user as readable skip reasons.
+    assert util.short_extract_error("動画が長すぎます") == "長すぎる動画"
+    assert util.short_extract_error("ファイルが大きすぎます") == "ファイルが大きすぎる"
+    assert "長すぎる" in util.friendly_extract_error("動画が長すぎます")
+
+
 def test_cleanup_late_download_removes_dir_after_timeout():
     """Regression for review item 5.
 

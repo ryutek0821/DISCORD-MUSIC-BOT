@@ -148,6 +148,7 @@ MAX_PLAYLIST_SIZE=50     # 1回に追加するプレイリスト上限
 MAX_PLAYLISTS_PER_GUILD=25 # Guildごとの保存プレイリスト上限
 PREFETCH_MAX_BYTES=268435456 # Guildごとの次曲先読み上限（bytes）
 TEMP_SWEEP_INTERVAL=3600 # 一時DLファイルの定期掃除間隔（秒）
+MAX_DOWNLOAD_BYTES=268435456 # 1曲のDL上限（bytes、超過分は転送前に拒否）
 LOG_FILE=bot.log         # 指定時はローテーションログも出力
 YT_PROXY=http://your-proxy-host:8888  # YouTube用プロキシ（住宅IPが必要な場合）
 YT_PROXIES=http://primary:8888,http://secondary:8888 # 複数プロキシのフェイルオーバー

@@ -34,6 +34,12 @@ def parse_time(value: str) -> Optional[float]:
 
 def _extract_error_kind(message: str) -> str:
     m = message.lower()
+    # Our own limit rejections, raised as Japanese text by audio.py. Checked
+    # first so "動画が長すぎます" isn't swallowed by a substring match below.
+    if "長すぎ" in message or "max-filesize" in m or "larger than" in m:
+        return "toolong" if "長すぎ" in message else "toolarge"
+    if "大きすぎ" in message:
+        return "toolarge"
     if any(k in m for k in ("private", "login", "sign in", "members-only", "cookies")):
         return "login"
     if any(k in m for k in (
@@ -51,6 +57,8 @@ def _extract_error_kind(message: str) -> str:
 def friendly_extract_error(message: str) -> str:
     """Map a yt-dlp/extraction error string to a Japanese explanation."""
     return {
+        "toolong": "動画が長すぎるため再生できません。",
+        "toolarge": "ファイルが大きすぎるため再生できません。",
         "login": "ログインが必要な動画のため再生できません。",
         "age": "年齢制限付きの動画のため再生できません。",
         "geo": "地域制限により再生できません。",
@@ -63,6 +71,8 @@ def friendly_extract_error(message: str) -> str:
 def short_extract_error(message: str) -> str:
     """Return a compact failure reason suitable for a skip notification."""
     return {
+        "toolong": "長すぎる動画",
+        "toolarge": "ファイルが大きすぎる",
         "login": "ログインが必要",
         "age": "年齢制限",
         "geo": "地域制限",

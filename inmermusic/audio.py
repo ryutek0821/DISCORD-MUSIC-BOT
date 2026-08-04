@@ -81,6 +81,10 @@ def build_ydl_opts(url: str, guild_id: Optional[int] = None,
         "noplaylist": True,
         # Treat bare keywords as a YouTube search instead of an invalid URL.
         "default_search": "ytsearch",
+        # Refuse an oversized track before the transfer starts. Extraction-only
+        # calls ignore this; it exists for the download paths, where a multi-
+        # hour archive stream could otherwise fill DOWNLOAD_DIR.
+        "max_filesize": config.MAX_DOWNLOAD_BYTES,
     }
     ydl_opts.update(overrides)
 
@@ -426,6 +430,31 @@ class DownloadResult(NamedTuple):
     error: Optional[str] = None
 
 
+def _oversized_duration(info: Any) -> Optional[float]:
+    """Duration of `info` if it exceeds MAX_TRACK_DURATION, else None."""
+    if not isinstance(info, dict):
+        return None
+    try:
+        duration = float(info.get("duration") or 0)
+    except (TypeError, ValueError):
+        return None
+    return duration if duration > config.MAX_TRACK_DURATION else None
+
+
+def _exceeds_max_filesize(info: Any) -> bool:
+    """Whether yt-dlp's reported size is over the configured ceiling."""
+    if not isinstance(info, dict):
+        return False
+    for key in ("filesize", "filesize_approx"):
+        try:
+            size = float(info.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if size > config.MAX_DOWNLOAD_BYTES:
+            return True
+    return False
+
+
 def download_audio(url: str, guild_id: Optional[int] = None) -> DownloadResult:
     """Download audio to a fresh per-request temp directory.
 
@@ -448,11 +477,24 @@ def download_audio(url: str, guild_id: Optional[int] = None) -> DownloadResult:
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
+                # Playlist/flat entries reach the queue without a duration, so
+                # _song_from_info's length check never ran for them. This is
+                # the first point where the real value is known.
+                too_long = _oversized_duration(info)
+                if too_long:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                    logger.info(f"Rejected oversized track ({too_long:.0f}s): {url}")
+                    return DownloadResult(None, "動画が長すぎます")
                 filename = ydl.prepare_filename(info)
                 if os.path.exists(filename):
                     _mark_proxy_success(proxy)
                     logger.info(f"Downloaded audio: {filename}")
                     return DownloadResult(filename)
+                # yt-dlp aborts (without raising) when max_filesize is hit.
+                if _exceeds_max_filesize(info):
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                    logger.info(f"Rejected oversized download: {url}")
+                    return DownloadResult(None, "ファイルが大きすぎます")
         except Exception as e:
             shutil.rmtree(tmpdir, ignore_errors=True)
             if index + 1 < len(proxies) and _proxy_retryable(e):
