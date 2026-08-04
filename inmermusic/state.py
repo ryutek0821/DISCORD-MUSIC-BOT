@@ -49,6 +49,17 @@ class GuildState:
         # play_next call (e.g. two racing /play commands) popping a second
         # song before the first has actually started playing.
         self.dispatching: bool = False
+        # Generation of the playback dispatch that currently owns this state.
+        # discord.py fires the `after` callback from the player thread, which
+        # then hops back to the loop, so a callback can run long after a newer
+        # song has taken over. Every callback carries the generation it was
+        # registered for and is ignored unless it still matches.
+        self.play_generation: int = 0
+
+    def next_play_generation(self) -> int:
+        """Claim the next playback generation, invalidating older callbacks."""
+        self.play_generation += 1
+        return self.play_generation
 
 
 guild_states: Dict[int, GuildState] = {}
