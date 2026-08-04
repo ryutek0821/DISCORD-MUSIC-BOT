@@ -240,6 +240,24 @@ def persist_queue(state: GuildState) -> None:
     persistence.save_queue(state.guild_id, songs)
 
 
+def active_download_paths() -> set:
+    """Every temp file some guild is currently playing or holding for later.
+
+    The periodic temp sweep is age-based, so a track playing longer than the
+    sweep's max_age would otherwise be deleted mid-playback.
+    """
+    paths = set()
+    for state in list(guild_states.values()):
+        songs = ([state.current_song] if state.current_song else []) + list(state.queue)
+        if state.prefetch_song:
+            songs.append(state.prefetch_song)
+        for song in songs:
+            path = song.get("local_file")
+            if path:
+                paths.add(path)
+    return paths
+
+
 def cancel_prefetch(state: GuildState) -> None:
     task = state.prefetch_task
     state.prefetch_task = None
@@ -591,9 +609,14 @@ async def _play_next(guild_id: int, state: GuildState, announce: bool = True) ->
         def after_play(error, song=song, generation=generation):
             if error:
                 logger.error(f"Play error: {error}")
+            if state.is_playing_sound:
+                # A sound effect stopped this source deliberately; the song is
+                # about to resume from the same file. Deleting it here forced a
+                # full re-download (seconds of silence, sometimes a skip).
+                return
             cleanup_download(song.get("local_file"))
             song["local_file"] = None
-            if not state.is_playing_sound and guild_states.get(guild_id) is state:
+            if guild_states.get(guild_id) is state:
                 async def _finish() -> None:
                     if error:
                         await notify_skip(
@@ -664,6 +687,10 @@ async def _play_next(guild_id: int, state: GuildState, announce: bool = True) ->
                 persist_queue(state)
         except Exception as e:
             logger.error(f"Play failed: {e}")
+            # The song is already popped, so cleanup_guild_state won't see it:
+            # drop its download here or the dl_* dir leaks until the sweep.
+            cleanup_download(song.get("local_file"))
+            song["local_file"] = None
             await notify_skip(guild_id, song, "再生エラー", expected_state=state)
             state.dispatching = False
             continue
@@ -795,6 +822,8 @@ async def restart_song(guild_id: int, expected_state: Optional[GuildState] = Non
     except Exception as e:
         logger.error(f"Failed to restart song: {e}")
         state.is_playing_sound = False
+        cleanup_download(song.get("local_file"))
+        song["local_file"] = None
         state.skip_flag = True  # forced skip: don't let advance_queue re-loop this song
         await notify_skip(guild_id, song, "再開失敗", expected_state=state)
         await advance_queue(

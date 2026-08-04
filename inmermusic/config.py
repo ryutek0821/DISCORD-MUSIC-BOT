@@ -107,6 +107,16 @@ FAVORITES_PAGE_SIZE = 25
 # Prefetch is deliberately bounded to one queued track per guild. Reject an
 # unexpectedly large file instead of allowing a single guild to fill the disk.
 PREFETCH_MAX_BYTES = int(os.getenv("PREFETCH_MAX_BYTES", str(256 * 1024 * 1024)))
+# Hard ceiling handed to yt-dlp, so an oversized track is refused *before* the
+# transfer instead of being downloaded in full and then rejected. Playlist
+# entries arrive without a duration, so this is the only bound that always
+# applies. Keep it >= PREFETCH_MAX_BYTES or prefetch would reject what the
+# main download path accepts.
+MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(256 * 1024 * 1024)))
+
+# How often (seconds) to reap orphaned dl_* temp dirs. A startup-only sweep
+# leaves anything leaked mid-run sitting on disk until the next restart.
+TEMP_SWEEP_INTERVAL = int(os.getenv("TEMP_SWEEP_INTERVAL", "3600"))
 
 # Autoplay (radio mode): how many tracks to append per refill, and how many
 # autoplay tracks may play back-to-back before the bot stops refilling. The
