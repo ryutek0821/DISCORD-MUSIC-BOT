@@ -139,6 +139,7 @@ COOKIE_TTL=3600          # Cookie有効期限（秒）
 STATE_DIR=~/.local/share/inmermusic  # DB保存先（既定値。リポジトリ外である必要あり）
 DOWNLOAD_DIR=/var/tmp/inmermusic     # 音声一時ファイルの保存先（既定値）
 IDLE_TIMEOUT=180         # アイドル切断時間（秒）
+QUEUE_RESTORE_TTL=86400  # 保存キューを復元できる期限（秒）
 AUTOPLAY_BATCH=3         # 自動再生で一度に補充する曲数
 AUTOPLAY_MAX_STREAK=50   # 自動再生の連続再生上限（超えたら補充停止）
 DOWNLOAD_TIMEOUT=120     # 1曲のDLタイムアウト（秒）
@@ -217,6 +218,8 @@ main.py          # エントリポイント（inmermusic.bot を呼び出す）
 キュー・履歴・再生統計・お気に入り・名前付きプレイリスト・Guild設定は `STATE_DIR/music.db`（SQLite / WAL）に保存されます。
 
 - キューはコマンド操作のたびに保存されるため、クラッシュしても直前の状態が残ります。再生中だった曲はキュー先頭として保存されます
+- 保存キューは**明示的な破棄**（`/leave` `/stop` ⏹️ ボタン・Bot のサーバー退出）でのみ消えます。VC から全員退出した場合、管理者が Bot を切断した場合、アイドル切断の場合は残るので、`/join` で「（保存キュー N曲を復元）」として戻せます。
+- 復元できる期限は `QUEUE_RESTORE_TTL`（既定 24 時間）です。それより古い保存キューは放置されたものとみなし、復元しません。
 - 再起動後、そのGuildで最初にコマンドが実行された時点でキューと設定（既定音量・アイドル切断秒数・リピートモード）を復元します。復元は特定のコマンド専用ではなく、`/play` や `/queue` など状態を扱うコマンド全般が契機になります（`/help` `/history` `/favorites` `/stats` `/refresh` `/settings` `/playlist list` `/playlist delete` は除く）
 - Bot は自動では再生を再開しません。`/play` すると復元されたキューの先頭から再生され、新規追加分は Embed のフッターに件数が表示されます
 - `/stop` `/leave` とアイドル切断時は保存済みキューも消去します

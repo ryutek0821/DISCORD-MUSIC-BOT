@@ -4,7 +4,7 @@ import asyncio
 import discord
 from discord.ext import commands
 
-from . import cookies
+from . import cookies, persistence
 from .audio import cleanup_temp_files
 from .cog import MusicCog
 from .config import COOKIE_TTL, TEMP_SWEEP_INTERVAL, TOKEN, logger
@@ -88,4 +88,8 @@ def run():
     if not TOKEN or TOKEN == "your_discord_bot_token_here":
         print("Error: Please set DISCORD_TOKEN in .env file")
         raise SystemExit(1)
-    bot.run(TOKEN)
+    try:
+        bot.run(TOKEN)
+    finally:
+        # Queue snapshots are written off the loop; don't exit on top of one.
+        persistence.flush_writes()
