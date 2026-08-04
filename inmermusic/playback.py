@@ -462,8 +462,15 @@ async def collect_autoplay_songs(guild_id: int, state: GuildState) -> list:
 
 async def advance_queue(guild_id: int, finished_song: Dict[str, Any],
                         expected_state: Optional[GuildState] = None,
-                        failed: bool = False) -> None:
-    """Decide what to enqueue next based on loop/skip state, then play."""
+                        failed: bool = False,
+                        generation: Optional[int] = None) -> None:
+    """Decide what to enqueue next based on loop/skip state, then play.
+
+    `generation` is the playback generation the caller was registered for. A
+    threaded `after` callback can reach the loop after a newer song has already
+    started (e.g. a /play that saw the VC idle), so a stale generation must not
+    clear current_song or advance the queue on the new playback's behalf.
+    """
     if expected_state is not None:
         if guild_states.get(guild_id) is not expected_state:
             return
@@ -472,6 +479,15 @@ async def advance_queue(guild_id: int, finished_song: Dict[str, Any],
         state = get_state(guild_id)
     async with state.lock:
         if guild_states.get(guild_id) is not state:
+            return
+        if generation is not None and generation != state.play_generation:
+            # A newer playback owns the state. The song did finish, so it still
+            # belongs in the history, but nothing else here may be touched.
+            logger.debug(
+                f"Ignoring stale playback callback (gen {generation} != "
+                f"{state.play_generation}): {finished_song.get('title')}")
+            if not failed and state.persistence_hydrated:
+                persistence.record_history(guild_id, finished_song)
             return
         state.current_song = None
         if not failed and state.persistence_hydrated:
@@ -566,8 +582,13 @@ async def _play_next(guild_id: int, state: GuildState, announce: bool = True) ->
 
         # Capture the running loop so the threaded `after` callback can hop back.
         loop = asyncio.get_running_loop()
+        # Claim this dispatch's generation up front so the callback below can
+        # prove it belongs to the playback that is still current. Claiming it
+        # before the download is deliberate: a dispatch that then fails leaves
+        # the counter ahead, which only ever invalidates older callbacks.
+        generation = state.next_play_generation()
 
-        def after_play(error, song=song):
+        def after_play(error, song=song, generation=generation):
             if error:
                 logger.error(f"Play error: {error}")
             cleanup_download(song.get("local_file"))
@@ -578,7 +599,8 @@ async def _play_next(guild_id: int, state: GuildState, announce: bool = True) ->
                         await notify_skip(
                             guild_id, song, "再生中のエラー", expected_state=state)
                     await advance_queue(
-                        guild_id, song, expected_state=state, failed=bool(error))
+                        guild_id, song, expected_state=state,
+                        failed=bool(error), generation=generation)
                 asyncio.run_coroutine_threadsafe(
                     _finish(), loop
                 )
@@ -679,6 +701,11 @@ async def restart_song(guild_id: int, expected_state: Optional[GuildState] = Non
 
     # Capture the running loop so the threaded `finish` callback can hop back.
     loop = asyncio.get_running_loop()
+    # The generation this resume belongs to. Re-playing below claims a fresh
+    # one (the old FFmpeg source is gone), and `finish` reads whichever is
+    # current at call time — the entry one on the skip path below, the new one
+    # once vc.play() has run.
+    generation = state.play_generation
 
     def finish(error=None):
         # Shared teardown for both the skip path and the normal end-of-song path.
@@ -691,7 +718,8 @@ async def restart_song(guild_id: int, expected_state: Optional[GuildState] = Non
         if guild_states.get(guild_id) is state:
             asyncio.run_coroutine_threadsafe(
                 advance_queue(
-                    guild_id, song, expected_state=state, failed=bool(error)), loop
+                    guild_id, song, expected_state=state, failed=bool(error),
+                    generation=generation), loop
             )
 
     # A skip requested during the sound effect should move on, not replay the song.
@@ -722,7 +750,8 @@ async def restart_song(guild_id: int, expected_state: Optional[GuildState] = Non
                 state.is_playing_sound = False
                 state.skip_flag = True
                 await notify_skip(guild_id, song, "読み込みタイムアウト", expected_state=state)
-                await advance_queue(guild_id, song, expected_state=state)
+                await advance_queue(
+                    guild_id, song, expected_state=state, generation=generation)
                 return
             local_file, download_error = _download_parts(download_result)
             if not local_file:
@@ -734,18 +763,24 @@ async def restart_song(guild_id: int, expected_state: Optional[GuildState] = Non
                     if download_error else "読み込み失敗"
                 )
                 await notify_skip(guild_id, song, reason, expected_state=state)
-                await advance_queue(guild_id, song, expected_state=state)
+                await advance_queue(
+                    guild_id, song, expected_state=state, generation=generation)
                 return
             song["local_file"] = local_file
 
+        # A /play racing the effect sees an idle VC, so a newer song may have
+        # taken over during the sleep/download above; the generation says so.
         if (guild_states.get(guild_id) is not state
-                or state.voice_client is not vc or not vc.is_connected()):
+                or state.voice_client is not vc or not vc.is_connected()
+                or state.play_generation != generation
+                or vc.is_playing() or vc.is_paused()):
             cleanup_download(song.get("local_file"))
             song["local_file"] = None
             state.is_playing_sound = False
             return
 
         # Resume from where the sound effect interrupted, keeping speed/pitch.
+        generation = state.next_play_generation()
         state.seek_position = seek
         state.loops_at_swap = 0
         state.speed_at_swap = state.speed
@@ -762,7 +797,8 @@ async def restart_song(guild_id: int, expected_state: Optional[GuildState] = Non
         state.is_playing_sound = False
         state.skip_flag = True  # forced skip: don't let advance_queue re-loop this song
         await notify_skip(guild_id, song, "再開失敗", expected_state=state)
-        await advance_queue(guild_id, song, expected_state=state)
+        await advance_queue(
+            guild_id, song, expected_state=state, generation=generation)
 
 
 def play_sound_effect(guild_id: int, sound_path: str) -> bool:

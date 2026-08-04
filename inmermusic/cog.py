@@ -65,6 +65,23 @@ def _drop_abandoned_state(guild_id: int, request_state, created: bool) -> None:
         guild_states.pop(guild_id, None)
 
 
+def voice_conflict(interaction: discord.Interaction) -> Optional[str]:
+    """Error text if the requester may not drive the bot right now, else None.
+
+    Re-checked immediately before enqueueing, not just at command entry:
+    search and extraction wait up to 60s, and a stale request completing after
+    someone else has started a session in another VC must not move the bot.
+    """
+    voice = getattr(interaction.user, "voice", None)
+    channel = getattr(voice, "channel", None) if voice else None
+    if channel is None:
+        return "VCに参加してください。"
+    vc = interaction.guild.voice_client
+    if vc and vc.channel and vc.channel != channel:
+        return "BOTは別のVCで再生中です。同じVCに参加してから操作してください。"
+    return None
+
+
 class SearchResultView(discord.ui.View):
     """Short-lived, requester-only selection of YouTube search candidates."""
 
@@ -110,6 +127,12 @@ class SearchResultView(discord.ui.View):
         return True
 
     async def _selected(self, interaction: discord.Interaction) -> None:
+        # The picker lives for 60s; the bot may have been claimed by another VC
+        # since the search started, so re-check before deferring.
+        conflict = voice_conflict(interaction)
+        if conflict:
+            await interaction.response.send_message(conflict, ephemeral=True)
+            return
         await interaction.response.defer()
         self.selector.disabled = True
         try:
@@ -237,8 +260,9 @@ class MusicCog(commands.Cog):
     async def _enqueue_songs(self, interaction: discord.Interaction, songs,
                              *, deduplicate: bool = False) -> None:
         """Connect once and enqueue one or many already-extracted songs."""
-        if not interaction.user.voice:
-            await interaction.followup.send("VCに参加してください。")
+        conflict = voice_conflict(interaction)
+        if conflict:
+            await interaction.followup.send(conflict, ephemeral=True)
             return
         guild_id = interaction.guild.id
         state = hydrate_state(guild_id)
@@ -246,17 +270,13 @@ class MusicCog(commands.Cog):
         vc = interaction.guild.voice_client
         connected_here = False
         if not vc:
+            # Playback commands never move the bot: voice_conflict above has
+            # already rejected the request if the bot was busy elsewhere.
             try:
                 vc = await channel.connect(timeout=15)
                 connected_here = True
             except Exception as e:
                 await interaction.followup.send(f"VC接続失敗: {str(e)}")
-                return
-        elif vc.channel != channel:
-            try:
-                await vc.move_to(channel)
-            except Exception as e:
-                await interaction.followup.send(f"チャンネル移動失敗: {str(e)}")
                 return
         if guild_states.get(guild_id) is not state:
             if connected_here:
@@ -721,11 +741,14 @@ class MusicCog(commands.Cog):
         state.queue.insert(0, song)
         cancel_prefetch(state)
         persist_queue(state)
+        # Stop the current song before the first await. Sending the response
+        # first would yield to the loop, and a song ending in that window would
+        # start the song we just queued — which vc.stop() would then skip.
+        state.skip_flag = True
+        vc.stop()
         start_prefetch(interaction.guild.id)
         await interaction.response.send_message(
             f"⏮️ **{song['title']}** に戻ります。")
-        state.skip_flag = True
-        vc.stop()
 
     @app_commands.command(name="replay", description="Replay the current song from the beginning")
     async def replay_cmd(self, interaction: discord.Interaction):

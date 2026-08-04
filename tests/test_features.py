@@ -1676,6 +1676,203 @@ def test_stale_music_panel_is_rejected():
         guild_states.pop(guild_id, None)
 
 
+def test_stale_after_callback_keeps_new_playback(monkeypatch=None):
+    """A late `after` callback must not clear the song that replaced it (#41)."""
+    from inmermusic.state import get_state, guild_states
+
+    class CapturingVoiceClient(FakeVoiceClient):
+        def play(self, source, after=None):
+            super().play(source, after=after)
+            self.after = after
+
+    guild_id = 900130
+    recorded = []
+    original_make = playback.make_audio_source
+    original_announce = playback.announce_now_playing
+    original_updater = playback.start_np_updater
+    original_prefetch = playback.start_prefetch
+    original_record = playback.persistence.record_history
+
+    async def fake_announce(_guild_id):
+        return None
+
+    playback.make_audio_source = lambda song, state, seek=0.0: "SOURCE"
+    playback.announce_now_playing = fake_announce
+    playback.start_np_updater = lambda *args, **kwargs: None
+    playback.start_prefetch = lambda *args, **kwargs: None
+    playback.persistence.record_history = lambda gid, song: recorded.append(
+        song["title"])
+
+    async def scenario():
+        state = get_state(guild_id)
+        state.persistence_hydrated = True
+        vc = CapturingVoiceClient()
+        state.voice_client = vc
+        old = {"title": "old", "needs_local": False}
+        new = {"title": "new", "needs_local": False}
+
+        state.queue = [old]
+        await playback.play_next(guild_id)
+        assert state.current_song is old
+        stale_callback = vc.after
+
+        # The old song ends, but its finish work is still queued on the loop
+        # when a /play starts the next song on the (now idle) voice client.
+        vc.stop()
+        state.queue = [new]
+        await playback.play_next(guild_id)
+        assert state.current_song is new
+
+        # Now the delayed callback lands. It must not touch the new playback.
+        stale_callback(None)
+        await asyncio.sleep(0.05)
+        assert state.current_song is new
+        assert state.queue == []
+        # The finished song still counts as played, exactly once.
+        assert recorded == ["old"]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        playback.make_audio_source = original_make
+        playback.announce_now_playing = original_announce
+        playback.start_np_updater = original_updater
+        playback.start_prefetch = original_prefetch
+        playback.persistence.record_history = original_record
+        guild_states.pop(guild_id, None)
+
+
+def test_previous_stops_current_song_before_responding():
+    """/previous must not skip the song it just queued (#37)."""
+    from types import SimpleNamespace
+    from inmermusic import cog as cog_module
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900131
+    events = []
+
+    class StoppingVoiceClient(FakeVoiceClient):
+        def __init__(self):
+            super().__init__()
+            self._playing = True
+
+        def stop(self):
+            super().stop()
+            events.append("stop")
+
+    class Response:
+        async def send_message(self, message, **kwargs):
+            events.append("respond")
+
+    original_persist = cog_module.persist_queue
+    original_cancel = cog_module.cancel_prefetch
+    original_start = cog_module.start_prefetch
+    original_pop = cog_module.persistence.pop_history
+    cog_module.persistence.pop_history = lambda gid: {
+        "title": "prev", "url": "https://example.com/prev"}
+    cog_module.persist_queue = lambda state: None
+    cog_module.cancel_prefetch = lambda state: None
+    cog_module.start_prefetch = lambda gid: events.append("prefetch")
+
+    async def scenario():
+        state = get_state(guild_id)
+        vc = StoppingVoiceClient()
+        state.voice_client = vc
+        state.current_song = {"title": "now"}
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=guild_id, voice_client=vc),
+            response=Response(),
+        )
+        cog = cog_module.MusicCog(bot=None)
+        await cog.previous_cmd.callback(cog, interaction)
+        assert state.queue[0]["title"] == "prev"
+        assert state.skip_flag is True
+        # The stop must be committed before the first await, so a song ending
+        # during the Discord round-trip can't have the queued song stopped.
+        assert events.index("stop") < events.index("respond")
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        cog_module.persistence.pop_history = original_pop
+        cog_module.persist_queue = original_persist
+        cog_module.cancel_prefetch = original_cancel
+        cog_module.start_prefetch = original_start
+        guild_states.pop(guild_id, None)
+
+
+def test_play_never_moves_a_busy_bot_to_another_vc():
+    """A stale /play must not steal a session running in another VC (#35)."""
+    from types import SimpleNamespace
+    from inmermusic import cog as cog_module
+    from inmermusic.state import guild_states
+
+    guild_id = 900132
+    sent = []
+    channel_a = SimpleNamespace(name="VC-A")
+    channel_b = SimpleNamespace(name="VC-B")
+
+    class BusyVoiceClient(FakeVoiceClient):
+        def __init__(self, channel):
+            super().__init__()
+            self.channel = channel
+            self.moved_to = []
+
+        async def move_to(self, channel):
+            self.moved_to.append(channel)
+
+    class Followup:
+        async def send(self, message=None, **kwargs):
+            sent.append(message)
+            return SimpleNamespace(id=1)
+
+    # Stubbed so that, without the fix, the run reaches the assertions below
+    # instead of dying inside real playback.
+    original_hydrate = cog_module.hydrate_state
+    original_persist = cog_module.persist_queue
+    original_play_next = cog_module.play_next
+    original_prefetch = cog_module.start_prefetch
+
+    async def fake_play_next(gid, announce=True):
+        return None
+
+    cog_module.hydrate_state = lambda gid: cog_module.get_state(gid)
+    cog_module.persist_queue = lambda state: None
+    cog_module.play_next = fake_play_next
+    cog_module.start_prefetch = lambda gid: None
+
+    async def scenario():
+        vc = BusyVoiceClient(channel_b)
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=guild_id, voice_client=vc),
+            user=SimpleNamespace(
+                id=5, display_name="A",
+                voice=SimpleNamespace(channel=channel_a)),
+            channel=SimpleNamespace(id=42),
+            followup=Followup(),
+        )
+        cog = cog_module.MusicCog(bot=None)
+        await cog._enqueue_songs(
+            interaction, [{"title": "x", "url": "https://example.com/x"}])
+        assert vc.moved_to == []
+        assert sent and "別のVC" in sent[0]
+        # Nothing was queued onto the other channel's session either.
+        assert guild_id not in guild_states or not guild_states[guild_id].queue
+
+        # Same channel: the request is allowed through to the normal path.
+        interaction.user.voice.channel = channel_b
+        assert cog_module.voice_conflict(interaction) is None
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        cog_module.hydrate_state = original_hydrate
+        cog_module.persist_queue = original_persist
+        cog_module.play_next = original_play_next
+        cog_module.start_prefetch = original_prefetch
+        guild_states.pop(guild_id, None)
+
+
 def test_nico_cli_never_prints_session_secret():
     import contextlib
     import io
