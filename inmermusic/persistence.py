@@ -4,6 +4,7 @@ import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional
 
 from . import config
@@ -20,21 +21,79 @@ def _db_path() -> str:
     return os.path.join(config.STATE_DIR, "music.db")
 
 
+class _SharedConnection(sqlite3.Connection):
+    """A connection the callers may not actually close.
+
+    Every accessor in this module is written as `conn = _connect()` / `try:` /
+    `finally: conn.close()`. The connection is now process-wide, so close() has
+    to be inert; `reset_connection()` is the only way to really drop it.
+    """
+
+    def close(self) -> None:  # noqa: D102 - see class docstring
+        pass
+
+    def _close_for_real(self) -> None:
+        sqlite3.Connection.close(self)
+
+
+_conn: Optional[_SharedConnection] = None
+_conn_path: Optional[str] = None
+
+
+def reset_connection() -> None:
+    """Drop the cached connection (tests that repoint config.STATE_DIR)."""
+    global _conn, _conn_path
+    with _db_lock:
+        if _conn is not None:
+            try:
+                _conn._close_for_real()
+            except sqlite3.Error:
+                pass
+        _conn = None
+        _conn_path = None
+
+
 def _connect() -> sqlite3.Connection:
+    """Return the process-wide connection, building it on first use.
+
+    Reconnecting per call meant redoing makedirs + chmod + open + chmod +
+    sqlite3.connect + `PRAGMA journal_mode=WAL` (itself a write) + 6 CREATE
+    statements before every single query — all of it synchronously on the event
+    loop, on a Raspberry Pi SD card. `_db_lock` (an RLock) already serializes
+    every accessor, so one connection shared across threads is safe.
+
+    `config.STATE_DIR` is a mutable module global (tests repoint it), so the
+    cache is keyed on the resolved path and rebuilds itself when it moves.
+    """
+    global _conn, _conn_path
+    with _db_lock:
+        path = _db_path()
+        if _conn is not None and _conn_path == path:
+            return _conn
+        reset_connection()
+        _conn = _build_connection()
+        _conn_path = path
+        return _conn
+
+
+def _build_connection() -> _SharedConnection:
     os.makedirs(config.STATE_DIR, mode=0o700, exist_ok=True)
     os.chmod(config.STATE_DIR, 0o700)
     path = _db_path()
     fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
     os.close(fd)
     os.chmod(path, 0o600)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(
+        path, factory=_SharedConnection, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS queues (
             guild_id INTEGER NOT NULL,
             position INTEGER NOT NULL,
             song_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (guild_id, position)
         );
         CREATE TABLE IF NOT EXISTS history (
@@ -107,6 +166,53 @@ def _migrate(conn: sqlite3.Connection) -> None:
             "ADD COLUMN autoplay INTEGER NOT NULL DEFAULT 0"
         )
         conn.commit()
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(queues)")}
+    if "updated_at" not in columns:
+        # Rows written before this column existed get 0, i.e. "too old to
+        # restore" — safer than resurrecting a queue of unknown age.
+        conn.execute(
+            "ALTER TABLE queues ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
+
+
+_write_executor: Optional[ThreadPoolExecutor] = None
+
+
+def _writer() -> ThreadPoolExecutor:
+    global _write_executor
+    with _db_lock:
+        if _write_executor is None:
+            # Exactly one worker: submissions run FIFO, so a later snapshot can
+            # never be overwritten by an earlier one that finished late.
+            _write_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="inmermusic-db")
+        return _write_executor
+
+
+def _log_write_error(future) -> None:
+    error = future.exception()
+    if error is not None:
+        logger.warning(f"Background DB write failed: {error}")
+
+
+def submit_write(fn, *args) -> None:
+    """Run a fire-and-forget DB write off the event loop, in submission order.
+
+    save_queue is a DELETE plus up to MAX_QUEUE_SIZE INSERTs and a commit
+    (an fsync on the Pi's SD card), and it runs twice per track plus on every
+    /shuffle, /remove, /move and /clear. Nothing reads its return value.
+    """
+    _writer().submit(fn, *args).add_done_callback(_log_write_error)
+
+
+def flush_writes(timeout: float = 5.0) -> None:
+    """Block until every queued write has finished (tests, shutdown)."""
+    with _db_lock:
+        executor = _write_executor
+    if executor is None:
+        return
+    executor.submit(lambda: None).result(timeout=timeout)
 
 
 def clean_song(song: Dict[str, Any]) -> Dict[str, Any]:
@@ -130,8 +236,9 @@ def _decode_song(raw: str) -> Optional[Dict[str, Any]]:
 
 
 def save_queue(guild_id: int, songs: Iterable[Dict[str, Any]]) -> bool:
+    now = int(time.time())
     rows = [
-        (guild_id, position, json.dumps(clean_song(song), ensure_ascii=False))
+        (guild_id, position, json.dumps(clean_song(song), ensure_ascii=False), now)
         for position, song in enumerate(songs)
     ]
     try:
@@ -140,7 +247,8 @@ def save_queue(guild_id: int, songs: Iterable[Dict[str, Any]]) -> bool:
             try:
                 conn.execute("DELETE FROM queues WHERE guild_id = ?", (guild_id,))
                 conn.executemany(
-                    "INSERT INTO queues (guild_id, position, song_json) VALUES (?, ?, ?)",
+                    "INSERT INTO queues (guild_id, position, song_json, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
                     rows,
                 )
                 conn.commit()
@@ -152,15 +260,29 @@ def save_queue(guild_id: int, songs: Iterable[Dict[str, Any]]) -> bool:
         return False
 
 
-def load_queue(guild_id: int) -> List[Dict[str, Any]]:
+def load_queue(guild_id: int,
+               max_age: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Load the persisted queue, optionally ignoring stale snapshots.
+
+    A queue now survives a non-explicit disconnect, so without an age bound a
+    week-old queue could suddenly start playing on the next /join.
+    """
     try:
         with _db_lock:
             conn = _connect()
             try:
-                rows = conn.execute(
-                    "SELECT song_json FROM queues WHERE guild_id = ? ORDER BY position",
-                    (guild_id,),
-                ).fetchall()
+                if max_age is None:
+                    rows = conn.execute(
+                        "SELECT song_json FROM queues WHERE guild_id = ? "
+                        "ORDER BY position",
+                        (guild_id,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT song_json FROM queues "
+                        "WHERE guild_id = ? AND updated_at >= ? ORDER BY position",
+                        (guild_id, int(time.time() - max_age)),
+                    ).fetchall()
             finally:
                 conn.close()
     except (OSError, sqlite3.Error) as e:

@@ -1173,7 +1173,9 @@ class MusicCog(commands.Cog):
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         if member.bot:
             if self.bot.user and member.id == self.bot.user.id and after.channel is None:
-                cleanup_guild_state(member.guild.id)
+                # Someone disconnected the bot; nobody asked to throw the
+                # queue away, so keep it restorable via /join.
+                cleanup_guild_state(member.guild.id, clear_persisted=False)
             return
 
         guild = member.guild
@@ -1188,7 +1190,7 @@ class MusicCog(commands.Cog):
             cancel_idle_task(guild.id)
             text_channel = resolve_text_channel(guild, state.current_song or {})
             await state.voice_client.disconnect()
-            cleanup_guild_state(guild.id)
+            cleanup_guild_state(guild.id, clear_persisted=False)
             if text_channel:
                 await text_channel.send("誰も居なくなったので退出しました。")
 

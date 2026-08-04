@@ -91,6 +91,10 @@ except OSError as e:
 
 # Idle disconnect timeout (seconds) configurable via env
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
+# A persisted queue survives an unintentional disconnect (empty VC, an admin
+# kicking the bot, an idle timeout) but not forever: past this age it is
+# treated as abandoned rather than restored on the next /join.
+QUEUE_RESTORE_TTL = int(os.getenv("QUEUE_RESTORE_TTL", str(24 * 3600)))
 
 # Max seconds to wait for a single audio download before giving up, so a stalled
 # fetch can't wedge the queue. Also passed to yt-dlp as socket_timeout (capped).

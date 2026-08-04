@@ -42,7 +42,9 @@ async def schedule_disconnect(guild_id: int) -> None:
         if vc and vc.is_connected() and not vc.is_playing():
             logger.info(f"Idle timeout ({timeout}s), disconnecting")
             await vc.disconnect()
-            cleanup_guild_state(guild_id)
+            # Not an explicit discard: the queue is normally empty here, but
+            # keep the semantics consistent with the other passive exits.
+            cleanup_guild_state(guild_id, clear_persisted=False)
     except asyncio.CancelledError:
         pass
 
@@ -233,11 +235,19 @@ def _download_parts(result: Any) -> tuple[Optional[str], Optional[str]]:
 
 
 def persist_queue(state: GuildState) -> None:
-    """Persist a crash-restorable snapshot; runtime file handles are stripped."""
+    """Persist a crash-restorable snapshot; runtime file handles are stripped.
+
+    Serialization happens here, on the caller's thread, so the writer never
+    sees a song dict mutate underneath it; only the SQLite work is offloaded.
+    """
     if state.guild_id is None or not state.persistence_hydrated:
         return
-    songs = ([state.current_song] if state.current_song else []) + list(state.queue)
-    persistence.save_queue(state.guild_id, songs)
+    songs = [
+        persistence.clean_song(song)
+        for song in (([state.current_song] if state.current_song else [])
+                     + list(state.queue))
+    ]
+    persistence.submit_write(persistence.save_queue, state.guild_id, songs)
 
 
 def cancel_prefetch(state: GuildState) -> None:
@@ -352,7 +362,9 @@ def cleanup_guild_state(guild_id: int, *, clear_persisted: bool = True) -> None:
         cleanup_download(song.get("local_file"))
         song["local_file"] = None
     if clear_persisted and state.persistence_hydrated:
-        persistence.save_queue(guild_id, [])
+        # Same queue as persist_queue, so a snapshot submitted moments earlier
+        # can't land after this clear and resurrect the queue.
+        persistence.submit_write(persistence.save_queue, guild_id, [])
     else:
         persist_queue(state)
     state.np_message = None

@@ -77,9 +77,11 @@ def hydrate_state(guild_id: int) -> GuildState:
     if state.persistence_hydrated:
         return state
     from . import persistence
+    from .config import QUEUE_RESTORE_TTL
     settings = persistence.get_settings(guild_id)
     if not state.queue and state.current_song is None:
-        state.queue = persistence.load_queue(guild_id)
+        state.queue = persistence.load_queue(
+            guild_id, max_age=QUEUE_RESTORE_TTL)
         state.restored_count = len(state.queue)
     state.volume = settings["default_volume"]
     state.idle_timeout = settings["idle_timeout"]

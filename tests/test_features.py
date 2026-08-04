@@ -10,6 +10,7 @@ __name__ == "__main__", so importing here never starts the bot.
 import asyncio
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1871,6 +1872,95 @@ def test_play_never_moves_a_busy_bot_to_another_vc():
         cog_module.play_next = original_play_next
         cog_module.start_prefetch = original_prefetch
         guild_states.pop(guild_id, None)
+
+
+def test_connection_is_reused_and_follows_state_dir():
+    """One connection per process, rebuilt when STATE_DIR moves (#27)."""
+    import shutil
+    import tempfile
+    from inmermusic import persistence
+
+    first = tempfile.mkdtemp()
+    second = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    persistence.reset_connection()
+    try:
+        config.STATE_DIR = first
+        conn = persistence._connect()
+        assert persistence._connect() is conn  # no reconnect per call
+        conn.close()  # callers' close() must not break the shared handle
+        assert persistence._connect() is conn
+
+        persistence.save_queue(101, [{"url": "https://e/a", "title": "a"}])
+        persistence.record_history(101, {"url": "https://e/a", "title": "a"})
+        assert [s["url"] for s in persistence.load_queue(101)] == ["https://e/a"]
+        assert persistence.load_history(101, 5)[0]["url"] == "https://e/a"
+
+        # Repointing STATE_DIR must not keep serving the old database.
+        config.STATE_DIR = second
+        assert persistence._connect() is not conn
+        assert persistence.load_queue(101) == []
+    finally:
+        config.STATE_DIR = original_state_dir
+        persistence.reset_connection()
+        shutil.rmtree(first, ignore_errors=True)
+        shutil.rmtree(second, ignore_errors=True)
+
+
+def test_queue_survives_passive_disconnect_but_not_stop():
+    """Only an explicit discard may wipe the saved queue (#34)."""
+    import shutil
+    import tempfile
+    from inmermusic import persistence
+    from inmermusic.state import get_state, guild_states, hydrate_state
+
+    guild_id = 900160
+    directory = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    persistence.reset_connection()
+    config.STATE_DIR = directory
+
+    def seed():
+        state = get_state(guild_id)
+        state.persistence_hydrated = True
+        state.current_song = {"url": "https://e/now", "title": "now"}
+        state.queue = [{"url": "https://e/next", "title": "next"}]
+        return state
+
+    try:
+        # All users left / an admin disconnected the bot: keep it restorable.
+        seed()
+        playback.cleanup_guild_state(guild_id, clear_persisted=False)
+        persistence.flush_writes()
+        restored = persistence.load_queue(guild_id)
+        assert [s["url"] for s in restored] == ["https://e/now", "https://e/next"]
+
+        # /join restores it through hydrate_state.
+        assert hydrate_state(guild_id).restored_count == 2
+        guild_states.pop(guild_id, None)
+
+        # /stop, /leave, ⏹️: the user asked for it to go away.
+        seed()
+        playback.cleanup_guild_state(guild_id)
+        persistence.flush_writes()
+        assert persistence.load_queue(guild_id) == []
+
+        # A snapshot older than QUEUE_RESTORE_TTL is abandoned, not resurrected.
+        persistence.save_queue(guild_id, [{"url": "https://e/old", "title": "old"}])
+        conn = persistence._connect()
+        conn.execute("UPDATE queues SET updated_at = ? WHERE guild_id = ?",
+                     (int(time.time()) - config.QUEUE_RESTORE_TTL - 60, guild_id))
+        conn.commit()
+        assert len(persistence.load_queue(guild_id)) == 1  # unbounded read
+        assert persistence.load_queue(
+            guild_id, max_age=config.QUEUE_RESTORE_TTL) == []
+        guild_states.pop(guild_id, None)
+        assert hydrate_state(guild_id).restored_count == 0
+    finally:
+        config.STATE_DIR = original_state_dir
+        persistence.reset_connection()
+        guild_states.pop(guild_id, None)
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def test_nico_cli_never_prints_session_secret():
