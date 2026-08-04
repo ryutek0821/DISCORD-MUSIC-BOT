@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional
 
 import discord
 import yt_dlp
@@ -81,6 +81,10 @@ def build_ydl_opts(url: str, guild_id: Optional[int] = None,
         "noplaylist": True,
         # Treat bare keywords as a YouTube search instead of an invalid URL.
         "default_search": "ytsearch",
+        # Refuse an oversized track before the transfer starts. Extraction-only
+        # calls ignore this; it exists for the download paths, where a multi-
+        # hour archive stream could otherwise fill DOWNLOAD_DIR.
+        "max_filesize": config.MAX_DOWNLOAD_BYTES,
     }
     ydl_opts.update(overrides)
 
@@ -426,6 +430,31 @@ class DownloadResult(NamedTuple):
     error: Optional[str] = None
 
 
+def _oversized_duration(info: Any) -> Optional[float]:
+    """Duration of `info` if it exceeds MAX_TRACK_DURATION, else None."""
+    if not isinstance(info, dict):
+        return None
+    try:
+        duration = float(info.get("duration") or 0)
+    except (TypeError, ValueError):
+        return None
+    return duration if duration > config.MAX_TRACK_DURATION else None
+
+
+def _exceeds_max_filesize(info: Any) -> bool:
+    """Whether yt-dlp's reported size is over the configured ceiling."""
+    if not isinstance(info, dict):
+        return False
+    for key in ("filesize", "filesize_approx"):
+        try:
+            size = float(info.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if size > config.MAX_DOWNLOAD_BYTES:
+            return True
+    return False
+
+
 def download_audio(url: str, guild_id: Optional[int] = None) -> DownloadResult:
     """Download audio to a fresh per-request temp directory.
 
@@ -448,11 +477,24 @@ def download_audio(url: str, guild_id: Optional[int] = None) -> DownloadResult:
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
+                # Playlist/flat entries reach the queue without a duration, so
+                # _song_from_info's length check never ran for them. This is
+                # the first point where the real value is known.
+                too_long = _oversized_duration(info)
+                if too_long:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                    logger.info(f"Rejected oversized track ({too_long:.0f}s): {url}")
+                    return DownloadResult(None, "動画が長すぎます")
                 filename = ydl.prepare_filename(info)
                 if os.path.exists(filename):
                     _mark_proxy_success(proxy)
                     logger.info(f"Downloaded audio: {filename}")
                     return DownloadResult(filename)
+                # yt-dlp aborts (without raising) when max_filesize is hit.
+                if _exceeds_max_filesize(info):
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                    logger.info(f"Rejected oversized download: {url}")
+                    return DownloadResult(None, "ファイルが大きすぎます")
         except Exception as e:
             shutil.rmtree(tmpdir, ignore_errors=True)
             if index + 1 < len(proxies) and _proxy_retryable(e):
@@ -480,18 +522,29 @@ def cleanup_download(path: Optional[str]) -> None:
         shutil.rmtree(parent, ignore_errors=True)
 
 
-def cleanup_temp_files(max_age: float = 3600) -> int:
+def cleanup_temp_files(max_age: float = 3600,
+                       in_use: Optional[Iterable[str]] = None) -> int:
     """Remove orphaned dl_* temp files/directories left by a previous crash.
 
     Downloads are normally deleted in the play `after` callback, but a crash
-    mid-playback leaks them in the temp dir. Sweep ones older than max_age on
-    startup so they don't accumulate. Handles both the current per-request
-    `dl_*` directories and any pre-migration `dl_*` files. Returns the number
-    removed.
+    mid-playback leaks them in the temp dir. Sweep ones older than max_age so
+    they don't accumulate. Handles both the current per-request `dl_*`
+    directories and any pre-migration `dl_*` files. Returns the number removed.
+
+    `in_use` is a set of paths (or their parent dirs) that must never be
+    swept. It matters because this now runs periodically rather than only at
+    startup: a track playing for longer than max_age has an old mtime, and
+    deleting it out from under FFmpeg would kill playback.
     """
     removed = 0
     tmpdir = config.DOWNLOAD_DIR
     now = time.time()
+    protected = set()
+    for path in (in_use or ()):
+        if not path:
+            continue
+        protected.add(os.path.abspath(path))
+        protected.add(os.path.abspath(os.path.dirname(path)))
     try:
         names = os.listdir(tmpdir)
     except OSError as e:
@@ -501,6 +554,8 @@ def cleanup_temp_files(max_age: float = 3600) -> int:
         if not name.startswith("dl_"):
             continue
         path = os.path.join(tmpdir, name)
+        if os.path.abspath(path) in protected:
+            continue
         try:
             if now - os.path.getmtime(path) > max_age:
                 if os.path.isdir(path):
@@ -538,6 +593,11 @@ def build_audio_filter(speed: float, pitch: int, volume: int = 100,
     filters: List[str] = []
     ratio = 2 ** (pitch / 12.0)
     if pitch != 0:
+        # asetrate *replaces* the sample rate rather than scaling it, so the
+        # shift it produces is 48000*ratio / input_rate. Normalize the input to
+        # 48k first, or a 44.1kHz source lands ~8.8% sharp (+12 semitones gives
+        # ~958Hz instead of 880Hz) and plays correspondingly short.
+        filters.append("aresample=48000")
         # asetrate shifts pitch *and* speed by `ratio`; resample back to 48k.
         filters.append(f"asetrate={int(round(48000 * ratio))}")
         filters.append("aresample=48000")
