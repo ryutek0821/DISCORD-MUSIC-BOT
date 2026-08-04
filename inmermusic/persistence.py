@@ -68,6 +68,27 @@ def _connect() -> sqlite3.Connection:
             idle_timeout INTEGER NOT NULL DEFAULT 180,
             loop_mode TEXT NOT NULL DEFAULT 'off'
         );
+        CREATE TABLE IF NOT EXISTS play_counts (
+            guild_id INTEGER NOT NULL,
+            url TEXT NOT NULL,
+            title TEXT NOT NULL,
+            song_json TEXT NOT NULL,
+            play_count INTEGER NOT NULL DEFAULT 0,
+            total_sec INTEGER NOT NULL DEFAULT 0,
+            last_played INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, url)
+        );
+        CREATE INDEX IF NOT EXISTS play_counts_rank
+            ON play_counts(guild_id, play_count DESC, last_played DESC, url);
+        CREATE TABLE IF NOT EXISTS requester_counts (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            play_count INTEGER NOT NULL DEFAULT 0,
+            total_sec INTEGER NOT NULL DEFAULT 0,
+            last_played INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        );
         """
     )
     return conn
@@ -133,15 +154,69 @@ def load_queue(guild_id: int) -> List[Dict[str, Any]]:
     return [song for (raw,) in rows if (song := _decode_song(raw)) is not None]
 
 
+def _duration_sec(song: Dict[str, Any]) -> int:
+    """Best-effort seconds for a track; unknown/garbage durations count as 0."""
+    try:
+        return max(0, int(float(song.get("duration") or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bump_play_counts(
+    conn: sqlite3.Connection,
+    guild_id: int,
+    song: Dict[str, Any],
+    payload: str,
+    played_at: int,
+) -> None:
+    """Accumulate lifetime play totals. Runs inside record_history's transaction.
+
+    Unlike `history` (rolling `limit` rows), these totals are never trimmed.
+    """
+    url = song.get("url")
+    if not url:
+        return
+    seconds = _duration_sec(song)
+    conn.execute(
+        "INSERT INTO play_counts "
+        "(guild_id, url, title, song_json, play_count, total_sec, last_played) "
+        "VALUES (?, ?, ?, ?, 1, ?, ?) "
+        "ON CONFLICT(guild_id, url) DO UPDATE SET "
+        "play_count = play_count + 1, "
+        "total_sec = total_sec + excluded.total_sec, "
+        "title = excluded.title, "
+        "song_json = excluded.song_json, "
+        "last_played = excluded.last_played",
+        (guild_id, url, song.get("title") or url, payload, seconds, played_at),
+    )
+    try:
+        user_id = int(song.get("requester_id"))
+    except (TypeError, ValueError):
+        return
+    conn.execute(
+        "INSERT INTO requester_counts "
+        "(guild_id, user_id, name, play_count, total_sec, last_played) "
+        "VALUES (?, ?, ?, 1, ?, ?) "
+        "ON CONFLICT(guild_id, user_id) DO UPDATE SET "
+        "play_count = play_count + 1, "
+        "total_sec = total_sec + excluded.total_sec, "
+        "name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END, "
+        "last_played = excluded.last_played",
+        (guild_id, user_id, str(song.get("requester") or ""), seconds, played_at),
+    )
+
+
 def record_history(guild_id: int, song: Dict[str, Any], limit: int = 200) -> bool:
     try:
-        payload = json.dumps(clean_song(song), ensure_ascii=False)
+        cleaned = clean_song(song)
+        payload = json.dumps(cleaned, ensure_ascii=False)
+        played_at = int(time.time())
         with _db_lock:
             conn = _connect()
             try:
                 conn.execute(
                     "INSERT INTO history (guild_id, song_json, played_at) VALUES (?, ?, ?)",
-                    (guild_id, payload, int(time.time())),
+                    (guild_id, payload, played_at),
                 )
                 conn.execute(
                     "DELETE FROM history WHERE guild_id = ? AND id NOT IN "
@@ -149,6 +224,7 @@ def record_history(guild_id: int, song: Dict[str, Any], limit: int = 200) -> boo
                     "ORDER BY played_at DESC, id DESC LIMIT ?)",
                     (guild_id, guild_id, limit),
                 )
+                _bump_play_counts(conn, guild_id, cleaned, payload, played_at)
                 conn.commit()
             finally:
                 conn.close()
@@ -206,6 +282,138 @@ def pop_history(guild_id: int) -> Optional[Dict[str, Any]]:
     if song is not None:
         song["played_at"] = row[2]
     return song
+
+
+def top_songs(guild_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    """Most-played tracks, ranked. `song` holds the replayable track dict."""
+    try:
+        with _db_lock:
+            conn = _connect()
+            try:
+                rows = conn.execute(
+                    "SELECT url, title, song_json, play_count, total_sec, last_played "
+                    "FROM play_counts WHERE guild_id = ? "
+                    "ORDER BY play_count DESC, last_played DESC, url ASC LIMIT ?",
+                    (guild_id, max(1, limit)),
+                ).fetchall()
+            finally:
+                conn.close()
+    except (OSError, sqlite3.Error) as e:
+        logger.warning(f"Failed to read play counts for guild {guild_id}: {e}")
+        return []
+    result = []
+    for url, title, raw, play_count, total_sec, last_played in rows:
+        song = _decode_song(raw) or {"url": url, "title": title}
+        song.setdefault("url", url)
+        song.setdefault("title", title)
+        result.append({
+            "url": url,
+            "title": title,
+            "song": song,
+            "play_count": play_count,
+            "total_sec": total_sec,
+            "last_played": last_played,
+        })
+    return result
+
+
+def top_requesters(guild_id: int, limit: int = 5) -> List[Dict[str, Any]]:
+    try:
+        with _db_lock:
+            conn = _connect()
+            try:
+                rows = conn.execute(
+                    "SELECT user_id, name, play_count, total_sec, last_played "
+                    "FROM requester_counts WHERE guild_id = ? "
+                    "ORDER BY play_count DESC, last_played DESC, user_id ASC LIMIT ?",
+                    (guild_id, max(1, limit)),
+                ).fetchall()
+            finally:
+                conn.close()
+    except (OSError, sqlite3.Error) as e:
+        logger.warning(f"Failed to read requester counts for guild {guild_id}: {e}")
+        return []
+    return [
+        {
+            "user_id": user_id,
+            "name": name,
+            "play_count": play_count,
+            "total_sec": total_sec,
+            "last_played": last_played,
+        }
+        for user_id, name, play_count, total_sec, last_played in rows
+    ]
+
+
+def guild_play_totals(guild_id: int) -> Dict[str, int]:
+    empty = {"unique_tracks": 0, "plays": 0, "total_sec": 0}
+    try:
+        with _db_lock:
+            conn = _connect()
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(play_count), 0), "
+                    "COALESCE(SUM(total_sec), 0) FROM play_counts WHERE guild_id = ?",
+                    (guild_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+    except (OSError, sqlite3.Error) as e:
+        logger.warning(f"Failed to read play totals for guild {guild_id}: {e}")
+        return empty
+    if not row:
+        return empty
+    return {"unique_tracks": int(row[0]), "plays": int(row[1]), "total_sec": int(row[2])}
+
+
+def user_play_stats(guild_id: int, user_id: int) -> Dict[str, Any]:
+    """One requester's totals plus their own most-played tracks."""
+    empty: Dict[str, Any] = {"play_count": 0, "total_sec": 0, "songs": []}
+    try:
+        with _db_lock:
+            conn = _connect()
+            try:
+                row = conn.execute(
+                    "SELECT play_count, total_sec FROM requester_counts "
+                    "WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                ).fetchone()
+                rows = conn.execute(
+                    "SELECT song_json, played_at FROM history WHERE guild_id = ? "
+                    "ORDER BY played_at DESC, id DESC LIMIT 200",
+                    (guild_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+    except (OSError, sqlite3.Error) as e:
+        logger.warning(f"Failed to read user stats for guild {guild_id}: {e}")
+        return empty
+    if not row:
+        return empty
+    # play_counts is keyed by track, not requester, so per-user favourites can
+    # only come from the (rolling) history rows.
+    tally: Dict[str, Dict[str, Any]] = {}
+    for raw, _played_at in rows:
+        song = _decode_song(raw)
+        if song is None or not song.get("url"):
+            continue
+        try:
+            if int(song.get("requester_id")) != user_id:
+                continue
+        except (TypeError, ValueError):
+            continue
+        entry = tally.setdefault(
+            song["url"],
+            {"title": song.get("title") or song["url"], "play_count": 0},
+        )
+        entry["play_count"] += 1
+    songs = sorted(
+        tally.values(), key=lambda item: (-item["play_count"], item["title"]))
+    return {
+        "play_count": int(row[0]),
+        "total_sec": int(row[1]),
+        "songs": songs[:5],
+    }
 
 
 def _playlist_key(name: str) -> str:
@@ -464,6 +672,7 @@ def delete_guild_data(guild_id: int) -> None:
                 for table in (
                     "queues", "history", "favorites",
                     "named_playlists", "guild_settings",
+                    "play_counts", "requester_counts",
                 ):
                     conn.execute(f"DELETE FROM {table} WHERE guild_id = ?", (guild_id,))
                 conn.commit()

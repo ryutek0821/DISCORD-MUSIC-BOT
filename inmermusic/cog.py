@@ -34,6 +34,19 @@ _PRESET_CHOICES = [
 ]
 
 
+_RANK_ICONS = ("🥇", "🥈", "🥉")
+
+
+def _rank_icon(rank: int) -> str:
+    return _RANK_ICONS[rank - 1] if rank <= len(_RANK_ICONS) else f"{rank}."
+
+
+def _short_title(title: str, limit: int = 60) -> str:
+    """Keep ranking rows on one line; embeds cap out at 4096 chars."""
+    title = title.replace("[", "(").replace("]", ")")
+    return title if len(title) <= limit else title[:limit - 1] + "…"
+
+
 def _drop_abandoned_state(guild_id: int, request_state, created: bool) -> None:
     """Drop a GuildState this /play call just created, if extraction failed
     before anything else touched it.
@@ -128,7 +141,7 @@ class MusicCog(commands.Cog):
             or getattr(interaction.command, "name", "")
         )
         if command not in {
-            "help", "history", "favorites", "refresh", "settings",
+            "help", "history", "favorites", "refresh", "settings", "stats",
             "playlist list", "playlist delete",
         }:
             hydrate_state(interaction.guild.id)
@@ -140,7 +153,7 @@ class MusicCog(commands.Cog):
                 )
             return allowed
         if command in {
-            "help", "queue", "nowplaying", "history", "favorites",
+            "help", "queue", "nowplaying", "history", "favorites", "stats",
             "playlist list", "playlist delete",
         }:
             return True
@@ -704,6 +717,89 @@ class MusicCog(commands.Cog):
         await interaction.response.defer()
         await self._enqueue_songs(interaction, [songs[position - 1]])
 
+    @app_commands.command(name="stats", description="Show play statistics for this server")
+    @app_commands.describe(scope="表示する内容（既定: 曲ランキング）")
+    @app_commands.choices(scope=[
+        app_commands.Choice(name="曲ランキング", value="songs"),
+        app_commands.Choice(name="DJランキング", value="djs"),
+        app_commands.Choice(name="自分の実績", value="me"),
+    ])
+    async def stats_cmd(self, interaction: discord.Interaction,
+                        scope: Optional[app_commands.Choice[str]] = None):
+        guild_id = interaction.guild.id
+        totals = persistence.guild_play_totals(guild_id)
+        if not totals["plays"]:
+            await interaction.response.send_message(
+                "まだ再生実績がありません。", ephemeral=True)
+            return
+        mode = scope.value if scope else "songs"
+        embed = discord.Embed(color=0x00ff00)
+
+        if mode == "me":
+            stats = persistence.user_play_stats(guild_id, interaction.user.id)
+            embed.title = f"📊 {interaction.user.display_name} の再生実績"
+            if not stats["play_count"]:
+                embed.description = "このサーバーでの再生実績はまだありません。"
+            else:
+                lines = [
+                    f"リクエストした曲数: **{stats['play_count']}回**",
+                    f"合計再生時間: **{fmt_duration(stats['total_sec'])}**",
+                ]
+                if stats["songs"]:
+                    lines.append("")
+                    lines.append("**よく流している曲**（直近の履歴から）")
+                    lines += [
+                        f"{index}. {_short_title(entry['title'])} "
+                        f"— {entry['play_count']}回"
+                        for index, entry in enumerate(stats["songs"], start=1)
+                    ]
+                embed.description = "\n".join(lines)
+        elif mode == "djs":
+            djs = persistence.top_requesters(guild_id, 10)
+            embed.title = "📊 DJランキング"
+            if not djs:
+                embed.description = "リクエスト者の記録がありません。"
+            else:
+                lines = []
+                for index, entry in enumerate(djs, start=1):
+                    name = entry["name"] or f"<@{entry['user_id']}>"
+                    lines.append(
+                        f"{_rank_icon(index)} {name} "
+                        f"— **{entry['play_count']}回** "
+                        f"({fmt_duration(entry['total_sec'])})"
+                    )
+                embed.description = "\n".join(lines)
+        else:
+            songs = persistence.top_songs(guild_id, 10)
+            embed.title = "📊 よく再生されている曲"
+            embed.description = "\n".join(
+                f"{_rank_icon(index)} **[{_short_title(entry['title'])}]"
+                f"({entry['url']})** — {entry['play_count']}回 "
+                f"(<t:{entry['last_played']}:R>)"
+                for index, entry in enumerate(songs, start=1)
+            )
+
+        embed.set_footer(
+            text=f"総再生 {totals['plays']}回 / {totals['unique_tracks']}曲 / "
+                 f"{fmt_duration(totals['total_sec'])}"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="playtop", description="Queue the most-played tracks")
+    @app_commands.describe(count="追加する曲数（1〜25、既定10）")
+    async def playtop_cmd(self, interaction: discord.Interaction, count: int = 10):
+        if not interaction.user.voice:
+            await interaction.response.send_message("VCに参加してください。")
+            return
+        entries = persistence.top_songs(interaction.guild.id, max(1, min(25, count)))
+        if not entries:
+            await interaction.response.send_message(
+                "まだ再生実績がありません。", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self._enqueue_songs(
+            interaction, [entry["song"] for entry in entries], deduplicate=True)
+
     @app_commands.command(name="favorite", description="Save the current track to favorites")
     async def favorite_cmd(self, interaction: discord.Interaction):
         state = get_state(interaction.guild.id)
@@ -866,6 +962,8 @@ class MusicCog(commands.Cog):
             name="/previous・/replay", value="前の曲・現在曲を先頭から再生", inline=True)
         embed.add_field(
             name="/history・/historyplay", value="履歴表示・履歴から追加", inline=True)
+        embed.add_field(
+            name="/stats・/playtop", value="再生ランキング・上位曲をキューへ", inline=True)
         embed.add_field(name="/favorite・/favorites", value="お気に入り保存・表示", inline=True)
         embed.add_field(name="/playfavorite・/unfavorite", value="お気に入り再生・削除", inline=True)
         embed.add_field(name="/settings", value="サーバー既定値（管理者）", inline=True)

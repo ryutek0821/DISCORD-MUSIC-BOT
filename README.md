@@ -9,7 +9,7 @@ Discord でニコニコ動画・YouTube を再生できる Music Bot。
 - ニコニコ動画・YouTube の再生（URL または検索キーワード）
 - キーワード検索時は上位5件（投稿者名・再生時間つき）から選択、プレイリスト/マイリストの一括追加
 - キュー管理（追加・スキップ・表示・削除・クリア・シャッフル・リピート）
-- 次曲プリフェッチ、再起動後のキュー復元、再生履歴・お気に入り・名前付きプレイリスト
+- 次曲プリフェッチ、再起動後のキュー復元、再生履歴・お気に入り・名前付きプレイリスト・累計再生統計
 - 再生中の曲情報を Embed で表示（タイトル・URL・再生位置プログレスバー・リクエスト者・サムネイル）＋操作ボタン
 - 速度・ピッチ・音量の調整、シーク、エフェクトプリセット20種
 - 効果音再生（`/na-` またはメッセージトリガー `んあー` / `んあーと`）
@@ -29,6 +29,8 @@ Discord でニコニコ動画・YouTube を再生できる Music Bot。
 | `/history` / `/historyplay <番号>` | 最近の再生履歴を表示／キューへ再追加 |
 | `/favorite` / `/favorites` | 再生中の曲をお気に入り保存／一覧表示 |
 | `/playfavorite <番号>` / `/unfavorite <番号>` | お気に入りを再生／削除 |
+| `/stats [songs/djs/me]` | サーバーの累計再生ランキング（曲・DJ・自分の実績） |
+| `/playtop [曲数]` | 再生回数の多い曲を上位からキューへ追加（既定10曲、最大25曲） |
 | `/loop <off/song/queue>` | リピート再生（オフ／1曲／キュー全体） |
 | `/shuffle` | キューをシャッフル |
 | `/speed <0.5-2.0>` | 再生速度を変更（ピッチ維持） |
@@ -54,7 +56,7 @@ Discord でニコニコ動画・YouTube を再生できる Music Bot。
 ### 実行制限
 
 - DM では使用できません（サーバー内専用）
-- Bot が VC に接続中は、**同じ VC に参加しているユーザーのみ**操作できます。ただし閲覧系（`/help` `/queue` `/nowplaying` `/history` `/favorites` `/playlist list` `/playlist delete`）は VC 外からでも実行可能です
+- Bot が VC に接続中は、**同じ VC に参加しているユーザーのみ**操作できます。ただし閲覧系（`/help` `/queue` `/nowplaying` `/history` `/favorites` `/stats` `/playlist list` `/playlist delete`）は VC 外からでも実行可能です
 - `/refresh` と `/settings` は `サーバー管理` 権限が必要です
 
 再生中の曲の Embed には操作ボタン（⏯️ 一時停止/再開・⏭️ スキップ・⏹️ 停止・🔁 リピート・🔀 シャッフル）とエフェクト選択ドロップダウンが付きます。
@@ -180,7 +182,7 @@ inmermusic/
 ├── audio.py     # FFmpeg フィルタ構築・音源生成・ダウンロード・検索/プレイリスト展開
 ├── ui.py        # Embed・操作ボタン UI
 ├── cookies.py   # ニコニコ Cookie 取得・更新（APIログイン + Seleniumフォールバック）
-├── persistence.py # キュー・履歴・お気に入り・Guild設定のSQLite永続化
+├── persistence.py # キュー・履歴・再生統計・お気に入り・Guild設定のSQLite永続化
 ├── nico_cli.py  # Guild別ニコニコセッションのローカル管理CLI
 ├── config.py    # 環境変数読み込み・ログ設定・エフェクト/プリセット定義テーブル
 └── util.py      # 共通ユーティリティ
@@ -195,12 +197,13 @@ main.py          # エントリポイント（inmermusic.bot を呼び出す）
 
 ### 永続化と再起動時の挙動
 
-キュー・履歴・お気に入り・名前付きプレイリスト・Guild設定は `STATE_DIR/music.db`（SQLite / WAL）に保存されます。
+キュー・履歴・再生統計・お気に入り・名前付きプレイリスト・Guild設定は `STATE_DIR/music.db`（SQLite / WAL）に保存されます。
 
 - キューはコマンド操作のたびに保存されるため、クラッシュしても直前の状態が残ります。再生中だった曲はキュー先頭として保存されます
-- 再起動後、そのGuildで最初にコマンドが実行された時点でキューと設定（既定音量・アイドル切断秒数・リピートモード）を復元します。復元は特定のコマンド専用ではなく、`/play` や `/queue` など状態を扱うコマンド全般が契機になります（`/help` `/history` `/favorites` `/refresh` `/settings` `/playlist list` `/playlist delete` は除く）
+- 再起動後、そのGuildで最初にコマンドが実行された時点でキューと設定（既定音量・アイドル切断秒数・リピートモード）を復元します。復元は特定のコマンド専用ではなく、`/play` や `/queue` など状態を扱うコマンド全般が契機になります（`/help` `/history` `/favorites` `/stats` `/refresh` `/settings` `/playlist list` `/playlist delete` は除く）
 - Bot は自動では再生を再開しません。`/play` すると復元されたキューの先頭から再生され、新規追加分は Embed のフッターに件数が表示されます
 - `/stop` `/leave` とアイドル切断時は保存済みキューも消去します
+- 履歴は直近200件のローリング保存ですが、`/stats` の累計再生回数・再生時間は別テーブルで保持されるため削除されません（Bot がサーバーから抜けた時点で当該Guildのデータは全削除）
 
 ## Guild別ニコニコセッション
 
