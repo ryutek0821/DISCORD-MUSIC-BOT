@@ -18,8 +18,12 @@ on:
 
 jobs:
   deploy:
+    # The manual path is restricted to master as well. "Run workflow" lets any
+    # write-access user pick a branch, which would otherwise rsync unmerged,
+    # CI-unvalidated code straight to production.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == 'refs/heads/master') ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'master')
