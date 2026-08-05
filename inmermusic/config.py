@@ -14,6 +14,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+
+def _parse_id_list(raw: Optional[str]) -> frozenset:
+    """Parse a comma-separated Discord ID list, ignoring junk entries."""
+    if not raw:
+        return frozenset()
+    ids = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            logging.getLogger("niconico-bot").warning(
+                f"Ignoring non-numeric BOT_ADMIN_IDS entry: {part!r}")
+    return frozenset(ids)
+
+
+# Discord user IDs allowed to run the operator commands (/refresh, /settings).
+# Server "Manage Server" permission answers "is this person a moderator of the
+# guild", not "does this person operate the bot" — the two came apart in
+# practice, locking the operator out of their own bot. When this is empty the
+# manage_guild check still applies, so an unconfigured deployment is neither
+# wide open nor locked out.
+BOT_ADMIN_IDS = _parse_id_list(os.getenv("BOT_ADMIN_IDS"))
 COOKIE_FILE = os.getenv("COOKIE_FILE")
 NICO_EMAIL = os.getenv("NICO_EMAIL")
 NICO_PASSWORD = os.getenv("NICO_PASSWORD")
