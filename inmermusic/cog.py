@@ -1149,16 +1149,22 @@ class MusicCog(commands.Cog):
         return [app_commands.Choice(name=n, value=n)
                 for n in list_sound_names() if current in n.lower()][:25]
 
-    @app_commands.command(name="refresh", description="Refresh niconico cookies")
+    @app_commands.command(
+        name="refresh", description="Reapply the niconico session from NICO_SESSION")
     async def refresh(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        cookies.last_cookie_refresh = 0
+        # force=True so a rotated NICO_SESSION replaces the stored cookie;
+        # without it the existing session would simply be kept.
         success = await asyncio.get_running_loop().run_in_executor(
-            None, cookies.refresh_nico_cookies_sync, True)
+            None, cookies.ensure_nico_cookies, True)
         if success:
-            await interaction.followup.send("Cookieを更新しました！", ephemeral=True)
+            await interaction.followup.send(
+                "ニコニコのセッションを適用しました！", ephemeral=True)
         else:
-            await interaction.followup.send("Cookieの更新に失敗しました", ephemeral=True)
+            await interaction.followup.send(
+                "利用できるセッションがありません。`.env` の `NICO_SESSION` に "
+                "ログイン済みブラウザの `user_session` を設定してください",
+                ephemeral=True)
 
     @commands.Cog.listener()
     async def on_app_command_completion(

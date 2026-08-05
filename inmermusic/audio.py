@@ -16,8 +16,8 @@ from . import config
 from .config import (DOWNLOAD_TIMEOUT, EFFECT_FILTERS, MAX_PLAYLIST_SIZE,
                      MAX_TRACK_DURATION, NICO_EMAIL, NICO_PASSWORD,
                      SOURCE_CLEANUP_DELAY, logger)
-from .cookies import (ensure_cookie_file, guild_cookie_file,
-                      refresh_nico_cookies_sync)
+from .cookies import (ensure_cookie_file, ensure_nico_cookies,
+                      guild_cookie_file)
 from .state import GuildState
 
 _GUILD_COOKIE_UNSET = object()
@@ -284,7 +284,7 @@ def extract_audio_url(url: str, guild_id: Optional[int] = None) -> Dict[str, Any
     guild_cookie = (guild_cookie_file(guild_id)
                     if is_niconico and guild_id is not None else None)
     if is_niconico and not guild_cookie:
-        refresh_nico_cookies_sync()
+        ensure_nico_cookies()
 
     try:
         info = _extract_info_with_failover(
@@ -340,7 +340,7 @@ def extract_playlist(url: str, guild_id: Optional[int] = None,
         if is_niconico and guild_id is not None else None
     )
     if is_niconico and not guild_cookie:
-        refresh_nico_cookies_sync()
+        ensure_nico_cookies()
     try:
         info = _extract_info_with_failover(
             url, guild_id, noplaylist=False, extract_flat="in_playlist",

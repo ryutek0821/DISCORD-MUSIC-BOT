@@ -1,6 +1,15 @@
-"""niconico login, guild session storage, and Netscape cookie persistence.
+"""niconico session handling, guild session storage, and cookie persistence.
 
 COOKIE_FILE is read via ``config.COOKIE_FILE`` so tests can monkeypatch it.
+
+This module does **not** log in to niconico. niconico replaced its
+server-rendered login form with an MFA-capable SPA, which removed
+``POST /login/redirector`` (now 404) and every element id the old Selenium
+fallback drove — both paths broke at once and neither is repairable in a way
+that stays fixed. Authentication now comes from two places only: a
+``user_session`` supplied by hand (globally via ``NICO_SESSION``, per guild via
+``set_guild_session``), and yt-dlp's own niconico login (see
+``audio.build_ydl_opts``), which is maintained upstream against site changes.
 """
 import os
 import sqlite3
@@ -9,15 +18,15 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-import requests
-
 from . import config
-from .config import CHROMEDRIVER_PATH, COOKIE_TTL, NICO_EMAIL, NICO_PASSWORD, logger
+from .config import NICO_SESSION, logger
 
-last_cookie_refresh = 0
-# threading.Lock (not asyncio): cookie refreshes run in executor threads, so the
-# foreground extract path and the background loop must serialize there, not on
-# the event loop. cookie_refresh_lock avoids duplicate logins; cookie_file_lock
+# Sessions are long-lived, but pin an explicit expiry so yt-dlp keeps sending
+# the cookie rather than treating it as a session cookie it may drop.
+SESSION_COOKIE_TTL = 180 * 24 * 60 * 60
+# threading.Lock (not asyncio): cookie work runs in executor threads, so the
+# foreground extract path must serialize there, not on the event loop.
+# cookie_refresh_lock keeps two writers off the file at once; cookie_file_lock
 # guards the atomic file write so a concurrent yt-dlp read never sees a partial.
 cookie_refresh_lock = threading.Lock()
 cookie_file_lock = threading.Lock()
@@ -27,29 +36,6 @@ guild_session_locks_lock = threading.Lock()
 guild_session_locks = {}
 guild_cookie_cache_lock = threading.Lock()
 guild_cookie_cache: Dict[int, tuple[str, str]] = {}
-
-NICO_LOGIN_BASE = "https://account.nicovideo.jp"
-
-
-def login_via_api() -> requests.cookies.RequestsCookieJar:
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-    })
-    # niconico deprecated /api/v1/login; the current login flow posts to
-    # /login/redirector and sets the `user_session` cookie on success.
-    session.get(f"{NICO_LOGIN_BASE}/login", timeout=(10, 30))
-    resp = session.post(
-        f"{NICO_LOGIN_BASE}/login/redirector",
-        data={"mail_tel": NICO_EMAIL, "password": NICO_PASSWORD},
-        headers={"Referer": f"{NICO_LOGIN_BASE}/login"},
-        allow_redirects=True,
-        timeout=(10, 30),
-    )
-    resp.raise_for_status()
-    logger.info(f"API login status: {resp.status_code}")
-    return session.cookies
-
 
 def write_netscape_cookies(records: List[Dict[str, Any]],
                            output_path: Optional[str] = None) -> int:
@@ -253,7 +239,7 @@ def guild_cookie_file(guild_id: int) -> Optional[str]:
                 "domain": ".nicovideo.jp",
                 "path": "/",
                 "secure": True,
-                "expiry": int(time.time()) + 180 * 24 * 60 * 60,
+                "expiry": int(time.time()) + SESSION_COOKIE_TTL,
                 "name": "user_session",
                 "value": user_session,
             }],
@@ -264,109 +250,60 @@ def guild_cookie_file(guild_id: int) -> Optional[str]:
         return path
 
 
-def save_session_cookies(cookies: requests.cookies.RequestsCookieJar) -> None:
-    records = [
-        {
-            "domain": c.domain,
-            "path": c.path,
-            "secure": c.secure,
-            "expiry": c.expires,
-            "name": c.name,
-            "value": c.value,
-        }
-        for c in cookies
-    ]
-    count = write_netscape_cookies(records)
-    logger.info(f"Saved {count} session cookies")
-
-
-def refresh_nico_cookies_sync(force: bool = False) -> bool:
-    def _cache_valid() -> bool:
-        return (not force
-                and (time.time() - last_cookie_refresh) < COOKIE_TTL
-                and bool(config.COOKIE_FILE)
-                and os.path.exists(config.COOKIE_FILE)
-                and os.path.getsize(config.COOKIE_FILE) > 0)
-
-    if _cache_valid():
-        logger.info("Using cached cookies (not expired)")
-        return True
-
-    if not config.COOKIE_FILE or not NICO_EMAIL or not NICO_PASSWORD:
-        logger.warning("Niconico credentials/cookie path are not configured")
+def cookie_file_has_session(path: Optional[str] = None) -> bool:
+    """True when the cookie file already carries a user_session line."""
+    target = path if path is not None else config.COOKIE_FILE
+    if not target:
+        return False
+    try:
+        with open(target) as f:
+            return any(
+                line.split("\t")[5] == "user_session"
+                for line in f
+                if not line.startswith("#") and len(line.split("\t")) >= 7
+            )
+    except OSError:
         return False
 
-    # Serialize logins across the foreground extract path and the background
-    # loop so we never run two logins (or two cookie writes) concurrently.
-    with cookie_refresh_lock:
-        if _cache_valid():
-            logger.info("Using cached cookies (refreshed by another task)")
-            return True
-        return _do_refresh_nico_cookies()
 
+def ensure_nico_cookies(force: bool = False) -> bool:
+    """Make sure COOKIE_FILE carries a usable global niconico user_session.
 
-def _do_refresh_nico_cookies() -> bool:
-    """Run the actual niconico login (API, then Selenium fallback).
+    Normally a no-op: yt-dlp owns COOKIE_FILE once a session is in it and
+    writes refreshed cookies back on close, so overwriting on every extract
+    would throw away the newer values. NICO_SESSION is therefore only written
+    when the file has no session at all — or when ``force`` says to adopt a
+    rotated NICO_SESSION (that is what /refresh now does).
 
-    The caller holds cookie_refresh_lock, so only one refresh runs at a time.
+    Returns whether a usable session ended up in the file.
     """
-    global last_cookie_refresh
+    if not config.COOKIE_FILE:
+        logger.warning("COOKIE_FILE is not configured; niconico playback needs it")
+        return False
 
-    logger.info("Refreshing niconico cookies via API...")
-    try:
-        cookies = login_via_api()
-        if any(c.name == "user_session" for c in cookies):
-            save_session_cookies(cookies)
-            last_cookie_refresh = time.time()
+    with cookie_refresh_lock:
+        if not force and cookie_file_has_session():
             return True
-        logger.warning("API login did not return a user_session cookie")
-    except Exception as e:
-        logger.error(f"API login failed: {e}")
-
-    logger.info("API login failed, trying Selenium fallback...")
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.chrome.service import Service
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-
-        options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
-
-        service = Service(CHROMEDRIVER_PATH)
-        driver = webdriver.Chrome(service=service, options=options)
-
-        try:
-            driver.set_page_load_timeout(30)
-            driver.set_script_timeout(30)
-            driver.get("https://account.nicovideo.jp/login?site=niconico")
-            time.sleep(3)
-            mail_field = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.ID, "input__mailtel"))
-            )
-            mail_field.send_keys(NICO_EMAIL)
-            pass_field = driver.find_element(By.ID, "input__password")
-            pass_field.send_keys(NICO_PASSWORD)
-            driver.find_element(By.ID, "login__submit").click()
-            time.sleep(10)
-
-            cookies = driver.get_cookies()
-            if not any(c.get("name") == "user_session" for c in cookies):
-                raise RuntimeError("Selenium login did not return user_session")
-            write_netscape_cookies(cookies)
-            last_cookie_refresh = time.time()
-            logger.info(f"Saved {len(cookies)} cookies via Selenium")
+        if NICO_SESSION:
+            write_netscape_cookies([{
+                "domain": ".nicovideo.jp",
+                "path": "/",
+                "secure": True,
+                "expiry": int(time.time()) + SESSION_COOKIE_TTL,
+                "name": "user_session",
+                "value": NICO_SESSION,
+            }])
+            logger.info("Applied niconico user_session from NICO_SESSION")
             return True
-        finally:
-            driver.quit()
-    except Exception as e:
-        logger.error(f"Selenium fallback failed: {e}")
+        if cookie_file_has_session():
+            # force=True with nothing to apply; keep whatever yt-dlp last wrote.
+            return True
+        ensure_cookie_file()
+        logger.warning(
+            "No niconico user_session available. Set NICO_SESSION in .env "
+            "(copy the user_session cookie from a logged-in browser), or "
+            "register one per guild. Falling back to yt-dlp's own login."
+        )
         return False
 
 

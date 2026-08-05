@@ -2159,8 +2159,11 @@ def test_startup_work_runs_once_per_process():
 
     original_bot = bot_module.bot
     original_cleanup = bot_module.cleanup_temp_files
+    original_ensure = cookies.ensure_nico_cookies
     sweeps = []
+    seeds = []
     bot_module.cleanup_temp_files = lambda *a, **k: sweeps.append(1)
+    cookies.ensure_nico_cookies = lambda *a, **k: seeds.append(1)
     bot_module.bot = SimpleNamespace(
         user="fake", tree=FakeTree(), loop=FakeLoop())
 
@@ -2171,14 +2174,17 @@ def test_startup_work_runs_once_per_process():
         await bot_module.on_ready()
         assert syncs == [1], syncs
         assert sweeps == [1], sweeps
-        # Both background loops start, and only once.
-        assert len(tasks) == 2, tasks
+        # The session is seeded once, not re-applied on every reconnect (#53).
+        assert seeds == [1], seeds
+        # Only the temp sweep loop remains; the hourly relogin loop is gone.
+        assert len(tasks) == 1, tasks
 
     try:
         asyncio.run(scenario())
     finally:
         bot_module.bot = original_bot
         bot_module.cleanup_temp_files = original_cleanup
+        cookies.ensure_nico_cookies = original_ensure
 
 
 def test_panel_refresh_is_debounced():
@@ -2451,6 +2457,120 @@ def test_queue_survives_passive_disconnect_but_not_stop():
         persistence.reset_connection()
         guild_states.pop(guild_id, None)
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def _cookie_file_fixture():
+    """A temp cookie file plus a restore callback for config.COOKIE_FILE."""
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    os.remove(path)  # start absent; ensure_nico_cookies must create it
+    original_file = config.COOKIE_FILE
+    original_session = cookies.NICO_SESSION
+    config.COOKIE_FILE = path
+
+    def restore():
+        config.COOKIE_FILE = original_file
+        cookies.NICO_SESSION = original_session
+        if os.path.exists(path):
+            os.remove(path)
+
+    return path, restore
+
+
+def test_nico_session_is_applied_and_not_reapplied():
+    """NICO_SESSION seeds the cookie file, then yt-dlp owns it (#53)."""
+    path, restore = _cookie_file_fixture()
+    try:
+        cookies.NICO_SESSION = "session-from-env"
+        assert cookies.ensure_nico_cookies() is True
+        with open(path) as f:
+            assert "session-from-env" in f.read()
+
+        # yt-dlp refreshes the file on close. A later call must not stomp on
+        # the newer value with the stale env one.
+        cookies.write_netscape_cookies([{
+            "name": "user_session", "value": "refreshed-by-ytdlp",
+            "domain": ".nicovideo.jp", "path": "/", "secure": True,
+            "expiry": 1999999999,
+        }])
+        assert cookies.ensure_nico_cookies() is True
+        with open(path) as f:
+            assert "refreshed-by-ytdlp" in f.read()
+
+        # force=True is how /refresh adopts a rotated NICO_SESSION.
+        cookies.NICO_SESSION = "rotated"
+        assert cookies.ensure_nico_cookies(force=True) is True
+        with open(path) as f:
+            assert "rotated" in f.read()
+    finally:
+        restore()
+
+
+def test_missing_nico_session_warns_without_raising():
+    """No session must degrade to yt-dlp's login, not crash (#53)."""
+    path, restore = _cookie_file_fixture()
+    try:
+        cookies.NICO_SESSION = None
+        assert cookies.ensure_nico_cookies() is False
+        # The file is still created so yt-dlp has somewhere to persist cookies.
+        assert os.path.exists(path)
+        assert cookies.cookie_file_has_session() is False
+
+        # An existing session is reported even when nothing can be applied,
+        # so /refresh doesn't claim failure while playback still works.
+        cookies.write_netscape_cookies([{
+            "name": "user_session", "value": "already-there",
+            "domain": ".nicovideo.jp", "path": "/", "secure": True,
+            "expiry": 1999999999,
+        }])
+        assert cookies.cookie_file_has_session() is True
+        assert cookies.ensure_nico_cookies(force=True) is True
+    finally:
+        restore()
+
+
+def test_no_selenium_or_login_endpoint_remains():
+    """The scraped-login paths are gone for good (#53).
+
+    niconico moved login to an MFA-capable SPA: /login/redirector 404s and
+    every element id the Selenium fallback drove was removed. Re-adding either
+    path would fail the same way, so keep them out.
+    """
+    import ast
+
+    from inmermusic import bot as bot_module
+
+    path = os.path.join(os.path.dirname(__file__), os.pardir,
+                        "inmermusic", "cookies.py")
+    tree = ast.parse(open(path).read())
+    # Scan code only: the module docstring documents why these paths are gone,
+    # so a plain substring search over the file would match its own rationale.
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add((node.module or "").split(".")[0])
+            imported.update(a.name for a in node.names)
+    assert "selenium" not in imported
+    assert "requests" not in imported
+    # Credentials belong to yt-dlp's login now, not to this module.
+    assert "NICO_PASSWORD" not in imported and "NICO_EMAIL" not in imported
+
+    body = tree.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(
+            body[0].value, ast.Constant):
+        body = body[1:]  # drop the module docstring explaining the removal
+    literals = {n.value for stmt in body for n in ast.walk(stmt)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    for gone in ("input__mailtel", "input__password", "login__submit"):
+        assert not any(gone in s for s in literals), gone
+    assert not any("login/redirector" in s for s in literals)
+
+    assert not hasattr(cookies, "login_via_api")
+    # The hourly relogin loop went with it.
+    assert not hasattr(bot_module, "background_cookie_refresh")
 
 
 def test_nico_cli_never_prints_session_secret():
