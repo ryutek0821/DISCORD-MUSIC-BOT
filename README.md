@@ -13,7 +13,7 @@ Discord でニコニコ動画・YouTube を再生できる Music Bot。
 - 再生中の曲情報を Embed で表示（タイトル・URL・再生位置プログレスバー・リクエスト者・サムネイル）＋操作ボタン
 - 速度・ピッチ・音量の調整、シーク、エフェクトプリセット20種
 - 効果音再生（`/na-` またはメッセージトリガー `んあー` / `んあーと`）
-- ニコニコセッションの適用・再適用（`/refresh`）
+- ニコニコセッションの適用・再適用（`/nicosession`）
 - 自動再生（オートDJ）: キューが空になったら関連曲を自動追加
 - アイドル時に自動 VC 切断
 
@@ -27,9 +27,9 @@ Discord でニコニコ動画・YouTube を再生できる Music Bot。
 | `/skip` | 現在の曲をスキップ |
 | `/queue` | キューを10件ずつページ表示、各曲の開始ETAも表示 |
 | `/previous` / `/replay` | 前の曲へ戻る／現在曲を先頭から再生 |
-| `/history` / `/historyplay <番号>` | 最近の再生履歴を表示／キューへ再追加 |
-| `/favorite` / `/favorites` | 再生中の曲をお気に入り保存／一覧表示 |
-| `/playfavorite <番号>` / `/unfavorite <番号>` | お気に入りを再生／削除 |
+| `/history show` / `/history play <番号>` | 最近の再生履歴を表示／キューへ再追加 |
+| `/favorite add` / `/favorite list` | 再生中の曲をお気に入り保存／一覧表示 |
+| `/favorite play <番号>` / `/favorite remove <番号>` | お気に入りを再生／削除 |
 | `/stats [songs/djs/me]` | サーバーの累計再生ランキング（曲・DJ・自分の実績） |
 | `/playtop [曲数]` | 再生回数の多い曲を上位からキューへ追加（既定10曲、最大25曲） |
 | `/loop <off/song/queue>` | リピート再生（オフ／1曲／キュー全体） |
@@ -51,15 +51,15 @@ Discord でニコニコ動画・YouTube を再生できる Music Bot。
 | `/help` | コマンド一覧を表示 |
 | `/na-` | 効果音を再生（同一楽曲中に1回のみ） |
 | `/sound <名前>` | サウンドボードの音源を再生 |
-| `/refresh` | `NICO_SESSION` のセッションを再適用（要 Bot管理者） |
+| `/nicosession` | `NICO_SESSION` のセッションを再適用（要 Bot管理者） |
 | `/settings [音量] [切断秒数] [自動再生]` | サーバー既定値を表示・変更（要 Bot管理者） |
 
 ### 実行制限
 
 - DM では使用できません（サーバー内専用）
-- Bot が VC に接続中は、**同じ VC に参加しているユーザーのみ**操作できます。ただし閲覧系（`/help` `/queue` `/nowplaying` `/history` `/favorites` `/stats` `/playlist list` `/playlist delete`）は VC 外からでも実行可能です
+- Bot が VC に接続中は、**同じ VC に参加しているユーザーのみ**操作できます。ただし閲覧系（`/help` `/queue` `/nowplaying` `/history show` `/favorite list` `/stats` `/playlist list` `/playlist delete`）は VC 外からでも実行可能です
 - 再生系コマンド（`/play` や検索結果の選択など）は Bot を別の VC へ**移動させません**。Bot が他の VC で再生中の場合はリクエストが拒否されます（検索・抽出の待ち時間中に別の VC でセッションが始まった場合も同様）
-- `/refresh` と `/settings` は `BOT_ADMIN_IDS` に登録されたユーザーのみ実行できます（未設定の場合は従来どおり `サーバー管理` 権限で判定します）
+- `/nicosession` と `/settings` は `BOT_ADMIN_IDS` に登録されたユーザーのみ実行できます（未設定の場合は従来どおり `サーバー管理` 権限で判定します）
 
 再生中の曲の Embed には操作ボタン（⏯️ 一時停止/再開・⏭️ スキップ・⏹️ 停止・🔁 リピート・🔀 シャッフル・🐢🐇 速度・🔽🔼 ピッチ・🎚️ リセット・📻 自動再生）とエフェクト選択ドロップダウンが付きます。
 
@@ -128,7 +128,7 @@ cp .env.example .env
 ```
 # 必須
 DISCORD_TOKEN=your_discord_bot_token
-BOT_ADMIN_IDS=123456789012345678  # /refresh・/settings を使えるユーザーID（カンマ区切り）
+BOT_ADMIN_IDS=123456789012345678  # /nicosession・/settings を使えるユーザーID（カンマ区切り）
 COOKIE_FILE=cookies.txt
 NICO_SESSION=...         # ログイン済みブラウザの user_session Cookie（下記参照）
 
@@ -167,7 +167,7 @@ YT_PROXIES=http://primary:8888,http://secondary:8888 # 複数プロキシのフ�
 3. `user_session` の値をコピー
 4. `.env` の `NICO_SESSION` に貼り付け
 
-セッションは数ヶ月有効です。失効したら同じ手順で貼り替え、`/refresh` を実行すると再起動なしで反映されます。
+セッションは数ヶ月有効です。失効したら同じ手順で貼り替え、`/nicosession` を実行すると再起動なしで反映されます。
 
 `NICO_SESSION` を設定しない場合は yt-dlp 自身のログイン（`NICO_EMAIL` / `NICO_PASSWORD`）にフォールバックしますが、こちらもニコニコ側の仕様変更の影響を受けます。Guild ごとに別セッションを使いたい場合は `nico_cli.py` で登録でき、そちらが優先されます。
 
@@ -232,7 +232,7 @@ main.py          # エントリポイント（inmermusic.bot を呼び出す）
 - キューはコマンド操作のたびに保存されるため、クラッシュしても直前の状態が残ります。再生中だった曲はキュー先頭として保存されます
 - 保存キューは**明示的な破棄**（`/leave` `/stop` ⏹️ ボタン・Bot のサーバー退出）でのみ消えます。VC から全員退出した場合、管理者が Bot を切断した場合、アイドル切断の場合は残るので、`/join` で「（保存キュー N曲を復元）」として戻せます。
 - 復元できる期限は `QUEUE_RESTORE_TTL`（既定 24 時間）です。それより古い保存キューは放置されたものとみなし、復元しません。
-- 再起動後、そのGuildで最初にコマンドが実行された時点でキューと設定（既定音量・アイドル切断秒数・リピートモード）を復元します。復元は特定のコマンド専用ではなく、`/play` や `/queue` など状態を扱うコマンド全般が契機になります（`/help` `/history` `/favorites` `/stats` `/refresh` `/settings` `/playlist list` `/playlist delete` は除く）
+- 再起動後、そのGuildで最初にコマンドが実行された時点でキューと設定（既定音量・アイドル切断秒数・リピートモード）を復元します。復元は特定のコマンド専用ではなく、`/play` や `/queue` など状態を扱うコマンド全般が契機になります（`/help` `/history show` `/favorite list` `/stats` `/nicosession` `/settings` `/playlist list` `/playlist delete` は除く）
 - Bot は自動では再生を再開しません。`/play` すると復元されたキューの先頭から再生され、新規追加分は Embed のフッターに件数が表示されます
 - `/stop` `/leave` とアイドル切断時は保存済みキューも消去します
 - 履歴は直近200件のローリング保存ですが、`/stats` の累計再生回数・再生時間は別テーブルで保持されるため削除されません（Bot がサーバーから抜けた時点で当該Guildのデータは全削除）

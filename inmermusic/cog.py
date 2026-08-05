@@ -152,6 +152,10 @@ class MusicCog(commands.Cog):
 
     playlist_group = app_commands.Group(
         name="playlist", description="プレイリストの追加・保存・管理")
+    favorite_group = app_commands.Group(
+        name="favorite", description="お気に入りの保存・再生・管理")
+    history_group = app_commands.Group(
+        name="history", description="再生履歴の表示・キューへの追加")
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -168,11 +172,11 @@ class MusicCog(commands.Cog):
             or getattr(interaction.command, "name", "")
         )
         if command not in {
-            "help", "history", "favorites", "refresh", "settings", "stats",
-            "playlist list", "playlist delete",
+            "help", "history show", "favorite list", "nicosession", "settings",
+            "stats", "playlist list", "playlist delete",
         }:
             hydrate_state(interaction.guild.id)
-        if command in {"refresh", "settings"}:
+        if command in {"nicosession", "settings"}:
             # Operator commands. An explicit admin list wins when configured;
             # otherwise fall back to manage_guild so an unconfigured deployment
             # keeps the old behaviour instead of opening or locking everything.
@@ -187,8 +191,8 @@ class MusicCog(commands.Cog):
                 await interaction.response.send_message(denial, ephemeral=True)
             return allowed
         if command in {
-            "help", "queue", "nowplaying", "history", "favorites", "stats",
-            "playlist list", "playlist delete",
+            "help", "queue", "nowplaying", "history show", "favorite list",
+            "stats", "playlist list", "playlist delete",
         }:
             return True
         vc = interaction.guild.voice_client
@@ -710,8 +714,8 @@ class MusicCog(commands.Cog):
             f"🧹 キューをクリアしました（{count}曲）。再生中の曲は継続します。"
         )
 
-    @app_commands.command(name="history", description="最近再生した曲の履歴を表示")
-    async def history_cmd(self, interaction: discord.Interaction):
+    @history_group.command(name="show", description="最近再生した曲の履歴を表示")
+    async def history_show(self, interaction: discord.Interaction):
         songs = persistence.load_history(interaction.guild.id, 20)
         if not songs:
             await interaction.response.send_message("再生履歴はありません。", ephemeral=True)
@@ -775,9 +779,9 @@ class MusicCog(commands.Cog):
         swap_source_at(vc, state, 0.0)
         await interaction.response.send_message("⏪ 最初から再生し直します。")
 
-    @app_commands.command(name="historyplay", description="履歴から曲を選んでキューに追加")
+    @history_group.command(name="play", description="履歴から曲を選んでキューに追加")
     @app_commands.describe(position="履歴の番号（1〜20）")
-    async def historyplay_cmd(self, interaction: discord.Interaction, position: int):
+    async def history_play(self, interaction: discord.Interaction, position: int):
         if not interaction.user.voice:
             await interaction.response.send_message("VCに参加してください。")
             return
@@ -875,8 +879,8 @@ class MusicCog(commands.Cog):
         await self._enqueue_songs(
             interaction, [entry["song"] for entry in entries], deduplicate=True)
 
-    @app_commands.command(name="favorite", description="再生中の曲をお気に入りに保存")
-    async def favorite_cmd(self, interaction: discord.Interaction):
+    @favorite_group.command(name="add", description="再生中の曲をお気に入りに保存")
+    async def favorite_add(self, interaction: discord.Interaction):
         state = get_state(interaction.guild.id)
         if not state.current_song:
             await interaction.response.send_message("再生中の曲はありません。", ephemeral=True)
@@ -891,8 +895,8 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(
                 "お気に入りの保存に失敗しました。", ephemeral=True)
 
-    @app_commands.command(name="favorites", description="自分のお気に入り一覧を表示")
-    async def favorites_cmd(self, interaction: discord.Interaction):
+    @favorite_group.command(name="list", description="自分のお気に入り一覧を表示")
+    async def favorite_list(self, interaction: discord.Interaction):
         songs = persistence.load_favorites(
             interaction.guild.id, interaction.user.id, FAVORITES_PAGE_SIZE)
         if not songs:
@@ -911,9 +915,9 @@ class MusicCog(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="playfavorite", description="お気に入りから曲を選んで再生")
+    @favorite_group.command(name="play", description="お気に入りから曲を選んで再生")
     @app_commands.describe(position="お気に入りの番号")
-    async def playfavorite_cmd(self, interaction: discord.Interaction, position: int):
+    async def favorite_play(self, interaction: discord.Interaction, position: int):
         if not interaction.user.voice:
             await interaction.response.send_message("VCに参加してください。")
             return
@@ -929,9 +933,9 @@ class MusicCog(commands.Cog):
         await interaction.response.defer()
         await self._enqueue_songs(interaction, [songs[position - 1]])
 
-    @app_commands.command(name="unfavorite", description="お気に入りから曲を削除")
+    @favorite_group.command(name="remove", description="お気に入りから曲を削除")
     @app_commands.describe(position="お気に入りの番号")
-    async def unfavorite_cmd(self, interaction: discord.Interaction, position: int):
+    async def favorite_remove(self, interaction: discord.Interaction, position: int):
         removed = persistence.remove_favorite(
             interaction.guild.id, interaction.user.id, position)
         if removed:
@@ -1051,13 +1055,12 @@ class MusicCog(commands.Cog):
         embed.add_field(
             name="/previous・/replay", value="前の曲・現在曲を先頭から再生", inline=True)
         embed.add_field(
-            name="/history・/historyplay", value="履歴表示・履歴から追加", inline=True)
+            name="/history show・play", value="履歴表示・履歴から追加", inline=True)
         embed.add_field(
             name="/stats・/playtop", value="再生ランキング・上位曲をキューへ", inline=True)
         embed.add_field(
-            name="/favorite・/favorites", value="お気に入り保存・表示", inline=True)
-        embed.add_field(
-            name="/playfavorite・/unfavorite", value="お気に入り再生・削除", inline=True)
+            name="/favorite add・list・play・remove",
+            value="お気に入りの保存・表示・再生・削除", inline=True)
         embed.add_field(
             name="/settings", value="サーバー既定値・自動再生（管理者）", inline=True)
         embed.add_field(name="/join・/leave", value="VCに参加・退出", inline=True)
@@ -1065,7 +1068,8 @@ class MusicCog(commands.Cog):
             name="/na-・/sound <名前>",
             value="効果音（同一曲中1回）・サウンドボード", inline=True)
         embed.add_field(
-            name="/refresh・/help", value="ニコニコCookie更新・この一覧", inline=True)
+            name="/nicosession・/help",
+            value="ニコニコセッション再適用・この一覧", inline=True)
         embed.add_field(
             name="再生中ボタン",
             value="🐢🐇 速度 / 🔽🔼 ピッチ / 🎚️ リセット / 📻 自動再生", inline=False)
@@ -1162,8 +1166,8 @@ class MusicCog(commands.Cog):
                 for n in list_sound_names() if current in n.lower()][:25]
 
     @app_commands.command(
-        name="refresh", description="NICO_SESSIONのニコニコセッションを再適用")
-    async def refresh(self, interaction: discord.Interaction):
+        name="nicosession", description="NICO_SESSIONのニコニコセッションを再適用")
+    async def nicosession_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         # force=True so a rotated NICO_SESSION replaces the stored cookie;
         # without it the existing session would simply be kept.

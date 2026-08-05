@@ -33,7 +33,7 @@ def _parse_id_list(raw: Optional[str]) -> frozenset:
     return frozenset(ids)
 
 
-# Discord user IDs allowed to run the operator commands (/refresh, /settings).
+# Discord user IDs allowed to run the operator commands (/nicosession, /settings).
 # Server "Manage Server" permission answers "is this person a moderator of the
 # guild", not "does this person operate the bot" — the two came apart in
 # practice, locking the operator out of their own bot. When this is empty the
@@ -132,7 +132,7 @@ MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))
 MAX_PLAYLIST_NAME_LEN = 50
 MAX_PLAYLISTS_PER_GUILD = int(os.getenv("MAX_PLAYLISTS_PER_GUILD", "25"))
 MAX_PLAYLIST_SIZE = int(os.getenv("MAX_PLAYLIST_SIZE", "50"))
-# How many favorites /favorites lists and /playfavorite / /unfavorite address by
+# How many favorites /favorite list shows and /favorite play / remove address by
 # number. Display and removal must share this window, or the position a user
 # reads and the position that gets deleted can refer to different tracks.
 FAVORITES_PAGE_SIZE = 25

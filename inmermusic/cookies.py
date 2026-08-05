@@ -273,7 +273,7 @@ def ensure_nico_cookies(force: bool = False) -> bool:
     writes refreshed cookies back on close, so overwriting on every extract
     would throw away the newer values. NICO_SESSION is therefore only written
     when the file has no session at all — or when ``force`` says to adopt a
-    rotated NICO_SESSION (that is what /refresh now does).
+    rotated NICO_SESSION (that is what /nicosession now does).
 
     Returns whether a usable session ended up in the file.
     """

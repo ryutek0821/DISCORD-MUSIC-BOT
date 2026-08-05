@@ -751,7 +751,7 @@ def add_favorite(guild_id: int, user_id: int, song: Dict[str, Any]) -> bool:
 
 
 def remove_favorite(guild_id: int, user_id: int, position: int) -> Optional[Dict[str, Any]]:
-    # Same window as /favorites, so `position` resolves to the row the user read.
+    # Same window as /favorite list, so `position` resolves to the row the user read.
     songs = load_favorites(guild_id, user_id, limit=FAVORITES_PAGE_SIZE)
     if not 1 <= position <= len(songs):
         return None
@@ -782,8 +782,8 @@ def load_favorites(
             try:
                 # `created_at` is whole seconds, so favorites added in the same
                 # second tie. Without the `url` tiebreaker SQLite may order ties
-                # differently per query plan, and the number shown by /favorites
-                # would no longer address the same row as /unfavorite.
+                # differently per query plan, and the number shown by /favorite list
+                # would no longer address the same row as /favorite remove.
                 rows = conn.execute(
                     "SELECT song_json FROM favorites WHERE guild_id = ? AND user_id = ? "
                     "ORDER BY created_at DESC, url LIMIT ?",

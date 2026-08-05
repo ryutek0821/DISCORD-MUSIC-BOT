@@ -566,16 +566,19 @@ def test_cog_registration():
     expected = {
         "play", "skip", "queue", "loop", "shuffle", "speed", "pitch", "seek",
         "volume", "preset", "remove", "move", "clear", "join", "leave", "help",
-        "stop", "pause", "resume", "nowplaying", "na-", "sound", "refresh",
-        "playlist", "history", "historyplay", "previous", "replay",
-        "favorite", "favorites",
-        "playfavorite", "unfavorite", "settings", "stats", "playtop",
+        "stop", "pause", "resume", "nowplaying", "na-", "sound", "nicosession",
+        "playlist", "history", "previous", "replay",
+        "favorite", "settings", "stats", "playtop",
     }
     assert names == expected, (expected - names, names - expected)
-    playlist = next(command for command in commands if command.name == "playlist")
-    assert {command.name for command in playlist.commands} == {
-        "add", "save", "load", "list", "delete",
+    groups = {
+        "playlist": {"add", "save", "load", "list", "delete"},
+        "favorite": {"add", "list", "play", "remove"},
+        "history": {"show", "play"},
     }
+    for name, subcommands in groups.items():
+        group = next(command for command in commands if command.name == name)
+        assert {command.name for command in group.commands} == subcommands, name
 
 
 def test_help_embed_within_discord_limits():
@@ -631,6 +634,40 @@ def test_command_descriptions_are_japanese():
                 check(sub)
         else:
             check(command)
+
+
+def test_interaction_check_names_match_real_commands():
+    """interaction_check gates on raw qualified names like "history show".
+
+    Grouping a command changes that string ("history" -> "history show"), and a
+    stale entry fails silently: the command still runs, but with the wrong VC
+    check or state hydration. Pin every literal to a registered command.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from discord import app_commands
+
+    from inmermusic.bot import bot
+    from inmermusic.cog import MusicCog
+
+    registered = set()
+    for command in MusicCog(bot).get_app_commands():
+        if isinstance(command, app_commands.Group):
+            registered.update(sub.qualified_name for sub in command.commands)
+        else:
+            registered.add(command.qualified_name)
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(MusicCog.interaction_check)))
+    gated = {
+        element.value
+        for node in ast.walk(tree) if isinstance(node, ast.Set)
+        for element in node.elts
+        if isinstance(element, ast.Constant) and isinstance(element.value, str)
+    }
+    assert gated, "expected interaction_check to gate on a set of command names"
+    assert gated <= registered, sorted(gated - registered)
 
 
 def test_initial_now_playing_message_waits_for_response():
@@ -2559,7 +2596,7 @@ def _operator_command_check(user_id, manage_guild, command="settings"):
 
 
 def test_operator_commands_use_the_admin_id_list():
-    """BOT_ADMIN_IDS decides /refresh and /settings, not manage_guild (#55)."""
+    """BOT_ADMIN_IDS decides /nicosession and /settings, not manage_guild (#55)."""
     original = config.BOT_ADMIN_IDS
     try:
         config.BOT_ADMIN_IDS = frozenset({111})
@@ -2575,7 +2612,7 @@ def test_operator_commands_use_the_admin_id_list():
         assert "Bot管理者" in msg
 
         allowed, _ = _operator_command_check(111, manage_guild=False,
-                                             command="refresh")
+                                             command="nicosession")
         assert allowed is True
     finally:
         config.BOT_ADMIN_IDS = original
