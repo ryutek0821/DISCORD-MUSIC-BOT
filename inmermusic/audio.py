@@ -13,9 +13,10 @@ import discord
 import yt_dlp
 
 from . import config
-from .config import (DOWNLOAD_TIMEOUT, EFFECT_FILTERS, MAX_PLAYLIST_SIZE,
-                     MAX_TRACK_DURATION, NICO_EMAIL, NICO_PASSWORD,
-                     SOURCE_CLEANUP_DELAY, logger)
+from .config import (DOWNLOAD_TIMEOUT, EFFECT_FILTERS, LOUDNORM_TARGET_I,
+                     LOUDNORM_TARGET_LRA, LOUDNORM_TARGET_TP,
+                     MAX_PLAYLIST_SIZE, MAX_TRACK_DURATION, NICO_EMAIL,
+                     NICO_PASSWORD, SOURCE_CLEANUP_DELAY, logger)
 from .cookies import (ensure_cookie_file, ensure_nico_cookies,
                       guild_cookie_file)
 from .state import GuildState
@@ -584,7 +585,7 @@ def _atempo_chain(factor: float) -> List[str]:
 
 
 def build_audio_filter(speed: float, pitch: int, volume: int = 100,
-                       effect: str = "off") -> Optional[str]:
+                       effect: str = "off", normalize: bool = False) -> Optional[str]:
     """Build an FFmpeg -af value for tempo, pitch (semitones), volume and effect.
 
     Pitch uses the asetrate trick so it runs on the stock FFmpeg shipped with
@@ -606,6 +607,15 @@ def build_audio_filter(speed: float, pitch: int, volume: int = 100,
     if abs(tempo - 1.0) > 1e-6:
         filters.extend(_atempo_chain(tempo))
     filters.extend(EFFECT_FILTERS.get(effect, []))
+    if normalize:
+        # Must sit *before* the user's volume filter: loudnorm drives whatever
+        # reaches it to the target loudness, so a volume applied first would be
+        # normalized away and /volume would stop doing anything. After it, the
+        # user's setting stays a relative trim on top of the normalized level.
+        filters.append(
+            f"loudnorm=I={LOUDNORM_TARGET_I}:TP={LOUDNORM_TARGET_TP}"
+            f":LRA={LOUDNORM_TARGET_LRA}"
+        )
     if volume != 100:
         filters.append(f"volume={volume / 100:.3f}")
     return ",".join(filters) if filters else None
@@ -625,7 +635,8 @@ def make_audio_source(song: Dict[str, Any], state: GuildState, seek: float = 0.0
     before_options = " ".join(before_parts) if before_parts else None
 
     options = "-c:a libopus -b:a 192k -ar 48000 -ac 2"
-    af = build_audio_filter(state.speed, state.pitch, state.volume, state.effect)
+    af = build_audio_filter(state.speed, state.pitch, state.volume, state.effect,
+                            state.normalize)
     if af:
         options += f' -af "{af}"'
 

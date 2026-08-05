@@ -126,7 +126,8 @@ def _build_connection() -> _SharedConnection:
             default_volume INTEGER NOT NULL DEFAULT 100,
             idle_timeout INTEGER NOT NULL DEFAULT 180,
             loop_mode TEXT NOT NULL DEFAULT 'off',
-            autoplay INTEGER NOT NULL DEFAULT 0
+            autoplay INTEGER NOT NULL DEFAULT 0,
+            normalize INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS play_counts (
             guild_id INTEGER NOT NULL,
@@ -164,6 +165,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE guild_settings "
             "ADD COLUMN autoplay INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
+    if "normalize" not in columns:
+        # Rows written before this column existed default to 0 (off), so an
+        # existing guild's playback is unchanged until someone opts in.
+        conn.execute(
+            "ALTER TABLE guild_settings "
+            "ADD COLUMN normalize INTEGER NOT NULL DEFAULT 0"
         )
         conn.commit()
     columns = {row[1] for row in conn.execute("PRAGMA table_info(queues)")}
@@ -803,14 +812,15 @@ def get_settings(guild_id: int) -> Dict[str, Any]:
         "idle_timeout": IDLE_TIMEOUT,
         "loop_mode": "off",
         "autoplay": False,
+        "normalize": False,
     }
     try:
         with _db_lock:
             conn = _connect()
             try:
                 row = conn.execute(
-                    "SELECT default_volume, idle_timeout, loop_mode, autoplay "
-                    "FROM guild_settings WHERE guild_id = ?",
+                    "SELECT default_volume, idle_timeout, loop_mode, autoplay, "
+                    "normalize FROM guild_settings WHERE guild_id = ?",
                     (guild_id,),
                 ).fetchone()
             finally:
@@ -825,6 +835,7 @@ def get_settings(guild_id: int) -> Dict[str, Any]:
         "idle_timeout": max(30, min(3600, int(row[1]))),
         "loop_mode": row[2] if row[2] in {"off", "song", "queue"} else "off",
         "autoplay": bool(row[3]),
+        "normalize": bool(row[4]),
     }
 
 
@@ -836,22 +847,25 @@ def update_settings(guild_id: int, **changes: Any) -> Dict[str, Any]:
     if settings["loop_mode"] not in {"off", "song", "queue"}:
         settings["loop_mode"] = "off"
     settings["autoplay"] = bool(settings["autoplay"])
+    settings["normalize"] = bool(settings["normalize"])
     try:
         with _db_lock:
             conn = _connect()
             try:
                 conn.execute(
                     "INSERT INTO guild_settings "
-                    "(guild_id, default_volume, idle_timeout, loop_mode, autoplay) "
-                    "VALUES (?, ?, ?, ?, ?) "
+                    "(guild_id, default_volume, idle_timeout, loop_mode, "
+                    "autoplay, normalize) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(guild_id) DO UPDATE SET "
                     "default_volume = excluded.default_volume, "
                     "idle_timeout = excluded.idle_timeout, "
-                    "loop_mode = excluded.loop_mode, autoplay = excluded.autoplay",
+                    "loop_mode = excluded.loop_mode, autoplay = excluded.autoplay, "
+                    "normalize = excluded.normalize",
                     (
                         guild_id, settings["default_volume"],
                         settings["idle_timeout"], settings["loop_mode"],
-                        int(settings["autoplay"]),
+                        int(settings["autoplay"]), int(settings["normalize"]),
                     ),
                 )
                 conn.commit()

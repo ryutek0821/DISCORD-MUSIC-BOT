@@ -950,27 +950,38 @@ class MusicCog(commands.Cog):
         default_volume="新しいデフォルト音量（省略時は変更なし）",
         idle_timeout="アイドル切断までの秒数（省略時は変更なし）",
         autoplay="キューが空になったら関連曲を自動追加（省略時は変更なし）",
+        normalize="曲ごとの音量差を自動で揃える（省略時は変更なし）",
     )
     async def settings_cmd(
         self, interaction: discord.Interaction,
         default_volume: Optional[app_commands.Range[int, 0, 200]] = None,
         idle_timeout: Optional[app_commands.Range[int, 30, 3600]] = None,
         autoplay: Optional[bool] = None,
+        normalize: Optional[bool] = None,
     ):
         changed = (default_volume is not None or idle_timeout is not None
-                   or autoplay is not None)
+                   or autoplay is not None or normalize is not None)
         settings = persistence.update_settings(
             interaction.guild.id,
             default_volume=default_volume,
             idle_timeout=idle_timeout,
             autoplay=autoplay,
+            normalize=normalize,
         ) if changed else persistence.get_settings(interaction.guild.id)
         state = guild_states.get(interaction.guild.id)
         if state is not None:
             state.idle_timeout = settings["idle_timeout"]
             state.autoplay = settings["autoplay"]
+            state.normalize = settings["normalize"]
             if autoplay is not None:
                 state.autoplay_streak = 0
+            if normalize is not None and state.voice_client and (
+                    state.voice_client.is_playing() or state.voice_client.is_paused()
+            ) and not state.is_playing_sound:
+                # Toggling mid-song needs the FFmpeg source rebuilt; ride the
+                # existing debounce so it coalesces with any other knob change.
+                schedule_reapply(interaction.guild.id)
+                schedule_refresh_now_playing(interaction.guild.id)
             if default_volume is not None and not (
                     state.voice_client and (
                         state.voice_client.is_playing() or state.voice_client.is_paused())):
@@ -986,7 +997,8 @@ class MusicCog(commands.Cog):
             f"デフォルト音量: **{settings['default_volume']}%**\n"
             f"アイドル切断: **{settings['idle_timeout']}秒**\n"
             f"デフォルトリピート: **{settings['loop_mode']}**\n"
-            f"自動再生: **{'ON' if settings['autoplay'] else 'OFF'}**",
+            f"自動再生: **{'ON' if settings['autoplay'] else 'OFF'}**\n"
+            f"音量ノーマライズ: **{'ON' if settings['normalize'] else 'OFF'}**",
             ephemeral=True,
         )
 
@@ -1062,7 +1074,8 @@ class MusicCog(commands.Cog):
             name="/favorite add・list・play・remove",
             value="お気に入りの保存・表示・再生・削除", inline=True)
         embed.add_field(
-            name="/settings", value="サーバー既定値・自動再生（管理者）", inline=True)
+            name="/settings", value="既定値・自動再生・音量ノーマライズ（管理者）",
+            inline=True)
         embed.add_field(name="/join・/leave", value="VCに参加・退出", inline=True)
         embed.add_field(
             name="/na-・/sound <名前>",
