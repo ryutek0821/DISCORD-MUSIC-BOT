@@ -51,15 +51,15 @@ Discord でニコニコ動画・YouTube を再生できる Music Bot。
 | `/help` | コマンド一覧を表示 |
 | `/na-` | 効果音を再生（同一楽曲中に1回のみ） |
 | `/sound <名前>` | サウンドボードの音源を再生 |
-| `/refresh` | `NICO_SESSION` のセッションを再適用（要 サーバー管理権限） |
-| `/settings [音量] [切断秒数] [自動再生]` | サーバー既定値を表示・変更（要 サーバー管理権限） |
+| `/refresh` | `NICO_SESSION` のセッションを再適用（要 Bot管理者） |
+| `/settings [音量] [切断秒数] [自動再生]` | サーバー既定値を表示・変更（要 Bot管理者） |
 
 ### 実行制限
 
 - DM では使用できません（サーバー内専用）
 - Bot が VC に接続中は、**同じ VC に参加しているユーザーのみ**操作できます。ただし閲覧系（`/help` `/queue` `/nowplaying` `/history` `/favorites` `/stats` `/playlist list` `/playlist delete`）は VC 外からでも実行可能です
 - 再生系コマンド（`/play` や検索結果の選択など）は Bot を別の VC へ**移動させません**。Bot が他の VC で再生中の場合はリクエストが拒否されます（検索・抽出の待ち時間中に別の VC でセッションが始まった場合も同様）
-- `/refresh` と `/settings` は `サーバー管理` 権限が必要です
+- `/refresh` と `/settings` は `BOT_ADMIN_IDS` に登録されたユーザーのみ実行できます（未設定の場合は従来どおり `サーバー管理` 権限で判定します）
 
 再生中の曲の Embed には操作ボタン（⏯️ 一時停止/再開・⏭️ スキップ・⏹️ 停止・🔁 リピート・🔀 シャッフル・🐢🐇 速度・🔽🔼 ピッチ・🎚️ リセット・📻 自動再生）とエフェクト選択ドロップダウンが付きます。
 
@@ -128,6 +128,7 @@ cp .env.example .env
 ```
 # 必須
 DISCORD_TOKEN=your_discord_bot_token
+BOT_ADMIN_IDS=123456789012345678  # /refresh・/settings を使えるユーザーID（カンマ区切り）
 COOKIE_FILE=cookies.txt
 NICO_SESSION=...         # ログイン済みブラウザの user_session Cookie（下記参照）
 

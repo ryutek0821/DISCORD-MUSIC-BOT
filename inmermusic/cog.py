@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from . import cookies, persistence
+from . import config, cookies, persistence
 from .audio import (cleanup_download, current_elapsed, extract_audio_url,
                     extract_playlist, is_playlist_url, search_candidates, swap_source_at,
                     validate_query)
@@ -173,11 +173,18 @@ class MusicCog(commands.Cog):
         }:
             hydrate_state(interaction.guild.id)
         if command in {"refresh", "settings"}:
-            allowed = getattr(interaction.user.guild_permissions, "manage_guild", False)
+            # Operator commands. An explicit admin list wins when configured;
+            # otherwise fall back to manage_guild so an unconfigured deployment
+            # keeps the old behaviour instead of opening or locking everything.
+            if config.BOT_ADMIN_IDS:
+                allowed = interaction.user.id in config.BOT_ADMIN_IDS
+                denial = "この操作はBot管理者のみ実行できます。"
+            else:
+                allowed = getattr(
+                    interaction.user.guild_permissions, "manage_guild", False)
+                denial = "この操作にはサーバー管理権限が必要です。"
             if not allowed:
-                await interaction.response.send_message(
-                    "この操作にはサーバー管理権限が必要です。", ephemeral=True
-                )
+                await interaction.response.send_message(denial, ephemeral=True)
             return allowed
         if command in {
             "help", "queue", "nowplaying", "history", "favorites", "stats",

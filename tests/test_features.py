@@ -2478,6 +2478,77 @@ def _cookie_file_fixture():
     return path, restore
 
 
+def _operator_command_check(user_id, manage_guild, command="settings"):
+    """Run interaction_check for an operator command; returns (allowed, msg)."""
+    from types import SimpleNamespace
+    from inmermusic import cog as cog_module
+
+    sent = []
+
+    class Response:
+        async def send_message(self, content=None, **kwargs):
+            sent.append(content)
+
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=1, voice_client=None),
+        user=SimpleNamespace(
+            id=user_id,
+            guild_permissions=SimpleNamespace(manage_guild=manage_guild),
+        ),
+        command=SimpleNamespace(qualified_name=command, name=command),
+        response=Response(),
+    )
+    cog = cog_module.MusicCog(bot=None)
+    allowed = asyncio.run(cog.interaction_check(interaction))
+    return allowed, (sent[0] if sent else None)
+
+
+def test_operator_commands_use_the_admin_id_list():
+    """BOT_ADMIN_IDS decides /refresh and /settings, not manage_guild (#55)."""
+    original = config.BOT_ADMIN_IDS
+    try:
+        config.BOT_ADMIN_IDS = frozenset({111})
+
+        allowed, msg = _operator_command_check(111, manage_guild=False)
+        assert allowed is True, "the listed operator must get in without manage_guild"
+        assert msg is None
+
+        # A guild moderator who is not the bot operator is now refused: the
+        # list replaces the permission check rather than widening it.
+        allowed, msg = _operator_command_check(222, manage_guild=True)
+        assert allowed is False
+        assert "Bot管理者" in msg
+
+        allowed, _ = _operator_command_check(111, manage_guild=False,
+                                             command="refresh")
+        assert allowed is True
+    finally:
+        config.BOT_ADMIN_IDS = original
+
+
+def test_operator_commands_fall_back_to_manage_guild():
+    """An unconfigured deployment keeps the old gate (#55)."""
+    original = config.BOT_ADMIN_IDS
+    try:
+        config.BOT_ADMIN_IDS = frozenset()
+        allowed, _ = _operator_command_check(999, manage_guild=True)
+        assert allowed is True, "no admin list -> manage_guild still governs"
+        allowed, msg = _operator_command_check(999, manage_guild=False)
+        assert allowed is False
+        assert "サーバー管理権限" in msg
+    finally:
+        config.BOT_ADMIN_IDS = original
+
+
+def test_bot_admin_ids_parsing():
+    """Whitespace and junk entries must not break startup (#55)."""
+    assert config._parse_id_list(None) == frozenset()
+    assert config._parse_id_list("") == frozenset()
+    assert config._parse_id_list(" 123 , 456 ,,") == frozenset({123, 456})
+    # A typo'd entry is dropped, not fatal — the bot still starts.
+    assert config._parse_id_list("123,oops,456") == frozenset({123, 456})
+
+
 def test_nico_session_is_applied_and_not_reapplied():
     """NICO_SESSION seeds the cookie file, then yt-dlp owns it (#53)."""
     path, restore = _cookie_file_fixture()
