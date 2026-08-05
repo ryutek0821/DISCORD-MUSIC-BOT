@@ -193,8 +193,8 @@ class MusicCog(commands.Cog):
             return False
         return True
 
-    @app_commands.command(name="play", description="Play a song from NicoNico or YouTube")
-    @app_commands.describe(query="NicoNico URL, YouTube URL, or search keyword")
+    @app_commands.command(name="play", description="ニコニコ/YouTubeの曲を再生（URL・検索キーワード対応）")
+    @app_commands.describe(query="ニコニコ/YouTubeのURL、または検索キーワード")
     async def play(self, interaction: discord.Interaction, query: str):
         if not interaction.user.voice:
             await interaction.response.send_message("VCに参加してください。")
@@ -510,7 +510,7 @@ class MusicCog(commands.Cog):
     ):
         return await self._playlist_autocomplete(interaction, current)
 
-    @app_commands.command(name="skip", description="Skip the current song")
+    @app_commands.command(name="skip", description="再生中の曲をスキップ")
     async def skip(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if not vc or not (vc.is_playing() or vc.is_paused()):
@@ -521,7 +521,7 @@ class MusicCog(commands.Cog):
         vc.stop()
         await interaction.response.send_message("スキップしました！")
 
-    @app_commands.command(name="queue", description="Show the current queue")
+    @app_commands.command(name="queue", description="再生キューを表示")
     async def queue_cmd(self, interaction: discord.Interaction):
         state = get_state(interaction.guild.id)
         if not state.queue:
@@ -547,7 +547,7 @@ class MusicCog(commands.Cog):
             except Exception as e:
                 logger.debug(f"Failed to retain queue pager message: {e}")
 
-    @app_commands.command(name="loop", description="Set repeat mode (off / song / queue)")
+    @app_commands.command(name="loop", description="リピートモードを設定（オフ / 1曲 / キュー全体）")
     @app_commands.describe(mode="リピートモード")
     @app_commands.choices(mode=[
         app_commands.Choice(name="オフ", value="off"),
@@ -562,7 +562,7 @@ class MusicCog(commands.Cog):
         schedule_refresh_now_playing(interaction.guild.id)
         await interaction.response.send_message(f"🔁 リピート: **{labels[state.loop_mode]}**")
 
-    @app_commands.command(name="shuffle", description="Shuffle the queue")
+    @app_commands.command(name="shuffle", description="キューの曲順をシャッフル")
     async def shuffle_cmd(self, interaction: discord.Interaction):
         state = get_state(interaction.guild.id)
         if len(state.queue) < 2:
@@ -573,7 +573,7 @@ class MusicCog(commands.Cog):
         start_prefetch(interaction.guild.id)
         await interaction.response.send_message(f"🔀 キュー（{len(state.queue)}曲）をシャッフルしました。")
 
-    @app_commands.command(name="speed", description="Set playback speed (0.5-2.0x, pitch preserved)")
+    @app_commands.command(name="speed", description="再生速度を変更（0.5〜2.0倍・ピッチは維持）")
     @app_commands.describe(rate="再生速度 (0.5〜2.0)")
     async def speed_cmd(self, interaction: discord.Interaction, rate: app_commands.Range[float, 0.5, 2.0]):
         state = get_state(interaction.guild.id)
@@ -584,7 +584,7 @@ class MusicCog(commands.Cog):
             schedule_refresh_now_playing(interaction.guild.id)
         await interaction.response.send_message(f"🎚️ 速度を **{state.speed:.2f}x** にしました。")
 
-    @app_commands.command(name="pitch", description="Set pitch shift in semitones (-12 to +12)")
+    @app_commands.command(name="pitch", description="ピッチを半音単位で変更（-12〜+12）")
     @app_commands.describe(semitones="ピッチ (-12〜+12半音)")
     async def pitch_cmd(self, interaction: discord.Interaction, semitones: app_commands.Range[int, -12, 12]):
         state = get_state(interaction.guild.id)
@@ -595,7 +595,7 @@ class MusicCog(commands.Cog):
             schedule_refresh_now_playing(interaction.guild.id)
         await interaction.response.send_message(f"🎚️ ピッチを **{state.pitch:+d}半音** にしました。")
 
-    @app_commands.command(name="seek", description="Jump to a position in the current song")
+    @app_commands.command(name="seek", description="再生中の曲を指定位置へシーク")
     @app_commands.describe(position="再生位置（秒 または mm:ss、例: 90 / 1:30）")
     async def seek_cmd(self, interaction: discord.Interaction, position: str):
         state = get_state(interaction.guild.id)
@@ -622,7 +622,7 @@ class MusicCog(commands.Cog):
         swap_source_at(vc, state, secs)
         await interaction.response.send_message(f"⏩ **{fmt_duration(secs)}** へシークしました。")
 
-    @app_commands.command(name="volume", description="Set playback volume (0-200%)")
+    @app_commands.command(name="volume", description="音量を変更（0〜200%）")
     @app_commands.describe(level="音量 (0〜200)")
     async def volume_cmd(self, interaction: discord.Interaction, level: app_commands.Range[int, 0, 200]):
         state = get_state(interaction.guild.id)
@@ -633,7 +633,7 @@ class MusicCog(commands.Cog):
             schedule_refresh_now_playing(interaction.guild.id)
         await interaction.response.send_message(f"🔊 音量を **{level}%** にしました。")
 
-    @app_commands.command(name="preset", description="Apply an audio effect preset")
+    @app_commands.command(name="preset", description="音響エフェクトのプリセットを適用")
     @app_commands.describe(name="エフェクトプリセット")
     @app_commands.choices(name=_PRESET_CHOICES)
     async def preset_cmd(self, interaction: discord.Interaction, name: app_commands.Choice[str]):
@@ -648,7 +648,7 @@ class MusicCog(commands.Cog):
             schedule_refresh_now_playing(interaction.guild.id)
         await interaction.response.send_message(f"🎛️ プリセット **{name.name}** を適用しました。")
 
-    @app_commands.command(name="remove", description="Remove a song from the queue by position")
+    @app_commands.command(name="remove", description="キューから指定番号の曲を削除")
     @app_commands.describe(position="削除するキューの番号（1から）")
     async def remove_cmd(self, interaction: discord.Interaction, position: int):
         state = get_state(interaction.guild.id)
@@ -667,7 +667,7 @@ class MusicCog(commands.Cog):
         start_prefetch(interaction.guild.id)
         await interaction.response.send_message(f"🗑️ 削除しました: **{removed['title']}**")
 
-    @app_commands.command(name="move", description="Reorder a song in the queue")
+    @app_commands.command(name="move", description="キュー内の曲を別の位置へ移動")
     @app_commands.describe(from_pos="移動元の番号", to_pos="移動先の番号")
     async def move_cmd(self, interaction: discord.Interaction, from_pos: int, to_pos: int):
         state = get_state(interaction.guild.id)
@@ -690,7 +690,7 @@ class MusicCog(commands.Cog):
             f"↕️ **{title}** を #{from_pos} → #{to_pos} に移動しました。"
         )
 
-    @app_commands.command(name="clear", description="Clear the queue without disconnecting")
+    @app_commands.command(name="clear", description="キューを空にする（再生中の曲は継続）")
     async def clear_cmd(self, interaction: discord.Interaction):
         state = get_state(interaction.guild.id)
         count = len(state.queue)
@@ -703,7 +703,7 @@ class MusicCog(commands.Cog):
             f"🧹 キューをクリアしました（{count}曲）。再生中の曲は継続します。"
         )
 
-    @app_commands.command(name="history", description="Show recently played tracks")
+    @app_commands.command(name="history", description="最近再生した曲の履歴を表示")
     async def history_cmd(self, interaction: discord.Interaction):
         songs = persistence.load_history(interaction.guild.id, 20)
         if not songs:
@@ -722,7 +722,7 @@ class MusicCog(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="previous", description="Play the previous song again")
+    @app_commands.command(name="previous", description="1つ前に再生した曲に戻る")
     async def previous_cmd(self, interaction: discord.Interaction):
         state = get_state(interaction.guild.id)
         vc = interaction.guild.voice_client
@@ -753,7 +753,7 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message(
             f"⏮️ **{song['title']}** に戻ります。")
 
-    @app_commands.command(name="replay", description="Replay the current song from the beginning")
+    @app_commands.command(name="replay", description="再生中の曲を最初から再生し直す")
     async def replay_cmd(self, interaction: discord.Interaction):
         state = get_state(interaction.guild.id)
         vc = interaction.guild.voice_client
@@ -768,7 +768,7 @@ class MusicCog(commands.Cog):
         swap_source_at(vc, state, 0.0)
         await interaction.response.send_message("⏪ 最初から再生し直します。")
 
-    @app_commands.command(name="historyplay", description="Add a track from recent history")
+    @app_commands.command(name="historyplay", description="履歴から曲を選んでキューに追加")
     @app_commands.describe(position="履歴の番号（1〜20）")
     async def historyplay_cmd(self, interaction: discord.Interaction, position: int):
         if not interaction.user.voice:
@@ -785,7 +785,7 @@ class MusicCog(commands.Cog):
         await interaction.response.defer()
         await self._enqueue_songs(interaction, [songs[position - 1]])
 
-    @app_commands.command(name="stats", description="Show play statistics for this server")
+    @app_commands.command(name="stats", description="このサーバーの再生統計を表示")
     @app_commands.describe(scope="表示する内容（既定: 曲ランキング）")
     @app_commands.choices(scope=[
         app_commands.Choice(name="曲ランキング", value="songs"),
@@ -853,7 +853,7 @@ class MusicCog(commands.Cog):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="playtop", description="Queue the most-played tracks")
+    @app_commands.command(name="playtop", description="再生回数の多い曲をキューに追加")
     @app_commands.describe(count="追加する曲数（1〜25、既定10）")
     async def playtop_cmd(self, interaction: discord.Interaction, count: int = 10):
         if not interaction.user.voice:
@@ -868,7 +868,7 @@ class MusicCog(commands.Cog):
         await self._enqueue_songs(
             interaction, [entry["song"] for entry in entries], deduplicate=True)
 
-    @app_commands.command(name="favorite", description="Save the current track to favorites")
+    @app_commands.command(name="favorite", description="再生中の曲をお気に入りに保存")
     async def favorite_cmd(self, interaction: discord.Interaction):
         state = get_state(interaction.guild.id)
         if not state.current_song:
@@ -884,7 +884,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(
                 "お気に入りの保存に失敗しました。", ephemeral=True)
 
-    @app_commands.command(name="favorites", description="Show your favorite tracks")
+    @app_commands.command(name="favorites", description="自分のお気に入り一覧を表示")
     async def favorites_cmd(self, interaction: discord.Interaction):
         songs = persistence.load_favorites(
             interaction.guild.id, interaction.user.id, FAVORITES_PAGE_SIZE)
@@ -904,7 +904,7 @@ class MusicCog(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="playfavorite", description="Play one of your favorites")
+    @app_commands.command(name="playfavorite", description="お気に入りから曲を選んで再生")
     @app_commands.describe(position="お気に入りの番号")
     async def playfavorite_cmd(self, interaction: discord.Interaction, position: int):
         if not interaction.user.voice:
@@ -922,7 +922,7 @@ class MusicCog(commands.Cog):
         await interaction.response.defer()
         await self._enqueue_songs(interaction, [songs[position - 1]])
 
-    @app_commands.command(name="unfavorite", description="Remove one of your favorites")
+    @app_commands.command(name="unfavorite", description="お気に入りから曲を削除")
     @app_commands.describe(position="お気に入りの番号")
     async def unfavorite_cmd(self, interaction: discord.Interaction, position: int):
         removed = persistence.remove_favorite(
@@ -934,7 +934,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(
                 "指定されたお気に入りはありません。", ephemeral=True)
 
-    @app_commands.command(name="settings", description="Show or update guild playback defaults")
+    @app_commands.command(name="settings", description="サーバーの再生既定値を表示・変更")
     @app_commands.describe(
         default_volume="新しいデフォルト音量（省略時は変更なし）",
         idle_timeout="アイドル切断までの秒数（省略時は変更なし）",
@@ -979,7 +979,7 @@ class MusicCog(commands.Cog):
             ephemeral=True,
         )
 
-    @app_commands.command(name="join", description="Join your voice channel")
+    @app_commands.command(name="join", description="自分が参加中のVCにBotを呼ぶ")
     async def join_cmd(self, interaction: discord.Interaction):
         if not interaction.user.voice:
             await interaction.response.send_message("先にVCに参加してください。")
@@ -1003,7 +1003,7 @@ class MusicCog(commands.Cog):
         suffix = f"（保存キュー {restored}曲を復元）" if restored else ""
         await interaction.followup.send(f"🔊 接続しました: **{channel.name}**{suffix}")
 
-    @app_commands.command(name="leave", description="Disconnect from the voice channel")
+    @app_commands.command(name="leave", description="VCからBotを退出させる")
     async def leave_cmd(self, interaction: discord.Interaction):
         await interaction.response.defer()
         cancel_idle_task(interaction.guild.id)
@@ -1020,20 +1020,21 @@ class MusicCog(commands.Cog):
         cleanup_guild_state(interaction.guild.id)
         await interaction.followup.send("👋 退出しました。")
 
-    @app_commands.command(name="help", description="Show available commands")
+    @app_commands.command(name="help", description="使えるコマンドの一覧を表示")
     async def help_cmd(self, interaction: discord.Interaction):
         embed = discord.Embed(title="INMERMUSIC BOT コマンド一覧", color=0x00ff00)
         embed.add_field(name="/play <URL/キーワード>", value="ニコニコ/YouTube/検索キーワードで再生", inline=False)
-        embed.add_field(name="/skip", value="現在の曲をスキップ", inline=True)
-        embed.add_field(name="/pause・/resume", value="一時停止・再開", inline=True)
+        embed.add_field(
+            name="/skip・/pause・/resume", value="スキップ・一時停止・再開", inline=True)
         embed.add_field(name="/stop", value="停止してキュー削除・退出", inline=True)
         embed.add_field(name="/queue", value="キューを表示", inline=True)
         embed.add_field(
             name="/playlist add・save・load・list・delete",
             value="プレイリストの一括追加・保存・管理", inline=False)
         embed.add_field(name="/nowplaying", value="再生中の曲を表示", inline=True)
-        embed.add_field(name="/loop <mode>", value="リピート (off/song/queue)", inline=True)
-        embed.add_field(name="/shuffle", value="キューをシャッフル", inline=True)
+        embed.add_field(
+            name="/loop <mode>・/shuffle",
+            value="リピート (off/song/queue)・シャッフル", inline=True)
         embed.add_field(name="/speed <0.5-2.0>", value="再生速度（ピッチ維持）", inline=True)
         embed.add_field(name="/pitch <-12〜12>", value="ピッチ（半音単位）", inline=True)
         embed.add_field(name="/volume <0-200>", value="音量調整（%）", inline=True)
@@ -1046,21 +1047,25 @@ class MusicCog(commands.Cog):
             name="/history・/historyplay", value="履歴表示・履歴から追加", inline=True)
         embed.add_field(
             name="/stats・/playtop", value="再生ランキング・上位曲をキューへ", inline=True)
-        embed.add_field(name="/favorite・/favorites", value="お気に入り保存・表示", inline=True)
-        embed.add_field(name="/playfavorite・/unfavorite", value="お気に入り再生・削除", inline=True)
+        embed.add_field(
+            name="/favorite・/favorites", value="お気に入り保存・表示", inline=True)
+        embed.add_field(
+            name="/playfavorite・/unfavorite", value="お気に入り再生・削除", inline=True)
         embed.add_field(
             name="/settings", value="サーバー既定値・自動再生（管理者）", inline=True)
         embed.add_field(name="/join・/leave", value="VCに参加・退出", inline=True)
-        embed.add_field(name="/na-", value="効果音（同一曲中1回）", inline=True)
-        embed.add_field(name="/sound <名前>", value="サウンドボード再生", inline=True)
-        embed.add_field(name="/refresh", value="ニコニコCookie更新", inline=True)
+        embed.add_field(
+            name="/na-・/sound <名前>",
+            value="効果音（同一曲中1回）・サウンドボード", inline=True)
+        embed.add_field(
+            name="/refresh・/help", value="ニコニコCookie更新・この一覧", inline=True)
         embed.add_field(
             name="再生中ボタン",
             value="🐢🐇 速度 / 🔽🔼 ピッチ / 🎚️ リセット / 📻 自動再生", inline=False)
         embed.add_field(name="メッセージトリガー", value="`んあー` / `んあーと` で効果音", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="stop", description="Stop playing and clear the queue")
+    @app_commands.command(name="stop", description="再生を停止し、キューを削除してVCから退出")
     async def stop(self, interaction: discord.Interaction):
         await interaction.response.defer()
         cancel_idle_task(interaction.guild.id)
@@ -1074,7 +1079,7 @@ class MusicCog(commands.Cog):
         cleanup_guild_state(interaction.guild.id)
         await interaction.followup.send("停止してキューをクリアしました。")
 
-    @app_commands.command(name="pause", description="Pause the current song")
+    @app_commands.command(name="pause", description="再生を一時停止")
     async def pause(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if vc and vc.is_playing():
@@ -1085,7 +1090,7 @@ class MusicCog(commands.Cog):
         else:
             await interaction.response.send_message("再生していません。")
 
-    @app_commands.command(name="resume", description="Resume the paused song")
+    @app_commands.command(name="resume", description="一時停止中の曲を再開")
     async def resume(self, interaction: discord.Interaction):
         vc = interaction.guild.voice_client
         if vc and vc.is_paused():
@@ -1096,7 +1101,7 @@ class MusicCog(commands.Cog):
         else:
             await interaction.response.send_message("一時停止していません。")
 
-    @app_commands.command(name="nowplaying", description="Show current playing song")
+    @app_commands.command(name="nowplaying", description="再生中の曲の情報を表示")
     async def nowplaying(self, interaction: discord.Interaction):
         state = get_state(interaction.guild.id)
         if not state.current_song:
@@ -1150,7 +1155,7 @@ class MusicCog(commands.Cog):
                 for n in list_sound_names() if current in n.lower()][:25]
 
     @app_commands.command(
-        name="refresh", description="Reapply the niconico session from NICO_SESSION")
+        name="refresh", description="NICO_SESSIONのニコニコセッションを再適用")
     async def refresh(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         # force=True so a rotated NICO_SESSION replaces the stored cookie;
