@@ -578,6 +578,61 @@ def test_cog_registration():
     }
 
 
+def test_help_embed_within_discord_limits():
+    """/help once grew to 28 fields; Discord rejects an embed past 25."""
+    from inmermusic.bot import bot
+    from inmermusic.cog import MusicCog
+
+    captured = {}
+
+    class _Response:
+        async def send_message(self, **kwargs):
+            captured["embed"] = kwargs["embed"]
+
+    class _Interaction:
+        response = _Response()
+
+    cog = MusicCog(bot)
+    asyncio.run(MusicCog.help_cmd.callback(cog, _Interaction()))
+    embed = captured["embed"]
+    assert len(embed.fields) <= 25, len(embed.fields)
+    assert len(embed) <= 6000, len(embed)
+    for field in embed.fields:
+        assert len(field.name) <= 256, field.name
+        assert len(field.value) <= 1024, field.name
+
+    # Every registered command must be findable in the list users are shown.
+    listed = " ".join(f"{f.name} {f.value}" for f in embed.fields)
+    for command in cog.get_app_commands():
+        assert f"/{command.name}" in listed, command.name
+
+
+def test_command_descriptions_are_japanese():
+    """The bot serves a Japanese guild; Discord's picker must not show English."""
+    from discord import app_commands
+
+    from inmermusic.bot import bot
+    from inmermusic.cog import MusicCog
+
+    def is_japanese(text):
+        return any(ord(char) > 0x7F for char in text)
+
+    def check(command):
+        assert is_japanese(command.description), command.qualified_name
+        for param in getattr(command, "parameters", ()):
+            assert param.description != "…", (command.qualified_name, param.name)
+            assert is_japanese(param.description), (
+                command.qualified_name, param.name)
+
+    for command in MusicCog(bot).get_app_commands():
+        if isinstance(command, app_commands.Group):
+            assert is_japanese(command.description), command.name
+            for sub in command.commands:
+                check(sub)
+        else:
+            check(command)
+
+
 def test_initial_now_playing_message_waits_for_response():
     """The first /play followup must return the Message used by its updater."""
     import ast
