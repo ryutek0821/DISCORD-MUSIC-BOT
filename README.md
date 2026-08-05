@@ -13,7 +13,7 @@ Discord でニコニコ動画・YouTube を再生できる Music Bot。
 - 再生中の曲情報を Embed で表示（タイトル・URL・再生位置プログレスバー・リクエスト者・サムネイル）＋操作ボタン
 - 速度・ピッチ・音量の調整、シーク、エフェクトプリセット20種
 - 効果音再生（`/na-` またはメッセージトリガー `んあー` / `んあーと`）
-- ニコニコ Cookie の自動更新・手動更新
+- ニコニコセッションの適用・再適用（`/refresh`）
 - 自動再生（オートDJ）: キューが空になったら関連曲を自動追加
 - アイドル時に自動 VC 切断
 
@@ -51,7 +51,7 @@ Discord でニコニコ動画・YouTube を再生できる Music Bot。
 | `/help` | コマンド一覧を表示 |
 | `/na-` | 効果音を再生（同一楽曲中に1回のみ） |
 | `/sound <名前>` | サウンドボードの音源を再生 |
-| `/refresh` | ニコニコのCookieを手動で更新（要 サーバー管理権限） |
+| `/refresh` | `NICO_SESSION` のセッションを再適用（要 サーバー管理権限） |
 | `/settings [音量] [切断秒数] [自動再生]` | サーバー既定値を表示・変更（要 サーバー管理権限） |
 
 ### 実行制限
@@ -104,7 +104,6 @@ VC 接続中に以下のメッセージを送信すると効果音が再生さ�
 - Raspberry Pi 4 (aarch64) または Linux/macOS
 - Python 3.11+
 - FFmpeg
-- Chromium（Selenium フォールバック用）
 
 ## セットアップ
 
@@ -130,12 +129,11 @@ cp .env.example .env
 # 必須
 DISCORD_TOKEN=your_discord_bot_token
 COOKIE_FILE=cookies.txt
-NICO_EMAIL=your_niconico_email
-NICO_PASSWORD=your_niconico_password
+NICO_SESSION=...         # ログイン済みブラウザの user_session Cookie（下記参照）
 
 # オプション
-CHROMEDRIVER_PATH=/usr/bin/chromedriver
-COOKIE_TTL=3600          # Cookie有効期限（秒）
+NICO_EMAIL=your_niconico_email      # yt-dlp 側のログインにのみ使用
+NICO_PASSWORD=your_niconico_password
 STATE_DIR=~/.local/share/inmermusic  # DB保存先（既定値。リポジトリ外である必要あり）
 DOWNLOAD_DIR=/var/tmp/inmermusic     # 音声一時ファイルの保存先（既定値）
 IDLE_TIMEOUT=180         # アイドル切断時間（秒）
@@ -158,6 +156,19 @@ YT_PROXIES=http://primary:8888,http://secondary:8888 # 複数プロキシのフ�
 > ログは標準出力（systemd 運用時は journald が収集）に出ます。`LOG_FILE` を設定すると 5MB×3 世代のローテーションファイルにも出力します。
 
 > **`STATE_DIR` はリポジトリ外を指す必要があります。** デプロイは `rsync --delete` でリポジトリを丸ごと同期するため、リポジトリ内に置くと更新のたびにDBが消えます。リポジトリ内のパスを指定した場合は警告を出して既定値（`~/.local/share/inmermusic`）へ強制的に戻します。ディレクトリとDBは `0700` / `0600` で作成されます。
+
+### ニコニコのセッション設定
+
+ニコニコはログイン画面を MFA 対応の SPA に置き換えたため、**メールアドレスとパスワードによる自動ログインはできません**。ログイン済みブラウザの `user_session` Cookie を手動で設定してください。
+
+1. ブラウザでニコニコにログイン
+2. DevTools → Application → Cookies → `https://www.nicovideo.jp`
+3. `user_session` の値をコピー
+4. `.env` の `NICO_SESSION` に貼り付け
+
+セッションは数ヶ月有効です。失効したら同じ手順で貼り替え、`/refresh` を実行すると再起動なしで反映されます。
+
+`NICO_SESSION` を設定しない場合は yt-dlp 自身のログイン（`NICO_EMAIL` / `NICO_PASSWORD`）にフォールバックしますが、こちらもニコニコ側の仕様変更の影響を受けます。Guild ごとに別セッションを使いたい場合は `nico_cli.py` で登録でき、そちらが優先されます。
 
 ## 起動
 
@@ -199,7 +210,7 @@ inmermusic/
 ├── playback.py  # 再生制御ロジック（キュー送り・ループ・スキップ）
 ├── audio.py     # FFmpeg フィルタ構築・音源生成・ダウンロード・検索/プレイリスト展開
 ├── ui.py        # Embed・操作ボタン UI
-├── cookies.py   # ニコニコ Cookie 取得・更新（APIログイン + Seleniumフォールバック）
+├── cookies.py   # ニコニコ user_session の適用・Guild別セッション管理・Cookieファイル書き出し
 ├── persistence.py # キュー・履歴・再生統計・お気に入り・Guild設定のSQLite永続化
 ├── nico_cli.py  # Guild別ニコニコセッションのローカル管理CLI
 ├── config.py    # 環境変数読み込み・ログ設定・エフェクト/プリセット定義テーブル
@@ -211,7 +222,7 @@ main.py          # エントリポイント（inmermusic.bot を呼び出す）
 - YouTube もプロキシ制約のため一時ファイルへダウンロードして再生
 - 再生終了後に一時ファイルを自動削除
 - 再生中に次の1曲を先読み（Guildあたり1曲まで）。キューの並び替え・シャッフル時は先頭以外のキャッシュを破棄
-- Cookie は API ログインで取得、失敗時に Selenium フォールバック
+- ニコニコ認証は手動供給の `user_session` と yt-dlp 自身のログインに一本化（自前のログイン処理は持たない）
 
 ### 永続化と再起動時の挙動
 

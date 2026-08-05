@@ -17,7 +17,11 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 COOKIE_FILE = os.getenv("COOKIE_FILE")
 NICO_EMAIL = os.getenv("NICO_EMAIL")
 NICO_PASSWORD = os.getenv("NICO_PASSWORD")
-CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+# A niconico `user_session` cookie value, obtained by hand from a logged-in
+# browser. niconico moved its login to an MFA-capable SPA, so there is no
+# scriptable credential login left to automate; a pasted session is the
+# supported way to authenticate. These sessions are long-lived (months).
+NICO_SESSION = os.getenv("NICO_SESSION")
 # Route YouTube traffic through a residential-IP proxy (e.g. a Tailscale RPi)
 # so YouTube's datacenter-IP bot detection doesn't block extraction. The
 # googlevideo media URLs are IP-locked to the extractor, so downloads must use
@@ -53,8 +57,6 @@ logging.basicConfig(
     handlers=_log_handlers,
 )
 logger = logging.getLogger("niconico-bot")
-
-COOKIE_TTL = int(os.getenv("COOKIE_TTL", "3600"))
 
 # Guild credentials must survive rsync --delete deployments, so keep them
 # outside the repository in the user's XDG data directory.

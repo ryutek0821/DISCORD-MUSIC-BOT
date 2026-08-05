@@ -64,7 +64,7 @@ def test_niconico_playlist_refreshes_only_without_guild_session(monkeypatch):
     }]
 
     monkeypatch.setattr(
-        audio, "refresh_nico_cookies_sync",
+        audio, "ensure_nico_cookies",
         lambda: refreshes.append(True))
     monkeypatch.setattr(
         audio, "_extract_info_with_failover",

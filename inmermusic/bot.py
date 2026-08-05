@@ -7,7 +7,7 @@ from discord.ext import commands
 from . import cookies, persistence
 from .audio import cleanup_temp_files
 from .cog import MusicCog
-from .config import COOKIE_TTL, TEMP_SWEEP_INTERVAL, TOKEN, logger
+from .config import TEMP_SWEEP_INTERVAL, TOKEN, logger
 from .playback import active_download_paths
 from .ui import MusicControls
 
@@ -15,18 +15,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 intents.guilds = True
-
-
-async def background_cookie_refresh():
-    await asyncio.sleep(2)
-    while True:
-        try:
-            # Serialization with on-demand refreshes happens inside
-            # refresh_nico_cookies_sync via cookie_refresh_lock (threading.Lock).
-            await asyncio.get_running_loop().run_in_executor(None, cookies.refresh_nico_cookies_sync, True)
-        except Exception as e:
-            logger.error(f"Background cookie refresh error: {e}")
-        await asyncio.sleep(COOKIE_TTL)
 
 
 async def background_temp_sweep():
@@ -77,9 +65,13 @@ async def on_ready():
         logger.info(f"Synced {len(synced)} commands")
     except Exception as e:
         logger.error(f"Sync error: {e}")
+    # Seed the cookie file from NICO_SESSION once. There is no periodic login
+    # to run any more: yt-dlp maintains COOKIE_FILE from here on, and a
+    # hand-supplied user_session lasts months.
+    await asyncio.get_running_loop().run_in_executor(
+        None, cookies.ensure_nico_cookies)
     # Clear temp downloads orphaned by a previous crash, then keep sweeping.
     cleanup_temp_files()
-    bot.loop.create_task(background_cookie_refresh())
     bot.loop.create_task(background_temp_sweep())
 
 
