@@ -24,6 +24,7 @@ class GuildState:
         self.pitch: int = 0              # pitch shift in semitones (-12–+12)
         self.volume: int = 100
         self.default_volume: int = 100  # guild default; volume != this is a user tweak
+        self.normalize: bool = False     # EBU R128 loudness normalization (loudnorm)
         self.idle_timeout: int = 180
         self.autoplay: bool = False      # keep the queue fed with related tracks
         self.autoplay_streak: int = 0    # consecutive autoplay tracks; reset by any user request
@@ -87,6 +88,7 @@ def hydrate_state(guild_id: int) -> GuildState:
         state.restored_count = len(state.queue)
     state.volume = settings["default_volume"]
     state.default_volume = settings["default_volume"]
+    state.normalize = settings["normalize"]
     state.idle_timeout = settings["idle_timeout"]
     state.loop_mode = settings["loop_mode"]
     state.autoplay = settings["autoplay"]

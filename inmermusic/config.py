@@ -172,6 +172,13 @@ SPEED_MIN, SPEED_MAX, SPEED_STEP = 0.5, 2.0, 0.1
 PITCH_MIN, PITCH_MAX = -12, 12
 VOLUME_MIN, VOLUME_MAX, VOLUME_STEP = 0, 200, 20
 
+# EBU R128 loudness normalization targets for the optional `loudnorm` filter.
+# -14 LUFS / -1 dBTP matches what streaming services normalize to, so a queue
+# mixing NicoNico and YouTube lands at a consistent perceived level.
+LOUDNORM_TARGET_I = -14.0    # integrated loudness (LUFS)
+LOUDNORM_TARGET_TP = -1.0    # true peak ceiling (dBTP)
+LOUDNORM_TARGET_LRA = 11.0   # loudness range
+
 # Extra FFmpeg filters layered on top of speed/pitch for each effect preset.
 EFFECT_FILTERS: Dict[str, List[str]] = {
     "off": [],

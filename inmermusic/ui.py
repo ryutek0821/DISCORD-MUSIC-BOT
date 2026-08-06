@@ -34,6 +34,8 @@ def effect_status_line(state: GuildState) -> str:
         parts.append(f"ピッチ {state.pitch:+d}")
     if state.volume != 100:
         parts.append(f"音量 {state.volume}%")
+    if state.normalize:
+        parts.append("音量ノーマライズ")
     if state.effect != "off":
         parts.append(f"効果 {EFFECT_LABELS.get(state.effect, state.effect)}")
     return " ・ ".join(parts)

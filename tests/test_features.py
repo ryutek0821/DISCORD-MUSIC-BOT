@@ -90,6 +90,32 @@ def test_pitch_filter_holds_duration_across_sample_rates():
         shutil.rmtree(directory)
 
 
+def test_build_audio_filter_normalize():
+    assert audio.build_audio_filter(1.0, 0, 100, "off", False) is None
+    af = audio.build_audio_filter(1.0, 0, 100, "off", True)
+    assert af.startswith("loudnorm=")
+    assert f"I={config.LOUDNORM_TARGET_I}" in af
+    assert f"TP={config.LOUDNORM_TARGET_TP}" in af
+    assert f"LRA={config.LOUDNORM_TARGET_LRA}" in af
+
+
+def test_build_audio_filter_normalize_precedes_volume():
+    """loudnorm must run before the user's volume, or /volume gets erased.
+
+    loudnorm drives whatever reaches it to the target loudness, so a volume
+    filter placed first would be normalized right back out.
+    """
+    af = audio.build_audio_filter(1.0, 0, 150, "off", True)
+    assert af.index("loudnorm=") < af.index("volume=1.500")
+
+
+def test_build_audio_filter_normalize_after_effects():
+    af = audio.build_audio_filter(1.25, 3, 150, "bassboost", True)
+    for token in ("asetrate", "atempo", "bass=g=12", "loudnorm=", "volume=1.500"):
+        assert token in af, token
+    assert af.index("bass=g=12") < af.index("loudnorm=")
+
+
 def test_build_audio_filter_combo():
     af = audio.build_audio_filter(1.25, 3, 150, "bassboost")
     for token in ("asetrate", "atempo", "bass=g=12", "volume=1.500"):
@@ -1497,14 +1523,17 @@ def test_music_persistence_round_trip():
             7001, default_volume=140, idle_timeout=75, loop_mode="queue")
         assert settings == {
             "default_volume": 140, "idle_timeout": 75, "loop_mode": "queue",
-            "autoplay": False}
+            "autoplay": False, "normalize": False}
         assert persistence.update_settings(7001, autoplay=True)["autoplay"] is True
         assert persistence.get_settings(7001)["autoplay"] is True
         # Turning it back off must persist: False is a value, not "unchanged".
         assert persistence.update_settings(7001, autoplay=False)["autoplay"] is False
+        assert persistence.update_settings(7001, normalize=True)["normalize"] is True
+        assert persistence.get_settings(7001)["normalize"] is True
+        assert persistence.update_settings(7001, normalize=False)["normalize"] is False
         assert persistence.get_settings(7001) == {
             "default_volume": 140, "idle_timeout": 75, "loop_mode": "queue",
-            "autoplay": False}
+            "autoplay": False, "normalize": False}
     finally:
         config.STATE_DIR = original_state_dir
         shutil.rmtree(directory)
@@ -2544,6 +2573,52 @@ def test_queue_survives_passive_disconnect_but_not_stop():
             guild_id, max_age=config.QUEUE_RESTORE_TTL) == []
         guild_states.pop(guild_id, None)
         assert hydrate_state(guild_id).restored_count == 0
+    finally:
+        config.STATE_DIR = original_state_dir
+        persistence.reset_connection()
+        guild_states.pop(guild_id, None)
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_normalize_column_migrates_on_an_older_db():
+    """A guild_settings table predating `normalize` must gain it, defaulted off."""
+    import shutil
+    import sqlite3
+    import tempfile
+    from inmermusic import persistence
+    from inmermusic.state import get_state, guild_states, hydrate_state
+
+    guild_id = 900161
+    directory = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    persistence.reset_connection()
+    config.STATE_DIR = directory
+    try:
+        # Hand-build the pre-migration schema and a row in it.
+        legacy = sqlite3.connect(os.path.join(directory, "music.db"))
+        legacy.execute(
+            "CREATE TABLE guild_settings ("
+            "guild_id INTEGER PRIMARY KEY,"
+            "default_volume INTEGER NOT NULL DEFAULT 100,"
+            "idle_timeout INTEGER NOT NULL DEFAULT 180,"
+            "loop_mode TEXT NOT NULL DEFAULT 'off',"
+            "autoplay INTEGER NOT NULL DEFAULT 0)"
+        )
+        legacy.execute(
+            "INSERT INTO guild_settings VALUES (?, 90, 200, 'song', 1)",
+            (guild_id,))
+        legacy.commit()
+        legacy.close()
+
+        settings = persistence.get_settings(guild_id)
+        assert settings["normalize"] is False  # existing guilds stay opted out
+        assert settings["default_volume"] == 90  # migration preserves the row
+        assert settings["loop_mode"] == "song"
+        assert persistence.update_settings(guild_id, normalize=True)["normalize"]
+
+        guild_states.pop(guild_id, None)
+        assert hydrate_state(guild_id).normalize is True
+        assert get_state(guild_id).normalize is True
     finally:
         config.STATE_DIR = original_state_dir
         persistence.reset_connection()
