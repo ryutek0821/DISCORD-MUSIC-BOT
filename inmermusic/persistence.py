@@ -150,6 +150,10 @@ def _build_connection() -> _SharedConnection:
             last_played INTEGER NOT NULL,
             PRIMARY KEY (guild_id, user_id)
         );
+        CREATE TABLE IF NOT EXISTS backfill_state (
+            guild_id INTEGER PRIMARY KEY,
+            counted_from INTEGER NOT NULL
+        );
         """
     )
     _migrate(conn)
@@ -318,6 +322,14 @@ def _bump_play_counts(
     """Accumulate lifetime play totals. Runs inside record_history's transaction.
 
     Unlike `history` (rolling `limit` rows), these totals are never trimmed.
+
+    Every field that describes "the most recent play" is guarded by the row's
+    own `last_played` rather than taking `excluded` unconditionally, because
+    /statsbackfill replays *old* plays through here: an unguarded assignment
+    would rewind `last_played` (which /stats both displays and sorts on) and
+    overwrite the current title/song_json with a stale copy. On the live path
+    `excluded.last_played` is always the newest value, so the guards are no-ops
+    there and the behaviour is unchanged.
     """
     url = song.get("url")
     if not url:
@@ -330,9 +342,11 @@ def _bump_play_counts(
         "ON CONFLICT(guild_id, url) DO UPDATE SET "
         "play_count = play_count + 1, "
         "total_sec = total_sec + excluded.total_sec, "
-        "title = excluded.title, "
-        "song_json = excluded.song_json, "
-        "last_played = excluded.last_played",
+        "title = CASE WHEN excluded.last_played >= last_played "
+        "THEN excluded.title ELSE title END, "
+        "song_json = CASE WHEN excluded.last_played >= last_played "
+        "THEN excluded.song_json ELSE song_json END, "
+        "last_played = MAX(last_played, excluded.last_played)",
         (guild_id, url, song.get("title") or url, payload, seconds, played_at),
     )
     try:
@@ -346,8 +360,9 @@ def _bump_play_counts(
         "ON CONFLICT(guild_id, user_id) DO UPDATE SET "
         "play_count = play_count + 1, "
         "total_sec = total_sec + excluded.total_sec, "
-        "name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END, "
-        "last_played = excluded.last_played",
+        "name = CASE WHEN excluded.name != '' AND excluded.last_played >= last_played "
+        "THEN excluded.name ELSE name END, "
+        "last_played = MAX(last_played, excluded.last_played)",
         (guild_id, user_id, str(song.get("requester") or ""), seconds, played_at),
     )
 
@@ -428,6 +443,167 @@ def pop_history(guild_id: int) -> Optional[Dict[str, Any]]:
     if song is not None:
         song["played_at"] = row[2]
     return song
+
+
+def _read_backfill_floor(conn: sqlite3.Connection, guild_id: int) -> int:
+    row = conn.execute(
+        "SELECT counted_from FROM backfill_state WHERE guild_id = ?",
+        (guild_id,),
+    ).fetchone()
+    return int(row[0]) if row else config.PLAY_COUNTS_EPOCH
+
+
+def _lower_backfill_floor(
+    conn: sqlite3.Connection, guild_id: int, counted_from: int
+) -> None:
+    """Extend the counted window backwards. The floor only ever moves down —
+    raising it would re-open an already-counted stretch to a second pass."""
+    conn.execute(
+        "INSERT INTO backfill_state (guild_id, counted_from) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET "
+        "counted_from = MIN(counted_from, excluded.counted_from)",
+        (guild_id, int(counted_from)),
+    )
+
+
+def backfill_floor(guild_id: int) -> int:
+    """Every play at/after this instant is already in `play_counts`.
+
+    Defaults to `config.PLAY_COUNTS_EPOCH` — the moment the stats tables
+    shipped, before which nothing was ever counted. /statsbackfill only ever
+    reads plays strictly older than the floor, which is what keeps a second run
+    (or a second source) from counting the same play twice.
+    """
+    try:
+        with _db_lock:
+            conn = _connect()
+            try:
+                return _read_backfill_floor(conn, guild_id)
+            finally:
+                conn.close()
+    except (OSError, sqlite3.Error) as e:
+        logger.warning(f"Failed to read backfill floor for guild {guild_id}: {e}")
+        return config.PLAY_COUNTS_EPOCH
+
+
+def backfill_from_history(guild_id: int) -> Dict[str, Any]:
+    """Fold the `history` rows that predate the floor into `play_counts`.
+
+    `history` is a rolling window (see `record_history`), so this reaches back
+    at most `limit` tracks — but unlike the Discord scan it carries
+    `requester_id`, so it is the only source that can also repair the DJ
+    ranking.
+    """
+    result: Dict[str, Any] = {
+        "plays": 0, "tracks": 0, "skipped": 0,
+        "floor_before": config.PLAY_COUNTS_EPOCH, "floor_after": None,
+    }
+    try:
+        with _db_lock:
+            conn = _connect()
+            try:
+                floor = _read_backfill_floor(conn, guild_id)
+                result["floor_before"] = floor
+                result["floor_after"] = floor
+                rows = conn.execute(
+                    "SELECT song_json, played_at FROM history "
+                    "WHERE guild_id = ? AND played_at < ? "
+                    "ORDER BY played_at ASC, id ASC",
+                    (guild_id, floor),
+                ).fetchall()
+                if not rows:
+                    return result
+                urls = set()
+                new_floor = floor
+                for raw, played_at in rows:
+                    song = _decode_song(raw)
+                    if song is None:
+                        result["skipped"] += 1
+                        continue
+                    played_at = int(played_at)
+                    _bump_play_counts(conn, guild_id, song, raw, played_at)
+                    result["plays"] += 1
+                    urls.add(song["url"])
+                    # played_at is stamped when the track *finished*, so the
+                    # play itself began roughly a duration earlier. Push the
+                    # floor back to that start, or the Discord scan — which
+                    # keys off the message's post time — would re-count this
+                    # very track.
+                    new_floor = min(new_floor, played_at - _duration_sec(song))
+                if result["plays"]:
+                    _lower_backfill_floor(conn, guild_id, new_floor)
+                    result["floor_after"] = new_floor
+                conn.commit()
+            finally:
+                conn.close()
+    except (OSError, sqlite3.Error) as e:
+        logger.warning(f"Failed to backfill history for guild {guild_id}: {e}")
+        return result
+    result["tracks"] = len(urls)
+    return result
+
+
+def backfill_plays(
+    guild_id: int,
+    entries: Iterable[Dict[str, Any]],
+    covered_from: int,
+) -> Dict[str, Any]:
+    """Fold past plays reconstructed outside the database into `play_counts`.
+
+    `entries` are `{"song": <track dict>, "played_at": <epoch>}` — today, the
+    now-playing embeds still sitting in a guild's text channels.
+
+    `covered_from` is the oldest instant the caller can vouch for having looked
+    at *everywhere* it needed to look, and only plays inside
+    `[covered_from, floor)` are counted; anything older is dropped even when
+    the caller already found it. That is what makes a partial scan safe to
+    repeat: the floor advances to exactly the window that was fully covered, so
+    a deeper second run picks the leftovers up instead of counting the shallow
+    ones twice.
+    """
+    result: Dict[str, Any] = {
+        "plays": 0, "tracks": 0, "skipped": 0,
+        "floor_before": config.PLAY_COUNTS_EPOCH, "floor_after": None,
+    }
+    covered_from = int(covered_from)
+    try:
+        with _db_lock:
+            conn = _connect()
+            try:
+                floor = _read_backfill_floor(conn, guild_id)
+                result["floor_before"] = floor
+                result["floor_after"] = floor
+                if covered_from >= floor:
+                    return result
+                urls = set()
+                for entry in entries:
+                    song = entry.get("song") or {}
+                    if not song.get("url"):
+                        result["skipped"] += 1
+                        continue
+                    try:
+                        played_at = int(entry["played_at"])
+                    except (KeyError, TypeError, ValueError):
+                        result["skipped"] += 1
+                        continue
+                    if not covered_from <= played_at < floor:
+                        result["skipped"] += 1
+                        continue
+                    cleaned = clean_song(song)
+                    payload = json.dumps(cleaned, ensure_ascii=False)
+                    _bump_play_counts(conn, guild_id, cleaned, payload, played_at)
+                    result["plays"] += 1
+                    urls.add(cleaned["url"])
+                _lower_backfill_floor(conn, guild_id, covered_from)
+                result["floor_after"] = covered_from
+                conn.commit()
+            finally:
+                conn.close()
+    except (OSError, sqlite3.Error) as e:
+        logger.warning(f"Failed to backfill plays for guild {guild_id}: {e}")
+        return result
+    result["tracks"] = len(urls)
+    return result
 
 
 def top_songs(guild_id: int, limit: int = 10) -> List[Dict[str, Any]]:
@@ -884,7 +1060,7 @@ def delete_guild_data(guild_id: int) -> None:
                 for table in (
                     "queues", "history", "favorites",
                     "named_playlists", "guild_settings",
-                    "play_counts", "requester_counts",
+                    "play_counts", "requester_counts", "backfill_state",
                 ):
                     conn.execute(f"DELETE FROM {table} WHERE guild_id = ?", (guild_id,))
                 conn.commit()

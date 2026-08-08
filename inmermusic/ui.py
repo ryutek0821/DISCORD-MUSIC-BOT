@@ -5,6 +5,7 @@ this module stays importable without pulling in playback at load time, which
 would otherwise create a ui <-> playback import cycle.
 """
 import random
+import re
 from typing import Any, Dict, Optional
 
 import discord
@@ -12,7 +13,7 @@ import discord
 from .config import (EFFECT_EMOJI, EFFECT_LABELS, EFFECT_PRESETS, PITCH_MAX,
                      PITCH_MIN, SPEED_MAX, SPEED_MIN, SPEED_STEP)
 from .state import GuildState, get_state, guild_states
-from .util import fmt_duration
+from .util import fmt_duration, parse_time
 
 
 def make_progress_bar(elapsed: float, duration: float, length: int = 18) -> str:
@@ -74,6 +75,61 @@ def create_now_playing_embed(song: Dict[str, Any], *, elapsed: Optional[float] =
     if song.get("thumbnail"):
         embed.set_thumbnail(url=song["thumbnail"])
     return embed
+
+
+# Inverse of create_now_playing_embed, for /statsbackfill. Keep the two in
+# step: the title prefixes below are the ones that function can produce
+# ("再生中" / "⏸️ 一時停止中", optionally followed by loop and autoplay labels),
+# and the description shape is its f-string read backwards.
+_NP_TITLE_PREFIXES = ("再生中", "⏸️ 一時停止中")
+# Greedy on the title so a bracket inside it loses to the real closing "](",
+# and the URL stops at the first whitespace or paren.
+_NP_DESCRIPTION_RE = re.compile(r"^\*\*\[(?P<title>.+)\]\((?P<url>[^\s()]+)\)\*\*")
+_NP_REQUESTER_RE = re.compile(r"^リクエスト:\s*(?P<requester>.*)$", re.MULTILINE)
+# The duration is the trailing `m:ss` of make_progress_bar's output, or the
+# whole value of the "再生時間" field when no bar was ever rendered.
+_NP_BAR_DURATION_RE = re.compile(r"`([0-9:]+)`\s*$")
+_NICONICO_HOSTS = ("nicovideo.jp", "nico.ms")
+
+
+def parse_now_playing_embed(embed: discord.Embed) -> Optional[Dict[str, Any]]:
+    """Recover a replayable track dict from a now-playing embed, or None.
+
+    `retire_now_playing` only strips the buttons off an old panel, so every
+    track the bot ever played leaves one of these embeds behind in the channel
+    forever — a play log that reaches much further back than the rolling
+    `history` table. `requester_id` is not recoverable (the embed carries only
+    the display name), so this can feed the song ranking but never the DJ one.
+    """
+    title = embed.title or ""
+    if not title.startswith(_NP_TITLE_PREFIXES):
+        return None
+    match = _NP_DESCRIPTION_RE.match(embed.description or "")
+    if not match:
+        return None
+    url = match.group("url")
+    duration = 0.0
+    for field in embed.fields:
+        if field.name == "再生時間":
+            duration = parse_time(field.value or "") or 0.0
+            break
+        if field.name == "再生位置":
+            bar = _NP_BAR_DURATION_RE.search(field.value or "")
+            duration = (parse_time(bar.group(1)) if bar else None) or 0.0
+            break
+    requester = _NP_REQUESTER_RE.search(embed.description or "")
+    is_niconico = any(host in url for host in _NICONICO_HOSTS)
+    return {
+        "url": url,
+        "title": match.group("title"),
+        "duration": duration,
+        "thumbnail": (embed.thumbnail.url if embed.thumbnail else "") or "",
+        "is_niconico": is_niconico,
+        # Mirrors extract_song_info: niconico and YouTube both need a local
+        # download, so a rebuilt track /playtop queues has to say so too.
+        "needs_local": is_niconico or "youtube.com" in url or "youtu.be" in url,
+        "requester": requester.group("requester").strip() if requester else "",
+    }
 
 
 def create_queued_embed(song: Dict[str, Any], position: int) -> discord.Embed:

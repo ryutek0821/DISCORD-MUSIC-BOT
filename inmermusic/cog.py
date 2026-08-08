@@ -1,7 +1,8 @@
 """All slash commands and the message/voice listeners, as a single cog."""
 import asyncio
 import random
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 import discord
 from discord import app_commands
@@ -27,7 +28,8 @@ from .playback import (cancel_idle_task, cancel_prefetch, cancel_reapply,
 from .state import (drop_if_idle, get_state, guild_states, hydrate_state,
                     move_queue_item)
 from .ui import (MusicControls, QueuePaginationView, create_now_playing_embed,
-                 create_queue_embed, create_queued_embed)
+                 create_queue_embed, create_queued_embed,
+                 parse_now_playing_embed)
 from .util import fmt_duration, friendly_extract_error, parse_time
 
 
@@ -173,10 +175,10 @@ class MusicCog(commands.Cog):
         )
         if command not in {
             "help", "history show", "favorite list", "nicosession", "settings",
-            "stats", "playlist list", "playlist delete",
+            "stats", "statsbackfill", "playlist list", "playlist delete",
         }:
             hydrate_state(interaction.guild.id)
-        if command in {"nicosession", "settings"}:
+        if command in {"nicosession", "settings", "statsbackfill"}:
             # Operator commands. An explicit admin list wins when configured;
             # otherwise fall back to manage_guild so an unconfigured deployment
             # keeps the old behaviour instead of opening or locking everything.
@@ -879,6 +881,122 @@ class MusicCog(commands.Cog):
         await self._enqueue_songs(
             interaction, [entry["song"] for entry in entries], deduplicate=True)
 
+    async def _scan_channel_for_plays(
+            self, channel: discord.abc.GuildChannel, before: datetime,
+            limit: int) -> Dict[str, Any]:
+        """Read back through one channel's now-playing panels.
+
+        Returns the plays found plus `covered_from`: the oldest instant this
+        channel is now known back to. Hitting `limit` means the channel goes
+        deeper than we looked, so coverage stops at the oldest message read;
+        running out of messages first means the channel is exhausted and
+        covers everything (0). `None` means the channel could not be read at
+        all, which is not the same as covering nothing.
+        """
+        me = channel.guild.me
+        if me is None or not channel.permissions_for(me).read_message_history:
+            return {"entries": [], "seen": 0, "covered_from": None}
+        entries = []
+        seen = 0
+        oldest = None
+        async for message in channel.history(limit=limit, before=before):
+            seen += 1
+            oldest = message.created_at
+            if message.author.id != self.bot.user.id or not message.embeds:
+                continue
+            song = parse_now_playing_embed(message.embeds[0])
+            if song is None:
+                continue
+            song["text_channel_id"] = channel.id
+            entries.append(
+                {"song": song, "played_at": int(message.created_at.timestamp())})
+        covered_from = int(oldest.timestamp()) if seen >= limit and oldest else 0
+        return {"entries": entries, "seen": seen, "covered_from": covered_from}
+
+    @app_commands.command(
+        name="statsbackfill",
+        description="過去の再生を遡って再生ランキングに取り込む（Bot管理者）")
+    @app_commands.describe(
+        source="取り込み元（既定: 両方）",
+        limit="チャンネルごとに遡るメッセージ数の上限")
+    @app_commands.choices(source=[
+        app_commands.Choice(name="両方", value="all"),
+        app_commands.Choice(name="履歴データベースのみ", value="history"),
+        app_commands.Choice(name="チャンネルの再生中メッセージのみ", value="discord"),
+    ])
+    async def statsbackfill_cmd(
+            self, interaction: discord.Interaction,
+            source: Optional[app_commands.Choice[str]] = None,
+            limit: Optional[int] = None):
+        guild = interaction.guild
+        mode = source.value if source else "all"
+        scan_limit = max(100, min(20000, limit or config.BACKFILL_SCAN_LIMIT))
+        await interaction.response.defer(ephemeral=True)
+        lines = []
+
+        if mode in ("all", "history"):
+            result = await asyncio.to_thread(
+                persistence.backfill_from_history, guild.id)
+            lines.append(
+                f"**履歴データベース**: {result['plays']}回 / "
+                f"{result['tracks']}曲を追加")
+            if result["skipped"]:
+                lines.append(f"　読めなかった行: {result['skipped']}件")
+
+        if mode in ("all", "discord"):
+            # The floor is guild-wide but panels land in whichever channel
+            # requested the song, so every readable channel has to be swept
+            # before the floor may move — a channel left unscanned is a gap
+            # that would otherwise be written off as counted.
+            floor = await asyncio.to_thread(persistence.backfill_floor, guild.id)
+            before = datetime.fromtimestamp(floor, tz=timezone.utc)
+            entries = []
+            covered = []
+            scanned = 0
+            # Not guild.text_channels: resolve_text_channel hands back
+            # whatever channel the /play came from, and a voice channel's
+            # built-in chat is messageable but not a TextChannel. Missing one
+            # would leave a gap the floor then claims to have covered.
+            for channel in [ch for ch in guild.channels
+                            if isinstance(ch, discord.abc.Messageable)]:
+                try:
+                    found = await self._scan_channel_for_plays(
+                        channel, before, scan_limit)
+                except discord.HTTPException as e:
+                    logger.warning(f"Backfill scan failed in #{channel}: {e}")
+                    # A channel that errored out leaves an unknown gap, so it
+                    # caps coverage at the floor and the run banks nothing.
+                    covered.append(floor)
+                    continue
+                if found["covered_from"] is None:
+                    continue
+                scanned += 1
+                entries += found["entries"]
+                covered.append(found["covered_from"])
+            # The shallowest channel bounds what the guild as a whole covers.
+            covered_from = max(covered) if covered else floor
+            result = await asyncio.to_thread(
+                persistence.backfill_plays, guild.id, entries, covered_from)
+            lines.append(
+                f"**チャンネル走査**: {scanned}チャンネルから "
+                f"{result['plays']}回 / {result['tracks']}曲を追加")
+            if result["floor_after"] == 0:
+                lines.append("　全チャンネルを最古まで走査しました")
+            elif result["floor_after"] != result["floor_before"]:
+                lines.append(
+                    f"　<t:{result['floor_after']}:D> まで遡りました"
+                    "（もう一度実行するとさらに遡れます）")
+            else:
+                lines.append("　新たに遡れた範囲はありません")
+            lines.append("　※Embedにリクエスト者IDが残らないためDJランキングは対象外です")
+
+        floor = await asyncio.to_thread(persistence.backfill_floor, guild.id)
+        lines.append("")
+        lines.append(
+            "集計済みの範囲: "
+            + ("全期間" if floor <= 0 else f"<t:{floor}:D> 以降"))
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
     @favorite_group.command(name="add", description="再生中の曲をお気に入りに保存")
     async def favorite_add(self, interaction: discord.Interaction):
         state = get_state(interaction.guild.id)
@@ -1074,7 +1192,8 @@ class MusicCog(commands.Cog):
             name="/favorite add・list・play・remove",
             value="お気に入りの保存・表示・再生・削除", inline=True)
         embed.add_field(
-            name="/settings", value="既定値・自動再生・音量ノーマライズ（管理者）",
+            name="/settings・/statsbackfill",
+            value="既定値・自動再生・音量ノーマライズ／過去再生の取り込み（管理者）",
             inline=True)
         embed.add_field(name="/join・/leave", value="VCに参加・退出", inline=True)
         embed.add_field(
