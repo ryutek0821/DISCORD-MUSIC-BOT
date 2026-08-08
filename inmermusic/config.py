@@ -124,6 +124,18 @@ IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "180"))
 # treated as abandoned rather than restored on the next /join.
 QUEUE_RESTORE_TTL = int(os.getenv("QUEUE_RESTORE_TTL", str(24 * 3600)))
 
+# `play_counts` only started accumulating when the stats tables shipped
+# (c3585da, 2026-08-04 11:03 JST); every play before this instant is missing
+# from the ranking. This is the *commit* time, not the deploy time — the few
+# minutes between them still ran the old code, so anything in that window went
+# uncounted. Erring early only under-counts those minutes; erring late would
+# double-count real plays. /statsbackfill starts from here and walks backwards,
+# lowering the per-guild floor as it goes.
+PLAY_COUNTS_EPOCH = int(os.getenv("PLAY_COUNTS_EPOCH", "1785808984"))
+# Upper bound on the messages /statsbackfill reads from one channel, so a
+# multi-year channel can't hold the interaction (and the API) hostage.
+BACKFILL_SCAN_LIMIT = int(os.getenv("BACKFILL_SCAN_LIMIT", "5000"))
+
 # Max seconds to wait for a single audio download before giving up, so a stalled
 # fetch can't wedge the queue. Also passed to yt-dlp as socket_timeout (capped).
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "120"))

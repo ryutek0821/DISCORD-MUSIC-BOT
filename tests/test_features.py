@@ -594,7 +594,7 @@ def test_cog_registration():
         "volume", "preset", "remove", "move", "clear", "join", "leave", "help",
         "stop", "pause", "resume", "nowplaying", "na-", "sound", "nicosession",
         "playlist", "history", "previous", "replay",
-        "favorite", "settings", "stats", "playtop",
+        "favorite", "settings", "stats", "playtop", "statsbackfill",
     }
     assert names == expected, (expected - names, names - expected)
     groups = {
@@ -2835,6 +2835,236 @@ def test_nico_cli_never_prints_session_secret():
         assert secret not in output.getvalue()
         assert "8001" in output.getvalue()
     finally:
+        config.STATE_DIR = original_state_dir
+        shutil.rmtree(directory)
+
+
+def test_now_playing_embed_round_trip():
+    """/statsbackfill rebuilds tracks from panels create_now_playing_embed
+    wrote, so the two must stay inverse to each other."""
+    from inmermusic.ui import (create_now_playing_embed, create_queued_embed,
+                               parse_now_playing_embed)
+
+    song = {
+        "url": "https://www.nicovideo.jp/watch/sm9",
+        "title": "新・[初音ミク] テスト曲",  # brackets in the title
+        "duration": 315,
+        "thumbnail": "https://example.com/thumb.jpg",
+        "requester": "だれか",
+    }
+    # Panel that never got a progress bar: duration comes from 再生時間.
+    parsed = parse_now_playing_embed(create_now_playing_embed(song))
+    assert parsed is not None
+    assert parsed["url"] == song["url"]
+    assert parsed["title"] == song["title"]
+    assert parsed["duration"] == 315
+    assert parsed["thumbnail"] == song["thumbnail"]
+    assert parsed["requester"] == "だれか"
+    assert parsed["is_niconico"] is True
+    assert parsed["needs_local"] is True
+
+    # Panel the progress updater has edited: duration is the bar's right end.
+    parsed = parse_now_playing_embed(
+        create_now_playing_embed(song, elapsed=42.0))
+    assert parsed is not None and parsed["duration"] == 315
+
+    # A YouTube track still needs a local download when replayed.
+    yt = dict(song, url="https://www.youtube.com/watch?v=abc", thumbnail="")
+    parsed = parse_now_playing_embed(create_now_playing_embed(yt))
+    assert parsed["is_niconico"] is False and parsed["needs_local"] is True
+    assert parsed["thumbnail"] == ""
+
+    # Autoplay tracks say so instead of naming a requester.
+    parsed = parse_now_playing_embed(
+        create_now_playing_embed(dict(song, autoplay=True)))
+    assert parsed["requester"] == ""
+
+    # Any other embed the bot posts must not be mistaken for a play.
+    assert parse_now_playing_embed(create_queued_embed(song, 1)) is None
+
+
+def test_backfill_scan_stops_coverage_at_the_scan_limit():
+    """Coverage is what was actually read, not what happened to be found."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from inmermusic.bot import bot
+    from inmermusic.cog import MusicCog
+    from inmermusic.ui import create_now_playing_embed
+
+    base = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    song = {"url": "https://example.com/a", "title": "a", "duration": 30}
+
+    class FakeChannel:
+        def __init__(self, count):
+            self.id = 55
+            self.guild = None
+            self._messages = [
+                SimpleNamespace(
+                    created_at=base + timedelta(seconds=i),
+                    author=SimpleNamespace(id=1),
+                    embeds=[create_now_playing_embed(song)],
+                )
+                for i in range(count)
+            ]
+
+        async def history(self, limit=None, before=None):
+            # discord.py hands them back newest first.
+            for message in sorted(
+                    self._messages, key=lambda m: m.created_at, reverse=True)[:limit]:
+                yield message
+
+    cog = MusicCog(bot)
+    cog.bot = SimpleNamespace(user=SimpleNamespace(id=1))
+
+    # Fewer messages than the limit: the channel is exhausted, so it covers
+    # everything and cannot bound the guild's coverage.
+    shallow = asyncio.run(
+        cog._scan_channel_for_plays(FakeChannel(3), base, limit=10))
+    assert len(shallow["entries"]) == 3
+    assert shallow["covered_from"] == 0
+
+    # Hitting the limit means the channel runs deeper than we looked: coverage
+    # stops at the oldest message read, not at the channel's true beginning.
+    deep = asyncio.run(
+        cog._scan_channel_for_plays(FakeChannel(10), base, limit=4))
+    assert len(deep["entries"]) == 4
+    assert deep["covered_from"] == int((base + timedelta(seconds=6)).timestamp())
+
+
+def _insert_legacy_history(guild_id, song, played_at):
+    """Write a history row the way the pre-#45 code did: no play_counts bump."""
+    import json
+
+    from inmermusic import persistence
+
+    conn = persistence._connect()
+    try:
+        conn.execute(
+            "INSERT INTO history (guild_id, song_json, played_at) VALUES (?, ?, ?)",
+            (guild_id, json.dumps(persistence.clean_song(song)), played_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_backfill_from_history_is_bounded_and_idempotent():
+    import shutil
+    import tempfile
+
+    from inmermusic import persistence
+
+    directory = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    config.STATE_DIR = directory
+    epoch = config.PLAY_COUNTS_EPOCH
+    old = {"url": "https://example.com/old", "title": "古い曲", "duration": 200}
+    try:
+        # Two plays the old code never counted, plus one from after the stats
+        # tables shipped — that last one is already in play_counts, so folding
+        # it in again would double-count it.
+        _insert_legacy_history(9001, old, epoch - 5000)
+        _insert_legacy_history(9001, old, epoch - 1000)
+        _insert_legacy_history(9001, old, epoch + 1000)
+
+        result = persistence.backfill_from_history(9001)
+        assert result["plays"] == 2, result
+        assert result["tracks"] == 1
+        top = persistence.top_songs(9001)
+        assert len(top) == 1 and top[0]["play_count"] == 2
+        assert top[0]["total_sec"] == 400
+        # The floor lands on the oldest play's *start*, not its end stamp, so
+        # the channel scan can't re-count the track that straddles it.
+        assert result["floor_after"] == epoch - 5000 - 200
+        assert persistence.backfill_floor(9001) == result["floor_after"]
+
+        # Running it again must find nothing: the floor already covers them.
+        again = persistence.backfill_from_history(9001)
+        assert again["plays"] == 0
+        assert persistence.top_songs(9001)[0]["play_count"] == 2
+    finally:
+        persistence.reset_connection()
+        config.STATE_DIR = original_state_dir
+        shutil.rmtree(directory)
+
+
+def test_backfill_never_rewinds_the_latest_play():
+    """An old play folded in later must not overwrite current metadata."""
+    import shutil
+    import tempfile
+
+    from inmermusic import persistence
+
+    directory = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    config.STATE_DIR = directory
+    epoch = config.PLAY_COUNTS_EPOCH
+    try:
+        recent = {"url": "https://example.com/song", "title": "現在のタイトル",
+                  "duration": 60, "requester": "now", "requester_id": 7}
+        assert persistence.record_history(9002, recent)
+        live = persistence.top_songs(9002)[0]
+
+        stale = dict(recent, title="昔のタイトル", requester="then")
+        result = persistence.backfill_plays(
+            9002, [{"song": stale, "played_at": epoch - 900}], epoch - 1000)
+        assert result["plays"] == 1
+
+        row = persistence.top_songs(9002)[0]
+        assert row["play_count"] == 2
+        assert row["title"] == "現在のタイトル"
+        assert row["song"]["title"] == "現在のタイトル"
+        assert row["last_played"] == live["last_played"]
+        # requester_id rides along on this source, so the DJ ranking moves too,
+        # but its last_played must not rewind either.
+        dj = persistence.top_requesters(9002)[0]
+        assert dj["play_count"] == 2 and dj["name"] == "now"
+    finally:
+        persistence.reset_connection()
+        config.STATE_DIR = original_state_dir
+        shutil.rmtree(directory)
+
+
+def test_backfill_plays_only_counts_the_covered_window():
+    """A shallow scan banks only what it fully covered (issue #62)."""
+    import shutil
+    import tempfile
+
+    from inmermusic import persistence
+
+    directory = tempfile.mkdtemp()
+    original_state_dir = config.STATE_DIR
+    config.STATE_DIR = directory
+    epoch = config.PLAY_COUNTS_EPOCH
+    song = {"url": "https://example.com/x", "title": "x", "duration": 10}
+    try:
+        entries = [
+            {"song": song, "played_at": epoch - 100},   # inside the window
+            {"song": song, "played_at": epoch - 9999},  # deeper than covered
+            {"song": song, "played_at": epoch + 100},   # already counted live
+            {"song": {"title": "no url"}, "played_at": epoch - 50},
+        ]
+        result = persistence.backfill_plays(9003, entries, epoch - 1000)
+        assert result["plays"] == 1, result
+        assert result["skipped"] == 3
+        assert persistence.backfill_floor(9003) == epoch - 1000
+
+        # The deeper play is still available to a later, deeper scan.
+        deeper = persistence.backfill_plays(
+            9003, [{"song": song, "played_at": epoch - 9999}], epoch - 20000)
+        assert deeper["plays"] == 1
+        assert persistence.top_songs(9003)[0]["play_count"] == 2
+        assert persistence.backfill_floor(9003) == epoch - 20000
+
+        # A scan that reaches no deeper than the floor changes nothing.
+        flat = persistence.backfill_plays(
+            9003, [{"song": song, "played_at": epoch - 30000}], epoch - 20000)
+        assert flat["plays"] == 0
+        assert persistence.top_songs(9003)[0]["play_count"] == 2
+    finally:
+        persistence.reset_connection()
         config.STATE_DIR = original_state_dir
         shutil.rmtree(directory)
 
