@@ -2883,6 +2883,56 @@ def test_now_playing_embed_round_trip():
     assert parse_now_playing_embed(create_queued_embed(song, 1)) is None
 
 
+def test_backfill_scan_stops_coverage_at_the_scan_limit():
+    """Coverage is what was actually read, not what happened to be found."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from inmermusic.bot import bot
+    from inmermusic.cog import MusicCog
+    from inmermusic.ui import create_now_playing_embed
+
+    base = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    song = {"url": "https://example.com/a", "title": "a", "duration": 30}
+
+    class FakeChannel:
+        def __init__(self, count):
+            self.id = 55
+            self.guild = None
+            self._messages = [
+                SimpleNamespace(
+                    created_at=base + timedelta(seconds=i),
+                    author=SimpleNamespace(id=1),
+                    embeds=[create_now_playing_embed(song)],
+                )
+                for i in range(count)
+            ]
+
+        async def history(self, limit=None, before=None):
+            # discord.py hands them back newest first.
+            for message in sorted(
+                    self._messages, key=lambda m: m.created_at, reverse=True)[:limit]:
+                yield message
+
+    cog = MusicCog(bot)
+    cog.bot = SimpleNamespace(user=SimpleNamespace(id=1))
+
+    # Fewer messages than the limit: the channel is exhausted, so it covers
+    # everything and cannot bound the guild's coverage.
+    shallow = asyncio.run(
+        cog._scan_channel_for_plays(FakeChannel(3), base, limit=10))
+    assert len(shallow["entries"]) == 3
+    assert shallow["covered_from"] == 0
+
+    # Hitting the limit means the channel runs deeper than we looked: coverage
+    # stops at the oldest message read, not at the channel's true beginning.
+    deep = asyncio.run(
+        cog._scan_channel_for_plays(FakeChannel(10), base, limit=4))
+    assert len(deep["entries"]) == 4
+    assert deep["covered_from"] == int((base + timedelta(seconds=6)).timestamp())
+
+
 def _insert_legacy_history(guild_id, song, played_at):
     """Write a history row the way the pre-#45 code did: no play_counts bump."""
     import json

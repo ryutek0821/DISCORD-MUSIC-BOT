@@ -881,6 +881,26 @@ class MusicCog(commands.Cog):
         await self._enqueue_songs(
             interaction, [entry["song"] for entry in entries], deduplicate=True)
 
+    @staticmethod
+    def _panel_channels(guild: discord.Guild) -> list:
+        """Every channel a now-playing panel could plausibly be sitting in.
+
+        Not `guild.text_channels`: resolve_text_channel hands back whichever
+        channel the /play came from, and a voice channel's built-in chat is
+        messageable without being a TextChannel. A panel only ever landed
+        somewhere the bot could send, so channels it cannot send in are not
+        gaps in the scan — but ones it can send in yet cannot read back are,
+        and those still have to reach the caller.
+        """
+        me = guild.me
+        if me is None:
+            return []
+        return [
+            channel for channel in guild.channels
+            if isinstance(channel, discord.abc.Messageable)
+            and channel.permissions_for(me).send_messages
+        ]
+
     async def _scan_channel_for_plays(
             self, channel: discord.abc.GuildChannel, before: datetime,
             limit: int) -> Dict[str, Any]:
@@ -890,12 +910,8 @@ class MusicCog(commands.Cog):
         channel is now known back to. Hitting `limit` means the channel goes
         deeper than we looked, so coverage stops at the oldest message read;
         running out of messages first means the channel is exhausted and
-        covers everything (0). `None` means the channel could not be read at
-        all, which is not the same as covering nothing.
+        covers everything (0).
         """
-        me = channel.guild.me
-        if me is None or not channel.permissions_for(me).read_message_history:
-            return {"entries": [], "seen": 0, "covered_from": None}
         entries = []
         seen = 0
         oldest = None
@@ -953,22 +969,18 @@ class MusicCog(commands.Cog):
             entries = []
             covered = []
             scanned = 0
-            # Not guild.text_channels: resolve_text_channel hands back
-            # whatever channel the /play came from, and a voice channel's
-            # built-in chat is messageable but not a TextChannel. Missing one
-            # would leave a gap the floor then claims to have covered.
-            for channel in [ch for ch in guild.channels
-                            if isinstance(ch, discord.abc.Messageable)]:
+            blocked = 0
+            for channel in self._panel_channels(guild):
                 try:
                     found = await self._scan_channel_for_plays(
                         channel, before, scan_limit)
                 except discord.HTTPException as e:
                     logger.warning(f"Backfill scan failed in #{channel}: {e}")
-                    # A channel that errored out leaves an unknown gap, so it
-                    # caps coverage at the floor and the run banks nothing.
+                    # A channel the bot could have posted panels to but cannot
+                    # read back is an unknown gap, not an empty one: it pins
+                    # coverage at the floor so this run banks nothing.
+                    blocked += 1
                     covered.append(floor)
-                    continue
-                if found["covered_from"] is None:
                     continue
                 scanned += 1
                 entries += found["entries"]
@@ -980,6 +992,10 @@ class MusicCog(commands.Cog):
             lines.append(
                 f"**チャンネル走査**: {scanned}チャンネルから "
                 f"{result['plays']}回 / {result['tracks']}曲を追加")
+            if blocked:
+                lines.append(
+                    f"　読み取れなかったチャンネル: {blocked}件"
+                    "（履歴の閲覧権限が必要です。集計範囲は広げていません）")
             if result["floor_after"] == 0:
                 lines.append("　全チャンネルを最古まで走査しました")
             elif result["floor_after"] != result["floor_before"]:
