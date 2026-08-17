@@ -365,6 +365,38 @@ class MusicControls(discord.ui.View):
         playback.schedule_reapply(interaction.guild.id)
         playback.schedule_refresh_now_playing(interaction.guild.id)
 
+    async def _seek_relative(
+        self, interaction: discord.Interaction, delta_seconds: float,
+    ) -> None:
+        from . import playback
+        state = get_state(interaction.guild.id)
+        vc = interaction.guild.voice_client
+        target = playback.seek_relative(vc, state, delta_seconds)
+        if target is None:
+            reason = (
+                "効果音の再生中はシークできません。"
+                if state.is_playing_sound else
+                "再生が終了したためシークできませんでした。"
+            )
+            await interaction.response.send_message(reason, ephemeral=True)
+            return
+        await interaction.response.defer()  # 成功は無言。位置はパネルに反映
+        playback.schedule_refresh_now_playing(interaction.guild.id)
+
+    @discord.ui.button(emoji="⏪", label="10秒戻る", style=discord.ButtonStyle.secondary,
+                       row=3, custom_id="music:seek_back_10")
+    async def seek_back_10(
+        self, interaction: discord.Interaction, button: discord.ui.Button,
+    ):
+        await self._seek_relative(interaction, -10.0)
+
+    @discord.ui.button(emoji="⏩", label="10秒進む", style=discord.ButtonStyle.secondary,
+                       row=3, custom_id="music:seek_forward_10")
+    async def seek_forward_10(
+        self, interaction: discord.Interaction, button: discord.ui.Button,
+    ):
+        await self._seek_relative(interaction, 10.0)
+
     @discord.ui.button(emoji="📻", label="自動再生", style=discord.ButtonStyle.secondary, row=3, custom_id="music:autoplay")
     async def autoplay(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()  # 無言で承認。状態は再生パネルに表示

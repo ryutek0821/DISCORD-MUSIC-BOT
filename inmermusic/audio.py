@@ -683,7 +683,7 @@ def schedule_source_cleanup(source: discord.AudioSource) -> None:
         _kill()
 
 
-def swap_source_at(vc: discord.VoiceClient, state: GuildState, seek: float) -> None:
+def swap_source_at(vc: discord.VoiceClient, state: GuildState, seek: float) -> bool:
     """Hot-swap the FFmpeg source to restart the current song at `seek` seconds.
 
     Swapping vc.source (instead of vc.play) avoids firing the `after` callback,
@@ -692,15 +692,33 @@ def swap_source_at(vc: discord.VoiceClient, state: GuildState, seek: float) -> N
     """
     song = state.current_song
     if not song or not vc or not vc.is_connected():
-        return
+        return False
+    player = getattr(vc, "_player", None)
     was_paused = vc.is_paused()
     new_source = make_audio_source(song, state, seek=seek)
     old_source = vc.source
-    vc.source = new_source  # _set_source resumes unconditionally; re-pause below
-    if was_paused:
-        vc.pause()
+    try:
+        vc.source = new_source  # _set_source resumes unconditionally; re-pause below
+    except Exception:
+        # The player can finish between the caller's state check and this
+        # assignment. The new FFmpeg process was never handed to discord.py, so
+        # it is ours to reap before propagating the race to the caller.
+        try:
+            new_source.cleanup()
+        except Exception as cleanup_error:
+            logger.warning(f"Failed to cleanup unused audio source: {cleanup_error}")
+        return False
     if old_source:
         schedule_source_cleanup(old_source)
+    if (getattr(vc, "_player", None) is not player
+            or not (vc.is_playing() or vc.is_paused())):
+        # AudioPlayer remains attached after natural EOF, so set_source can
+        # appear to work even though its thread will never consume the new
+        # source. Reap that unused process and report a lost race.
+        schedule_source_cleanup(new_source)
+        return False
+    if was_paused:
+        vc.pause()
     player = getattr(vc, "_player", None)
     state.seek_position = seek
     state.loops_at_swap = getattr(player, "loops", 0) if player else 0
@@ -710,8 +728,9 @@ def swap_source_at(vc: discord.VoiceClient, state: GuildState, seek: float) -> N
     state.paused_position = seek
     state.clock_paused = was_paused
     state.clock_started_at = None if was_paused else time.monotonic()
+    return True
 
 
-def reapply_audio_settings(vc: discord.VoiceClient, state: GuildState) -> None:
+def reapply_audio_settings(vc: discord.VoiceClient, state: GuildState) -> bool:
     """Re-render the current song in place from the current playback position."""
-    swap_source_at(vc, state, current_elapsed(vc, state))
+    return swap_source_at(vc, state, current_elapsed(vc, state))

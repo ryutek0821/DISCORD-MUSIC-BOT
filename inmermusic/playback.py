@@ -1,6 +1,7 @@
 """Queue advancement, playback lifecycle, idle disconnect, and the now-playing
 progress-bar updater. Sits above audio + ui; imported by cog and bot."""
 import asyncio
+import math
 import os
 import random
 import time
@@ -9,7 +10,8 @@ from typing import Any, Dict, Optional
 import discord
 
 from .audio import (cleanup_download, current_elapsed, download_audio,
-                    make_audio_source, reapply_audio_settings, related_songs)
+                    make_audio_source, reapply_audio_settings, related_songs,
+                    swap_source_at)
 from .config import (AUTOPLAY_BATCH, AUTOPLAY_MAX_STREAK, DOWNLOAD_TIMEOUT,
                      EFFECT_DEBOUNCE, NP_UPDATE_INTERVAL,
                      PREFETCH_MAX_BYTES, logger)
@@ -187,6 +189,41 @@ def schedule_reapply(guild_id: int) -> None:
             reapply_audio_settings(vc, state)
 
     state.reapply_task = asyncio.create_task(_run())
+
+
+def seek_relative(
+    vc: discord.VoiceClient, state: GuildState, delta_seconds: float,
+) -> Optional[float]:
+    """Move the current source by ``delta_seconds`` without advancing the queue.
+
+    The operation intentionally contains no await point: rapid button presses
+    see the clock position written by the preceding swap and therefore add up
+    instead of racing from the same stale position.
+    """
+    if (state.voice_client is not vc or state.current_song is None
+            or state.is_playing_sound or not vc or not vc.is_connected()
+            or not (vc.is_playing() or vc.is_paused())):
+        return None
+
+    target = max(0.0, current_elapsed(vc, state) + delta_seconds)
+    try:
+        duration = float(state.current_song.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if math.isfinite(duration) and duration > 0:
+        # Stay inside the source and let its final second reach the normal
+        # after-callback, which already owns loop and queue progression.
+        target = min(target, max(0.0, duration - 1.0))
+
+    try:
+        swapped = swap_source_at(vc, state, target)
+    except Exception as e:
+        logger.debug(f"Relative seek lost a playback race: {e}")
+        return None
+    if not swapped:
+        return None
+    cancel_reapply(state)
+    return target
 
 
 def resolve_text_channel(guild: discord.Guild, song: Dict[str, Any]) -> Optional[discord.abc.GuildChannel]:

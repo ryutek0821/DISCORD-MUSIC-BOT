@@ -779,6 +779,299 @@ class FakeVoiceClient:
         self._playing = False
 
 
+def test_relative_seek_clamps_accumulates_and_guards():
+    from inmermusic.state import get_state, guild_states
+
+    class SeekVoiceClient(FakeVoiceClient):
+        def __init__(self):
+            super().__init__()
+            self._playing = True
+            self._paused = False
+
+        def is_playing(self):
+            return self._playing and not self._paused
+
+        def is_paused(self):
+            return self._paused
+
+    guild_id = 900200
+    targets = []
+    original_elapsed = playback.current_elapsed
+    original_swap = playback.swap_source_at
+
+    def fake_elapsed(vc, state):
+        return state.paused_position if vc.is_paused() else state.clock_base
+
+    def fake_swap(vc, state, target):
+        targets.append(target)
+        state.clock_base = target
+        state.paused_position = target
+        return True
+
+    playback.current_elapsed = fake_elapsed
+    playback.swap_source_at = fake_swap
+    try:
+        state = get_state(guild_id)
+        vc = SeekVoiceClient()
+        state.voice_client = vc
+        state.current_song = {"title": "t", "duration": 120}
+        state.clock_base = 30
+
+        assert playback.seek_relative(vc, state, 10) == 40
+        assert playback.seek_relative(vc, state, 10) == 50
+        state.clock_base = 5
+        assert playback.seek_relative(vc, state, -10) == 0
+        state.current_song["duration"] = 75
+        state.clock_base = 70
+        assert playback.seek_relative(vc, state, 10) == 74
+        state.current_song["duration"] = 0
+        state.clock_base = 90
+        assert playback.seek_relative(vc, state, 10) == 100
+        state.current_song["duration"] = 0.5
+        state.clock_base = 0
+        assert playback.seek_relative(vc, state, 10) == 0
+        assert targets == [40, 50, 0, 74, 100, 0]
+
+        async def cancel_pending_reapply():
+            state.current_song["duration"] = 120
+            state.clock_base = 20
+            task = asyncio.create_task(asyncio.sleep(60))
+            state.reapply_task = task
+            assert playback.seek_relative(vc, state, 10) == 30
+            assert state.reapply_task is None
+            await asyncio.sleep(0)
+            assert task.cancelled()
+
+        asyncio.run(cancel_pending_reapply())
+
+        before = list(targets)
+        state.is_playing_sound = True
+        assert playback.seek_relative(vc, state, 10) is None
+        state.is_playing_sound = False
+        vc._playing = False
+        assert playback.seek_relative(vc, state, 10) is None
+        assert targets == before
+
+        vc._playing = True
+
+        def racing_swap(vc, state, target):
+            return False
+
+        playback.swap_source_at = racing_swap
+
+        async def preserve_pending_reapply_on_failure():
+            task = asyncio.create_task(asyncio.sleep(60))
+            state.reapply_task = task
+            assert playback.seek_relative(vc, state, 10) is None
+            assert state.reapply_task is task
+            assert not task.cancelled()
+            task.cancel()
+            await asyncio.sleep(0)
+            state.reapply_task = None
+
+        asyncio.run(preserve_pending_reapply_on_failure())
+    finally:
+        playback.current_elapsed = original_elapsed
+        playback.swap_source_at = original_swap
+        guild_states.pop(guild_id, None)
+
+
+def test_relative_seek_preserves_pause_and_current_audio_settings():
+    from types import SimpleNamespace
+    from inmermusic.state import get_state, guild_states
+
+    class PausedVoiceClient:
+        def __init__(self):
+            self.source = "old-source"
+            self._player = SimpleNamespace(loops=12)
+            self.pause_calls = 0
+
+        def is_connected(self):
+            return True
+
+        def is_playing(self):
+            return False
+
+        def is_paused(self):
+            return True
+
+        def pause(self):
+            self.pause_calls += 1
+
+    class NewSource:
+        def cleanup(self):
+            raise AssertionError("active replacement source must not be cleaned")
+
+    guild_id = 900201
+    cleaned = []
+    settings = []
+    original_make = audio.make_audio_source
+    original_cleanup = audio.schedule_source_cleanup
+
+    def fake_make(song, state, seek=0.0):
+        settings.append((seek, state.speed, state.pitch, state.volume, state.effect))
+        return NewSource()
+
+    audio.make_audio_source = fake_make
+    audio.schedule_source_cleanup = lambda source: cleaned.append(source)
+    try:
+        state = get_state(guild_id)
+        vc = PausedVoiceClient()
+        state.voice_client = vc
+        state.current_song = {"title": "t", "duration": 100}
+        state.speed = 1.25
+        state.pitch = 3
+        state.volume = 80
+        state.effect = "echo"
+        state.clock_paused = True
+        state.paused_position = 20
+
+        assert playback.seek_relative(vc, state, 10) == 30
+        assert isinstance(vc.source, NewSource)
+        assert vc.pause_calls == 1
+        assert cleaned == ["old-source"]
+        assert settings == [(30, 1.25, 3, 80, "echo")]
+        assert state.clock_paused is True
+        assert state.paused_position == 30
+        assert state.clock_base == 30
+        assert state.clock_started_at is None
+    finally:
+        audio.make_audio_source = original_make
+        audio.schedule_source_cleanup = original_cleanup
+        guild_states.pop(guild_id, None)
+
+
+def test_source_swap_cleans_replacement_when_player_ends():
+    from inmermusic.state import GuildState
+
+    class NewSource:
+        cleaned = False
+
+        def cleanup(self):
+            self.cleaned = True
+
+    class RacingVoiceClient:
+        def __init__(self):
+            self._source = "old-source"
+
+        def is_connected(self):
+            return True
+
+        def is_paused(self):
+            return False
+
+        @property
+        def source(self):
+            return self._source
+
+        @source.setter
+        def source(self, value):
+            raise RuntimeError("player ended")
+
+    class FinishedVoiceClient:
+        def __init__(self):
+            self._source = "old-source"
+            self._player = object()  # discord.py retains AudioPlayer after EOF
+            self._playing = True
+
+        def is_connected(self):
+            return True
+
+        def is_playing(self):
+            return self._playing
+
+        def is_paused(self):
+            return False
+
+        @property
+        def source(self):
+            return self._source
+
+        @source.setter
+        def source(self, value):
+            self._source = value
+            self._playing = False  # set_source accepted it, but the thread ended
+
+    replacement = NewSource()
+    scheduled = []
+    original_make = audio.make_audio_source
+    original_schedule = audio.schedule_source_cleanup
+    audio.make_audio_source = lambda song, state, seek=0.0: replacement
+    audio.schedule_source_cleanup = scheduled.append
+    try:
+        state = GuildState()
+        state.current_song = {"title": "t"}
+        assert audio.swap_source_at(RacingVoiceClient(), state, 10) is False
+        assert replacement.cleaned is True
+
+        replacement = NewSource()
+        state.clock_base = 3
+        assert audio.swap_source_at(FinishedVoiceClient(), state, 10) is False
+        assert scheduled == ["old-source", replacement]
+        assert state.clock_base == 3  # failed transfer must not rewrite the clock
+    finally:
+        audio.make_audio_source = original_make
+        audio.schedule_source_cleanup = original_schedule
+
+
+def test_relative_seek_buttons_are_wired():
+    from types import SimpleNamespace
+    from inmermusic.state import get_state, guild_states
+
+    controls = ui.MusicControls()
+    children = {item.custom_id: item for item in controls.children}
+    back = children["music:seek_back_10"]
+    forward = children["music:seek_forward_10"]
+    assert back.row == forward.row == children["music:autoplay"].row == 3
+    assert back.label == "10秒戻る" and str(back.emoji) == "⏪"
+    assert forward.label == "10秒進む" and str(forward.emoji) == "⏩"
+
+    guild_id = 900202
+    offsets = []
+    refreshes = []
+    deferred = []
+    sent = []
+    original_seek = playback.seek_relative
+    original_refresh = playback.schedule_refresh_now_playing
+
+    class Response:
+        async def defer(self):
+            deferred.append(True)
+
+        async def send_message(self, message, **kwargs):
+            sent.append((message, kwargs))
+
+    async def scenario():
+        state = get_state(guild_id)
+        vc = object()
+        state.voice_client = vc
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=guild_id, voice_client=vc),
+            response=Response(),
+        )
+        await back.callback(interaction)
+        await forward.callback(interaction)
+        assert offsets == [-10.0, 10.0]
+        assert len(deferred) == 2
+        assert refreshes == [guild_id, guild_id]
+        assert sent == []
+
+        state.is_playing_sound = True
+        playback.seek_relative = lambda vc, state, delta: None
+        await back.callback(interaction)
+        assert "効果音" in sent[-1][0]
+        assert sent[-1][1]["ephemeral"] is True
+
+    playback.seek_relative = lambda vc, state, delta: offsets.append(delta) or 1.0
+    playback.schedule_refresh_now_playing = refreshes.append
+    try:
+        asyncio.run(scenario())
+    finally:
+        playback.seek_relative = original_seek
+        playback.schedule_refresh_now_playing = original_refresh
+        guild_states.pop(guild_id, None)
+
+
 def test_advance_queue_decision_tree():
     # play_next itself is irrelevant here; only the queue mutation matters.
     from inmermusic.state import get_state, guild_states
@@ -1907,6 +2200,41 @@ def test_stale_music_panel_is_rejected():
         allowed = await ui.MusicControls().interaction_check(interaction)
         assert allowed is False
         assert "古く" in replies[0][0]
+        assert replies[0][1]["ephemeral"] is True
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        guild_states.pop(guild_id, None)
+
+
+def test_music_panel_rejects_user_in_another_voice_channel():
+    from types import SimpleNamespace
+    from inmermusic.state import get_state, guild_states
+
+    guild_id = 900203
+    replies = []
+
+    class Response:
+        async def send_message(self, message, **kwargs):
+            replies.append((message, kwargs))
+
+    async def scenario():
+        bot_channel = object()
+        user_channel = object()
+        voice_client = SimpleNamespace(channel=bot_channel)
+        state = get_state(guild_id)
+        state.voice_client = voice_client
+        state.np_message = SimpleNamespace(id=100)
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=guild_id, voice_client=voice_client),
+            message=SimpleNamespace(id=100),
+            response=Response(),
+            user=SimpleNamespace(voice=SimpleNamespace(channel=user_channel)),
+        )
+        allowed = await ui.MusicControls().interaction_check(interaction)
+        assert allowed is False
+        assert "同じVC" in replies[0][0]
         assert replies[0][1]["ephemeral"] is True
 
     try:
