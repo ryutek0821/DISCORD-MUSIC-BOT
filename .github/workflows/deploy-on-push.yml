@@ -28,6 +28,9 @@ jobs:
        github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'master')
     runs-on: ubuntu-latest
+    # Bound the entire deployment even if a runner, network command, or remote
+    # operation stops responding.
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -38,11 +41,15 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Connect to Tailscale
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey "$TAILSCALE_AUTHKEY" --accept-routes --hostname github-actions-deploy
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
+        timeout-minutes: 7
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: github-actions-deploy
+          timeout: 1m
+          # The action counts total attempts, so 2 means one retry.
+          retry: '2'
+          ping: ${{ secrets.SSH_HOST }}
 
       - name: Deploy to RYU-RASPBERRYPI
         env:
