@@ -631,9 +631,13 @@ class MusicCog(commands.Cog):
                 f"曲の長さ（{fmt_duration(duration)}）以内で指定してください。"
             )
             return
-        cancel_reapply(state)  # an explicit jump supersedes a pending effect swap
-        swap_source_at(vc, state, secs)
-        await interaction.response.send_message(f"⏩ **{fmt_duration(secs)}** へシークしました。")
+        if swap_source_at(vc, state, secs):
+            cancel_reapply(state)  # the explicit jump applied the latest settings too
+            await interaction.response.send_message(
+                f"⏩ **{fmt_duration(secs)}** へシークしました。")
+        else:
+            await interaction.response.send_message(
+                "再生が終了したためシークできませんでした。", ephemeral=True)
 
     @app_commands.command(name="volume", description="音量を変更（0〜200%）")
     @app_commands.describe(level="音量 (0〜200)")
@@ -777,9 +781,12 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(
                 "効果音の再生中は変更できません。")
             return
-        cancel_reapply(state)
-        swap_source_at(vc, state, 0.0)
-        await interaction.response.send_message("⏪ 最初から再生し直します。")
+        if swap_source_at(vc, state, 0.0):
+            cancel_reapply(state)
+            await interaction.response.send_message("⏪ 最初から再生し直します。")
+        else:
+            await interaction.response.send_message(
+                "再生が終了したため最初に戻れませんでした。", ephemeral=True)
 
     @history_group.command(name="play", description="履歴から曲を選んでキューに追加")
     @app_commands.describe(position="履歴の番号（1〜20）")
@@ -1220,7 +1227,8 @@ class MusicCog(commands.Cog):
             value="ニコニコセッション再適用・この一覧", inline=True)
         embed.add_field(
             name="再生中ボタン",
-            value="🐢🐇 速度 / 🔽🔼 ピッチ / 🎚️ リセット / 📻 自動再生", inline=False)
+            value=("⏪⏩ 10秒シーク / 🐢🐇 速度 / 🔽🔼 ピッチ / "
+                   "🎚️ リセット / 📻 自動再生"), inline=False)
         embed.add_field(name="メッセージトリガー", value="`んあー` / `んあーと` で効果音", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
